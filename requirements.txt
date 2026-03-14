@@ -1,0 +1,2 @@
+# Runtime requirements for MCP workspace.
+mcp>=1.20
