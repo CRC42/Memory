@@ -29,7 +29,7 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
         "targets": [
             {"path": ".ai-context/current-task.md", "max_chars": 6_000, "policy": "hot_task", "role": "hot task context for current working session"},
             {"path": ".ai-context/latest-error.md", "max_chars": 4_000, "policy": "error_summary", "role": "latest valid error summary"},
-            {"path": "memory-bank/activeContext.md", "max_chars": 8_000, "policy": "warm_context", "role": "current sprint focus, recent decisions, TODOs"},
+            {"path": "memory-bank/activeContext.md", "max_chars": 8_000, "policy": "warm_context", "role": "current sprint focus, recent decisions, TODOs", "preferred_mode": "append"},
             {"path": "memory-bank/progress.md", "max_chars": 12_000, "policy": "warm_context", "role": "feature completion status, milestones"},
             {"path": "memory-bank/techContext.md", "max_chars": 10_000, "policy": "warm_context", "role": "tech stack, plugin matrix, architecture config"},
             {"path": "memory-bank/systemPatterns.md", "max_chars": 10_000, "policy": "warm_context", "role": "architecture patterns, coding conventions, design decisions"},

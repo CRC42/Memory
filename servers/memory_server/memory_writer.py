@@ -19,7 +19,7 @@ from typing import Any
 
 from .memory_backup import backup_files
 from .memory_config import MemoryConfig
-from .memory_events import append_event
+from .memory_events import append_event, get_current_user
 from .memory_guard import check_total_budget
 from .memory_paths import PathManager, PathSecurityError
 from .memory_result import error_result, ok_result
@@ -111,10 +111,14 @@ def memory_write(
             )
 
     # Build final content
+    current_user = get_current_user(config.repo_root)
     if mode == "append":
+        # 多人协作：append 模式自动在内容前添加用户+时间戳标识
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        user_header = f"\n<!-- written by {current_user} at {timestamp} -->\n"
         # Ensure separator newline when appending
         separator = "" if original_content.endswith("\n") or not original_content else "\n"
-        final_content = original_content + separator + content
+        final_content = original_content + separator + user_header + content
     else:
         final_content = content
 
@@ -142,7 +146,7 @@ def memory_write(
     before_chars = len(original_content)
     before_tokens = estimate_tokens(original_content)
 
-    # Log audit event
+    # Log audit event（自动包含 user 字段，由 append_event 注入）
     append_event(
         config,
         event_type="memory_write",

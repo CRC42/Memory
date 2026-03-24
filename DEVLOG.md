@@ -1,5 +1,91 @@
 # DEVLOG - MCP Memory
 
+## 2026-03-24 (v0.3.1: 用户名可配置覆盖 — .vscode/settings.json)
+
+### 背景
+v0.3.0 的用户标识完全依赖 OS 用户名（`USERNAME`/`USER` 环境变量），但存在以下场景需求：
+1. 多人共用同一台机器/同一 OS 账户时无法区分
+2. 用户希望使用自定义名称（如昵称、工号）而非系统用户名
+3. 需要一个**不进 Git、不影响 VSCode 本身**的本地配置方式
+
+### 实现
+
+#### 1. `.vscode/settings.json` 用户名覆盖 (`memory_events.py`)
+- `get_current_user()` 新增可选参数 `repo_root: Path | None`
+- 优先级变为：`.vscode/settings.json["memory-mcp.userName"]` → `USERNAME` → `USER` → `'unknown'`
+- 新增 `_read_vscode_username(repo_root)` 内部函数，带进程级缓存（同一 repo_root 只读一次文件）
+- 文件不存在、解析失败、key 不存在时静默回退，零副作用
+
+#### 2. 调用方适配 (`memory_events.py` + `memory_writer.py`)
+- `append_event()` 调用 `get_current_user(config.repo_root)` 传入项目根目录
+- `memory_writer.py` 中 `get_current_user(config.repo_root)` 同步适配
+
+#### 3. 配置示例
+`.vscode/settings.json`（已被 `.gitignore` 排除，不进 Git）：
+```json
+{
+    "memory-mcp.userName": "mengzhoyang"
+}
+```
+- VSCode 对未知 key 完全忽略，不影响 IDE 本身行为
+- 每位开发者可在本地自定义用户名
+
+### Verification
+- `pytest tests/ -v` → 44 passed（全部原有测试通过，向后兼容）
+- 不传 `repo_root` 时行为与 v0.3.0 完全一致
+
+### 影响
+- 向后兼容：`get_current_user()` 无参调用仍返回 OS 用户名
+- `.vscode/` 目录已在 `.gitignore` 中排除，配置不进 Git
+- 进程级缓存避免频繁文件 I/O
+
+---
+
+## 2026-03-24 (v0.3.0: 多人协作支持 — 用户标识 + Git 共享策略)
+
+### 背景
+多人同一项目使用 Memory MCP 时存在三个问题：
+1. 审计日志不记录操作者，无法追溯谁写了什么
+2. `events.jsonl`、`backups/`、`temp/` 等运行时基础设施文件进 Git 会产生无意义冲突
+3. `activeContext.md` 使用 overwrite 模式，多人写入必然产生全文 Git 冲突
+
+### 实现
+
+#### 1. 用户自动识别 (`memory_events.py`)
+- 新增 `get_current_user()` 工具函数
+- 读取 `USERNAME`（Windows）/ `USER`（POSIX）环境变量，完全无感无需配置
+- 未找到时回退到 `'unknown'`
+
+#### 2. 审计日志注入用户 (`memory_events.py`)
+- `append_event()` 记录自动注入 `"user"` 字段
+- 所有写操作（write、backup、compact）的审计记录均可追溯操作者
+
+#### 3. append 模式用户标识头 (`memory_writer.py`)
+- 当 `mode == "append"` 时，自动在追加内容前插入 HTML 注释标识头：
+  `<!-- written by {user} at {timestamp} -->`
+- 多人追加不冲突，且可追溯每段内容的作者
+
+#### 4. Git 共享策略 (`.gitignore`)
+- `memory-bank/` 全部进 Git（全团队共享项目记忆）
+- `.ai-memory/config.json` 进 Git（共享配置）
+- `.ai-memory/events.jsonl`、`backups/`、`temp/` 排除出 Git（运行时基础设施）
+- `.ai-context/` 维持不进 Git（个人临时上下文）
+
+#### 5. 配置标注 (`memory_config.py`)
+- `activeContext.md` 的 guard target 新增 `preferred_mode: "append"` 字段
+- 作为多人协作时的推荐写入模式标注
+
+### Verification
+- `pytest tests/ -v` → 44 passed（原 44 全部通过，无破坏性变更）
+- `get_current_user()` 在 Windows / POSIX 环境均可正常获取用户名
+
+### 影响
+- 向后兼容：`user` 字段为新增，旧审计记录无此字段不影响解析
+- `preferred_mode` 为提示性字段，不改变实际写入逻辑
+- `.gitignore` 变更不影响已有 Git 历史
+
+---
+
 ## 2026-02-25 (v0.2.0: 备份轮转 + 全局预算 + 动态描述)
 
 ### 背景
