@@ -1,2 +1,3 @@
-# Runtime requirements for MCP workspace.
-mcp>=1.20
+# MCP Memory Server runtime dependencies
+# Target: MCP/Memory/.venv/ (virtual environment)
+mcp>=1.0.0
