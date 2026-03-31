@@ -60,9 +60,10 @@ def test_overwrite_existing_file(repo: Path) -> None:
     assert result["ok"] is True
     assert result["mode"] == "overwrite"
     assert result["created"] is False
-    # Verify file content
+    # Verify file content (overwrite 模式会注入用户标签尾注)
     text = (repo / "memory-bank/notes.md").read_text(encoding="utf-8")
-    assert text == "# Updated\nNew content.\n"
+    assert "# Updated\nNew content." in text
+    assert "<!-- last overwritten by" in text
     # Verify backup was created
     assert result.get("backup_batch_id") is not None
 
@@ -74,7 +75,8 @@ def test_overwrite_creates_file_if_missing(repo: Path) -> None:
     assert result["created"] is True
     assert result["backup_batch_id"] is None  # no backup for new file
     text = (repo / "memory-bank/new_file.md").read_text(encoding="utf-8")
-    assert text == "# New File\nHello.\n"
+    assert "# New File\nHello." in text
+    assert "<!-- last overwritten by" in text
 
 
 def test_overwrite_empty_content_rejected(repo: Path) -> None:

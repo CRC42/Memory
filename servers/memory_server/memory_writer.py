@@ -21,9 +21,32 @@ from .memory_backup import backup_files
 from .memory_config import MemoryConfig
 from .memory_events import append_event, get_current_user
 from .memory_guard import check_total_budget
-from .memory_paths import PathManager, PathSecurityError
+from .memory_paths import PathManager, PathSecurityError, resolve_user_path
 from .memory_result import error_result, ok_result
 from .token_estimator import estimate_tokens
+
+
+def _lookup_write_policy(config: MemoryConfig, path: str) -> str | None:
+    """查找目标路径对应的 write_policy。
+
+    优先匹配 guard_targets 中的 write_policy，
+    其次匹配 multi_user.shared_paths_policy。
+    返回 None 表示无特殊策略。
+    """
+    # 1. guard targets 中的 write_policy 优先
+    normalized = path.replace("\\", "/").strip("/")
+    for target in config.guard_targets:
+        tp = target.path.replace("\\", "/").strip("/")
+        if tp == normalized or normalized.endswith(tp):
+            if target.write_policy:
+                return target.write_policy
+    # 2. multi_user.shared_paths_policy 兜底
+    if config.multi_user and config.multi_user.enabled and config.multi_user.shared_paths_policy:
+        for sp, policy in config.multi_user.shared_paths_policy.items():
+            sp_norm = sp.replace("\\", "/").strip("/")
+            if sp_norm == normalized or normalized.endswith(sp_norm):
+                return policy
+    return None
 
 
 def memory_write(
@@ -57,12 +80,30 @@ def memory_write(
     if not content and mode == "overwrite":
         return error_result("invalid_input", "content must not be empty for overwrite mode")
 
+    # write_policy 检查：append_only 强制降级 / user_scoped 路径重定向
+    policy_override: str | None = None
+    effective_mode = mode
+    effective_path = path
+    _write_policy = _lookup_write_policy(config, path)
+    if _write_policy == "append_only" and mode == "overwrite":
+        effective_mode = "append"
+        policy_override = "append_only"
+    elif _write_policy == "user_scoped":
+        current_user_for_path = get_current_user(config.repo_root)
+        if not current_user_for_path or current_user_for_path == "unknown":
+            return error_result(
+                "user_required",
+                "user_scoped write requires a valid user identity. "
+                "Set 'memory-mcp.userName' in .vscode/settings.json or ensure USERNAME env var is set.",
+            )
+        effective_path = resolve_user_path(config, path, current_user_for_path)
+
     manager = PathManager(config)
 
-    # Resolve and validate path security
+    # Resolve and validate path security（使用 effective_path，可能已被 user_scoped 重定向）
     try:
         resolved = manager.resolve(
-            path,
+            effective_path,
             must_exist=not create_if_missing,
             must_be_file=False,
         )
@@ -73,7 +114,7 @@ def memory_write(
 
     # If it exists, ensure it's a file (not a directory)
     if resolved.exists() and not resolved.is_file():
-        return error_result("invalid_path", f"target is not a file: {path}")
+        return error_result("invalid_path", f"target is not a file: {effective_path}")
 
     file_exists = resolved.exists()
     rel_path = manager.to_repo_relative(resolved)
@@ -87,7 +128,7 @@ def memory_write(
             return error_result("read_failed", f"failed to read existing file: {exc}")
 
     # Pre-write global budget check
-    net_new_chars = len(content) - len(original_content) if mode == "overwrite" else len(content)
+    net_new_chars = len(content) - len(original_content) if effective_mode == "overwrite" else len(content)
     if net_new_chars > 0:
         budget_err = check_total_budget(config, extra_chars=net_new_chars)
         if budget_err is not None:
@@ -112,7 +153,7 @@ def memory_write(
 
     # Build final content
     current_user = get_current_user(config.repo_root)
-    if mode == "append":
+    if effective_mode == "append":
         # 多人协作：append 模式自动在内容前添加用户+时间戳标识
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         user_header = f"\n<!-- written by {current_user} at {timestamp} -->\n"
@@ -120,7 +161,10 @@ def memory_write(
         separator = "" if original_content.endswith("\n") or not original_content else "\n"
         final_content = original_content + separator + user_header + content
     else:
-        final_content = content
+        # 多人协作：overwrite 模式在末尾注入用户标签尾注，便于追溯
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        footer = f"\n<!-- last overwritten by {current_user} at {timestamp} -->\n"
+        final_content = content.rstrip("\n") + "\n" + footer
 
     # Ensure final content ends with newline
     if final_content and not final_content.endswith("\n"):
@@ -152,7 +196,9 @@ def memory_write(
         event_type="memory_write",
         payload={
             "path": rel_path,
-            "mode": mode,
+            "mode": effective_mode,
+            "original_mode": mode if policy_override else None,
+            "policy_override": policy_override,
             "reason": reason,
             "backup": backup,
             "created": not file_exists,
@@ -179,10 +225,10 @@ def memory_write(
                 guard_warning = f"near max_tokens threshold ({after_tokens}/{max_tokens})"
             break
 
-    return ok_result(
+    result = ok_result(
         "write completed",
         path=rel_path,
-        mode=mode,
+        mode=effective_mode,
         created=not file_exists,
         before={"chars": before_chars, "tokens_est": before_tokens},
         after={"chars": after_chars, "tokens_est": after_tokens},
@@ -190,3 +236,7 @@ def memory_write(
         guard_warning=guard_warning,
         reason=reason,
     )
+    if policy_override:
+        result["original_mode"] = mode
+        result["policy_override"] = policy_override
+    return result

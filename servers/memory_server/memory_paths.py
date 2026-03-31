@@ -110,3 +110,45 @@ class PathManager:
                     if exclude_paths and self._matches_patterns(rel_path, exclude_paths):
                         continue
                     yield abs_path, rel_path
+
+
+def resolve_user_path(config: MemoryConfig, path: str, user: str) -> str:
+    """将 user_scoped 路径重定向到用户分区目录。
+
+    例如：
+        memory-bank/activeContext.md → memory-bank/activeContext/{user}.md
+
+    仅当 multi_user.enabled=True 且 path 在 user_scoped_paths 列表中时生效。
+    否则原样返回。
+
+    自动迁移：如果旧的单文件存在且新的用户分区文件不存在，
+    自动将旧文件内容复制到新路径（旧文件保留不删除，供其他用户迁移）。
+    """
+    if not config.multi_user or not config.multi_user.enabled:
+        return path
+    scoped_paths = config.multi_user.user_scoped_paths
+    if not scoped_paths:
+        return path
+
+    normalized = path.replace("\\", "/").strip("/")
+    for scoped in scoped_paths:
+        scoped_norm = scoped.replace("\\", "/").strip("/")
+        if scoped_norm == normalized or normalized.endswith(scoped_norm):
+            # memory-bank/activeContext.md → memory-bank/activeContext/{user}.md
+            stem = Path(scoped_norm).stem       # "activeContext"
+            parent = str(Path(scoped_norm).parent).replace("\\", "/")  # "memory-bank"
+            new_path = f"{parent}/{stem}/{user}.md"
+
+            # 自动迁移：旧单文件 → 新用户分区文件
+            old_abs = (config.repo_root / scoped_norm).resolve()
+            new_abs = (config.repo_root / new_path).resolve()
+            if old_abs.is_file() and not new_abs.exists():
+                try:
+                    new_abs.parent.mkdir(parents=True, exist_ok=True)
+                    content = old_abs.read_text(encoding="utf-8", errors="replace")
+                    new_abs.write_text(content, encoding="utf-8")
+                except OSError:
+                    pass  # 迁移失败不阻塞正常流程
+
+            return new_path
+    return path

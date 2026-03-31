@@ -1,5 +1,237 @@
 # DEVLOG - MCP Memory
 
+## 2026-03-31 (v0.4.0 设计稿: 十人团队多人协作 — 用户分区写入 + 冲突消除)
+
+> **状态：设计方案，未执行开发**
+
+### 背景与问题
+
+团队即将扩展至 10 人规模，当前 Memory MCP 的多人协作支持存在以下瓶颈：
+
+| # | 问题 | 严重度 | 影响范围 |
+|---|------|--------|----------|
+| 1 | `activeContext.md` 使用 overwrite 模式，10 人同时写入必然产生全文 Git 冲突 | **P0** | 每次 push/pull |
+| 2 | overwrite 模式不注入任何用户标签，无法区分内容归属 | **P1** | 代码审查、冲突解决 |
+| 3 | `.ai-context/` 不进 Git 但也无用户隔离，同一机器多人共用时互相覆盖 | **P1** | 共享开发机 |
+| 4 | `config.json` 中 `preferred_mode: "append"` 在 DEVLOG v0.3.0 中提及但代码未实现 | **P2** | 配置与行为不一致 |
+| 5 | 全局预算 60K chars 在 10 人场景下可能不够 | **P2** | 写入被拒绝 |
+
+### 当前架构分析
+
+```
+memory-bank/              ← 进 Git，全团队共享
+  activeContext.md         ← overwrite 模式，冲突高发区
+  progress.md              ← 低频写入，冲突风险低
+  techContext.md            ← 低频写入，冲突风险低
+  systemPatterns.md         ← 低频写入，冲突风险低
+  projectbrief.md           ← 极低频，冲突风险极低
+
+.ai-context/              ← 不进 Git，个人临时上下文
+  current-task.md          ← 个人任务，不冲突
+  latest-error.md          ← 个人错误，不冲突
+
+.ai-memory/               ← config.json 进 Git，其余不进
+  config.json              ← 共享配置
+  events.jsonl             ← 不进 Git
+  backups/                 ← 不进 Git
+  temp/                    ← 不进 Git
+```
+
+**核心矛盾**：`activeContext.md` 是写入最频繁的文件（每次会话结束都写），但使用 overwrite 模式，10 人 = 10 个 AI 会话 = 高频全文替换 = Git 冲突地狱。
+
+### 设计方案
+
+#### 总体策略：按用户分文件 + 共享文件只读/append
+
+```
+memory-bank/
+  activeContext/                    ← 新：目录替代单文件
+    _shared.md                      ← 团队共享上下文（只读 or append-only）
+    mengzhoyang.md                  ← 个人活跃上下文
+    zhangsan.md                     ← 个人活跃上下文
+    ...                             ← 每人一个文件，最多 10 个
+  progress.md                       ← 保持不变（低频，append 模式）
+  techContext.md                    ← 保持不变（低频，append 模式）
+  systemPatterns.md                 ← 保持不变（低频，append 模式）
+  projectbrief.md                   ← 保持不变（极低频）
+```
+
+#### 改动 1：activeContext 从单文件改为用户分区目录
+
+**原理**：每人写自己的文件，Git 合并零冲突。
+
+| 操作 | 旧行为 | 新行为 |
+|------|--------|--------|
+| 会话开始读取 | `memory_get("memory-bank/activeContext.md")` | `memory_get("memory-bank/activeContext/{user}.md")` + `memory_get("memory-bank/activeContext/_shared.md")` |
+| 会话结束写入 | `memory_write("memory-bank/activeContext.md", ..., mode="overwrite")` | `memory_write("memory-bank/activeContext/{user}.md", ..., mode="overwrite")` |
+| 团队公告/决策 | 无 | `memory_write("memory-bank/activeContext/_shared.md", ..., mode="append")` |
+
+**`{user}` 来源**：`get_current_user(config.repo_root)` — 已有实现，优先读 `.vscode/settings.json["memory-mcp.userName"]`。
+
+**实现要点**：
+- `memory_writer.py`：新增 `resolve_user_path(path, user)` 函数
+  - 当 path 匹配 `memory-bank/activeContext.md` 时，自动重定向到 `memory-bank/activeContext/{user}.md`
+  - 其他路径不受影响
+- `memory_reader.py`：`memory_get` 同理，读取时自动重定向
+- `server.py`：工具描述更新，说明 activeContext 的用户分区行为
+- 向后兼容：如果旧的 `activeContext.md` 单文件仍存在，首次启动时自动迁移到 `activeContext/{user}.md`
+
+#### 改动 2：overwrite 模式注入用户标签尾注
+
+**原理**：即使是个人文件，也需要可追溯性。
+
+```python
+# memory_writer.py — overwrite 分支
+else:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    footer = f"\n<!-- last overwritten by {current_user} at {timestamp} -->\n"
+    final_content = content.rstrip("\n") + "\n" + footer
+```
+
+**影响**：所有 overwrite 写入的文件末尾都会有 `<!-- last overwritten by xxx at xxx -->` 标签。
+
+#### 改动 3：共享文件强制 append + 用户标签
+
+**原理**：`progress.md`、`techContext.md`、`systemPatterns.md` 是团队共享知识，多人写入应使用 append 模式。
+
+**实现**：
+- `config.json` 的 guard targets 新增 `write_policy` 字段：
+
+```json
+{
+  "path": "memory-bank/progress.md",
+  "write_policy": "append_only",
+  "role": "feature completion status, milestones"
+}
+```
+
+- `memory_writer.py`：写入前检查 target 的 `write_policy`
+  - `"append_only"`：如果调用方传入 `mode="overwrite"`，自动降级为 `append` 并在返回中标注 `"policy_override": "append_only"`
+  - `"user_scoped"`：触发改动 1 的用户分区逻辑
+  - `null` / 不设置：保持当前行为
+
+#### 改动 4：`.ai-context/` 用户隔离（共享开发机场景）
+
+**原理**：`.ai-context/` 不进 Git，但同一机器多人共用时会互相覆盖。
+
+```
+.ai-context/
+  mengzhoyang/
+    current-task.md
+    latest-error.md
+  zhangsan/
+    current-task.md
+    latest-error.md
+```
+
+**实现**：与改动 1 类似，`resolve_user_path` 对 `.ai-context/` 下的路径也做用户分区。
+
+**注意**：这个改动只在共享开发机场景下有意义。如果每人独立机器，`.ai-context/` 天然隔离，此改动可延后。
+
+#### 改动 5：全局预算扩容
+
+| 参数 | 当前值 | 10 人建议值 | 理由 |
+|------|--------|-------------|------|
+| `total_max_chars` | 60,000 | 150,000 | 10 人 × 8K activeContext + 共享文件 |
+| `total_max_tokens` | 15,000 | 40,000 | 同比例扩容 |
+| `guard_default_max_chars` | 12,000 | 12,000 | 单文件上限不变 |
+| 每人 activeContext 上限 | — | 6,000 chars | 新增 per-user guard target |
+
+#### 改动 6：config.json 新增结构
+
+```json
+{
+  "multi_user": {
+    "enabled": true,
+    "user_scoped_paths": [
+      "memory-bank/activeContext.md",
+      ".ai-context/current-task.md",
+      ".ai-context/latest-error.md"
+    ],
+    "shared_paths_policy": {
+      "memory-bank/progress.md": "append_only",
+      "memory-bank/techContext.md": "append_only",
+      "memory-bank/systemPatterns.md": "append_only",
+      "memory-bank/projectbrief.md": "append_only"
+    }
+  },
+  "guard": {
+    "total_max_chars": 150000,
+    "total_max_tokens": 40000,
+    "per_user_max_chars": 6000,
+    "targets": [
+      {
+        "path": "memory-bank/activeContext/{user}.md",
+        "max_chars": 6000,
+        "write_policy": "user_scoped",
+        "role": "per-user sprint focus and recent decisions"
+      },
+      {
+        "path": "memory-bank/activeContext/_shared.md",
+        "max_chars": 8000,
+        "write_policy": "append_only",
+        "role": "team-wide announcements, shared decisions"
+      }
+    ]
+  }
+}
+```
+
+### 迁移计划
+
+```
+Phase A — 基础设施（无破坏性变更）
+  1. memory_writer.py: 实现 overwrite 尾注（改动 2）
+  2. memory_config.py: 新增 multi_user / write_policy 配置解析
+  3. memory_writer.py: 实现 write_policy 检查（改动 3）
+  4. 测试：全部原有测试通过 + 新增 write_policy 测试
+
+Phase B — 用户分区（核心改动）
+  5. memory_writer.py + memory_reader.py: 实现 resolve_user_path（改动 1）
+  6. server.py: 工具描述更新
+  7. config.json: 新增 multi_user 配置（改动 6）
+  8. 迁移脚本: activeContext.md → activeContext/{user}.md
+  9. 测试：用户分区读写 + 迁移 + 向后兼容
+
+Phase C — 扩容与可选改动
+  10. config.json: 全局预算扩容（改动 5）
+  11. .ai-context 用户隔离（改动 4，可选，视是否有共享开发机需求）
+  12. copilot-instructions.md: 更新 Memory Bank 硬规则中的路径说明
+```
+
+### Git 冲突分析（改动后）
+
+| 文件 | 写入频率 | 写入模式 | 冲突概率 |
+|------|----------|----------|----------|
+| `activeContext/{user}.md` | 高（每次会话） | overwrite | **零**（每人独立文件） |
+| `activeContext/_shared.md` | 低（团队决策时） | append | **极低**（append 天然可合并） |
+| `progress.md` | 低 | append | **极低** |
+| `techContext.md` | 低 | append | **极低** |
+| `systemPatterns.md` | 低 | append | **极低** |
+| `projectbrief.md` | 极低 | append | **几乎为零** |
+
+### 风险与注意事项
+
+1. **AI 指令适配**：`copilot-instructions.md` 中的 Memory Bank 硬规则需要同步更新路径（`activeContext.md` → `activeContext/{user}.md`），否则 AI 会话仍会尝试写入旧路径
+2. **向后兼容**：需要处理旧的 `activeContext.md` 单文件到新目录结构的迁移，建议首次检测到旧文件时自动迁移
+3. **用户名一致性**：10 人团队必须确保每人的 `.vscode/settings.json` 中配置了唯一的 `memory-mcp.userName`，否则会出现用户名冲突。建议在 `memory_writer.py` 中增加用户名校验（非空、非 unknown）
+4. **compaction 适配**：`memory_compact` 的 `warm_context` 策略需要适配目录结构，对每个用户文件独立执行 compaction
+5. **memory_search 适配**：搜索范围需要包含 `activeContext/` 目录下的所有用户文件
+6. **guard 适配**：per-user guard target 需要动态匹配 `{user}` 占位符
+
+### 工作量估算
+
+| Phase | 改动文件数 | 预估工时 | 优先级 |
+|-------|-----------|----------|--------|
+| A（基础设施） | 2-3 | 2h | 高 |
+| B（用户分区） | 4-5 | 4h | 高 |
+| C（扩容与可选） | 2-3 | 2h | 中 |
+| 测试 | 1-2 | 2h | 高 |
+| 文档更新 | 2 | 1h | 中 |
+| **合计** | | **~11h** | |
+
+---
+
 ## 2026-03-24 (v0.3.1: 用户名可配置覆盖 — .vscode/settings.json)
 
 ### 背景

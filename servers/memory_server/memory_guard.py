@@ -9,6 +9,33 @@ from .memory_result import error_result, ok_result
 from .token_estimator import estimate_tokens
 
 
+def _scan_user_scoped_dir(config: MemoryConfig, target_path: str) -> list[tuple[str, str]]:
+    """扫描 user_scoped 目录下的所有用户文件。
+
+    例如 target_path="memory-bank/activeContext.md"
+    → 扫描 memory-bank/activeContext/*.md
+    返回 [(rel_path, text), ...]
+    """
+    from pathlib import Path as _Path
+    normalized = target_path.replace("\\", "/").strip("/")
+    stem = _Path(normalized).stem       # "activeContext"
+    parent = str(_Path(normalized).parent).replace("\\", "/")  # "memory-bank"
+    dir_path = config.repo_root / parent / stem
+
+    results: list[tuple[str, str]] = []
+    if not dir_path.is_dir():
+        return results
+    for f in sorted(dir_path.iterdir()):
+        if f.is_file() and f.suffix == ".md":
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+                rel = f.resolve().relative_to(config.repo_root).as_posix()
+                results.append((rel, text))
+            except OSError:
+                continue
+    return results
+
+
 def check_total_budget(config: MemoryConfig, *, extra_chars: int = 0) -> dict[str, Any] | None:
     """Check if adding *extra_chars* would exceed the global memory budget.
 
@@ -24,6 +51,12 @@ def check_total_budget(config: MemoryConfig, *, extra_chars: int = 0) -> dict[st
     total_chars = 0
     total_tokens = 0
     for target in config.guard_targets:
+        # user_scoped target：扫描目录下所有用户文件
+        if target.write_policy == "user_scoped":
+            for _rel, text in _scan_user_scoped_dir(config, target.path):
+                total_chars += len(text)
+                total_tokens += estimate_tokens(text)
+            continue
         try:
             resolved = manager.resolve(target.path, must_exist=False, must_be_file=False)
         except Exception:
@@ -79,10 +112,69 @@ def memory_guard_check(config: MemoryConfig) -> dict:
     items: list[dict] = []
     stats = {"total": 0, "ok": 0, "warn": 0, "exceeded": 0, "missing": 0, "error": 0}
 
+    _STATUS_MESSAGES = {
+        "ok": "within guard range",
+        "warn": "approaching threshold (>=90%)",
+        "exceeded": "threshold exceeded",
+    }
+
     for target in config.guard_targets:
         stats["total"] += 1
         max_chars = target.max_chars if target.max_chars is not None else config.guard_default_max_chars
         max_tokens = target.max_tokens if target.max_tokens is not None else config.guard_default_max_tokens
+
+        # user_scoped target：扫描目录下所有用户文件，每个文件独立报告
+        if target.write_policy == "user_scoped":
+            user_files = _scan_user_scoped_dir(config, target.path)
+            if not user_files:
+                # 目录不存在或为空，同时检查旧单文件是否存在
+                try:
+                    resolved = manager.resolve(target.path, must_exist=False, must_be_file=False)
+                except PathSecurityError:
+                    resolved = None
+                if resolved and resolved.is_file():
+                    # 旧单文件仍存在，按普通逻辑处理
+                    pass
+                else:
+                    items.append({
+                        "path": target.path,
+                        "chars": 0,
+                        "tokens_est": 0,
+                        "max_chars": max_chars,
+                        "max_tokens": max_tokens,
+                        "status": "missing",
+                        "message": "user_scoped directory is empty or does not exist",
+                        "suggested_action": "write to activeContext to auto-create user file",
+                    })
+                    stats["missing"] += 1
+                    continue
+            else:
+                # 为每个用户文件生成独立的 guard 条目
+                for rel_path, text in user_files:
+                    chars = len(text)
+                    tokens_est = estimate_tokens(text)
+                    over_char = max_chars is not None and chars > max_chars
+                    over_token = max_tokens is not None and tokens_est > max_tokens
+                    near_char = max_chars is not None and chars >= int(max_chars * 0.9)
+                    near_token = max_tokens is not None and tokens_est >= int(max_tokens * 0.9)
+                    if over_char or over_token:
+                        file_status = "exceeded"
+                    elif near_char or near_token:
+                        file_status = "warn"
+                    else:
+                        file_status = "ok"
+                    stats[file_status] += 1
+                    items.append({
+                        "path": rel_path,
+                        "chars": chars,
+                        "tokens_est": tokens_est,
+                        "max_chars": max_chars,
+                        "max_tokens": max_tokens,
+                        "status": file_status,
+                        "message": _STATUS_MESSAGES.get(file_status, file_status),
+                        "suggested_action": target.suggestion or _default_suggestion(target.policy, file_status),
+                    })
+                continue
 
         try:
             resolved = manager.resolve(target.path, must_exist=False, must_be_file=False)
@@ -162,11 +254,6 @@ def memory_guard_check(config: MemoryConfig) -> dict:
         else:
             status = "ok"
 
-        _STATUS_MESSAGES = {
-            "ok": "within guard range",
-            "warn": "approaching threshold (>=90%)",
-            "exceeded": "threshold exceeded",
-        }
         stats[status] += 1
         items.append(
             {

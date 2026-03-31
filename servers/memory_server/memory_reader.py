@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .memory_config import MemoryConfig
-from .memory_paths import PathManager, PathSecurityError
+from .memory_events import get_current_user
+from .memory_paths import PathManager, PathSecurityError, resolve_user_path
 from .memory_result import error_result, ok_result
 
 
@@ -23,8 +24,20 @@ def memory_get(
 ) -> dict:
     manager = PathManager(config)
 
+    # user_scoped 路径重定向：检查 write_policy 或 multi_user 配置
+    effective_path = path
+    if config.multi_user and config.multi_user.enabled and config.multi_user.user_scoped_paths:
+        normalized = path.replace("\\", "/").strip("/")
+        for scoped in config.multi_user.user_scoped_paths:
+            scoped_norm = scoped.replace("\\", "/").strip("/")
+            if scoped_norm == normalized or normalized.endswith(scoped_norm):
+                current_user = get_current_user(config.repo_root)
+                if current_user and current_user != "unknown":
+                    effective_path = resolve_user_path(config, path, current_user)
+                break
+
     try:
-        resolved = manager.resolve(path, must_exist=True, must_be_file=True)
+        resolved = manager.resolve(effective_path, must_exist=True, must_be_file=True)
     except PathSecurityError as exc:
         return error_result("path_not_allowed", str(exc))
     except FileNotFoundError as exc:

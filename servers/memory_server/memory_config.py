@@ -16,6 +16,18 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
     "events_file": ".ai-memory/events.jsonl",
     "backups_dir": ".ai-memory/backups",
     "temp_dir": ".ai-memory/temp",
+    "multi_user": {
+        "enabled": False,
+        "user_scoped_paths": [
+            "memory-bank/activeContext.md",
+        ],
+        "shared_paths_policy": {
+            "memory-bank/progress.md": "append_only",
+            "memory-bank/techContext.md": "append_only",
+            "memory-bank/systemPatterns.md": "append_only",
+            "memory-bank/projectbrief.md": "append_only",
+        },
+    },
     "backup": {
         "max_total_bytes": 524_288,
         "max_file_bytes": 262_144,
@@ -29,11 +41,11 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
         "targets": [
             {"path": ".ai-context/current-task.md", "max_chars": 6_000, "policy": "hot_task", "role": "hot task context for current working session"},
             {"path": ".ai-context/latest-error.md", "max_chars": 4_000, "policy": "error_summary", "role": "latest valid error summary"},
-            {"path": "memory-bank/activeContext.md", "max_chars": 8_000, "policy": "warm_context", "role": "current sprint focus, recent decisions, TODOs", "preferred_mode": "append"},
-            {"path": "memory-bank/progress.md", "max_chars": 12_000, "policy": "warm_context", "role": "feature completion status, milestones"},
-            {"path": "memory-bank/techContext.md", "max_chars": 10_000, "policy": "warm_context", "role": "tech stack, plugin matrix, architecture config"},
-            {"path": "memory-bank/systemPatterns.md", "max_chars": 10_000, "policy": "warm_context", "role": "architecture patterns, coding conventions, design decisions"},
-            {"path": "memory-bank/projectbrief.md", "max_chars": 8_000, "policy": "warm_context", "role": "project scope, core requirements, MVP goals"},
+            {"path": "memory-bank/activeContext.md", "max_chars": 8_000, "policy": "warm_context", "role": "current sprint focus, recent decisions, TODOs", "write_policy": "user_scoped"},
+            {"path": "memory-bank/progress.md", "max_chars": 12_000, "policy": "warm_context", "role": "feature completion status, milestones", "write_policy": "append_only"},
+            {"path": "memory-bank/techContext.md", "max_chars": 10_000, "policy": "warm_context", "role": "tech stack, plugin matrix, architecture config", "write_policy": "append_only"},
+            {"path": "memory-bank/systemPatterns.md", "max_chars": 10_000, "policy": "warm_context", "role": "architecture patterns, coding conventions, design decisions", "write_policy": "append_only"},
+            {"path": "memory-bank/projectbrief.md", "max_chars": 8_000, "policy": "warm_context", "role": "project scope, core requirements, MVP goals", "write_policy": "append_only"},
         ],
     },
 }
@@ -47,6 +59,15 @@ class GuardTarget:
     policy: str | None
     suggestion: str | None
     role: str | None = None
+    write_policy: str | None = None  # "append_only" | "user_scoped" | None
+
+
+@dataclass(frozen=True)
+class MultiUserConfig:
+    """多人协作配置。"""
+    enabled: bool = False
+    user_scoped_paths: list[str] | None = None  # 需要按用户分区的路径列表
+    shared_paths_policy: dict[str, str] | None = None  # 共享路径 → 写入策略映射
 
 
 @dataclass(frozen=True)
@@ -68,6 +89,7 @@ class MemoryConfig:
     backup_max_file_bytes: int | None = None
     backup_max_total_bytes: int | None = None
     backup_max_batches: int | None = None
+    multi_user: MultiUserConfig | None = None
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -110,9 +132,32 @@ def _parse_guard_targets(raw_targets: Any) -> list[GuardTarget]:
                 policy=str(item.get("policy")).strip() if item.get("policy") else None,
                 suggestion=str(item.get("suggestion")).strip() if item.get("suggestion") else None,
                 role=str(item.get("role")).strip() if item.get("role") else None,
+                write_policy=str(item.get("write_policy")).strip() if item.get("write_policy") else None,
             )
         )
     return parsed
+
+
+def _parse_multi_user(raw: Any) -> MultiUserConfig | None:
+    """解析 multi_user 配置节。"""
+    if not isinstance(raw, dict):
+        return None
+    enabled = bool(raw.get("enabled", False))
+    user_scoped_paths = raw.get("user_scoped_paths")
+    if isinstance(user_scoped_paths, list):
+        user_scoped_paths = [str(p).strip() for p in user_scoped_paths if str(p).strip()]
+    else:
+        user_scoped_paths = None
+    shared_paths_policy = raw.get("shared_paths_policy")
+    if isinstance(shared_paths_policy, dict):
+        shared_paths_policy = {str(k).strip(): str(v).strip() for k, v in shared_paths_policy.items() if str(k).strip()}
+    else:
+        shared_paths_policy = None
+    return MultiUserConfig(
+        enabled=enabled,
+        user_scoped_paths=user_scoped_paths,
+        shared_paths_policy=shared_paths_policy,
+    )
 
 
 def _ensure_layout(repo_root: Path) -> None:
@@ -202,4 +247,5 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         backup_max_batches=(
             int(backup_cfg.get("max_batches")) if isinstance(backup_cfg.get("max_batches"), (int, float)) else None
         ),
+        multi_user=_parse_multi_user(merged.get("multi_user")),
     )
