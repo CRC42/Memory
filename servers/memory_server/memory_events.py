@@ -88,6 +88,7 @@ def append_event(config: MemoryConfig, event_type: str, payload: dict[str, Any],
     }
     line = json.dumps(record, ensure_ascii=False) + "\n"
     config.events_file.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_events_if_needed(config)
     with config.events_file.open("a", encoding="utf-8") as handle:
         _lock_file(handle)
         try:
@@ -95,3 +96,64 @@ def append_event(config: MemoryConfig, event_type: str, payload: dict[str, Any],
             handle.flush()
         finally:
             _unlock_file(handle)
+
+
+# Default rotation thresholds; can be overridden by env var for emergencies.
+_EVENTS_MAX_BYTES_DEFAULT = 5 * 1024 * 1024   # 5 MB per active file
+_EVENTS_MAX_ARCHIVES_DEFAULT = 5              # keep last 5 rotated archives
+
+
+def _events_max_bytes() -> int:
+    raw = os.environ.get("MEMORY_MCP_EVENTS_MAX_BYTES")
+    if raw and raw.isdigit():
+        return max(1024, int(raw))
+    return _EVENTS_MAX_BYTES_DEFAULT
+
+
+def _events_max_archives() -> int:
+    raw = os.environ.get("MEMORY_MCP_EVENTS_MAX_ARCHIVES")
+    if raw and raw.isdigit():
+        return max(0, int(raw))
+    return _EVENTS_MAX_ARCHIVES_DEFAULT
+
+
+def _rotate_events_if_needed(config: MemoryConfig) -> None:
+    """Rotate events.jsonl when it grows past the configured size threshold.
+
+    Rotated files are renamed `events.jsonl.YYYYMMDDTHHMMSS` next to the
+    active file. The newest N archives are kept; older ones are deleted.
+    Failures here must never break event recording, so all OS errors are
+    swallowed and the active log keeps growing as a fallback.
+    """
+    try:
+        active = config.events_file
+        if not active.is_file():
+            return
+        max_bytes = _events_max_bytes()
+        if active.stat().st_size < max_bytes:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        archive = active.with_name(f"{active.name}.{ts}")
+        # On Windows os.replace handles existing targets; pick a fresh name if needed.
+        suffix = 1
+        while archive.exists():
+            archive = active.with_name(f"{active.name}.{ts}-{suffix}")
+            suffix += 1
+        os.replace(active, archive)
+        active.touch()
+
+        max_archives = _events_max_archives()
+        if max_archives <= 0:
+            return
+        archives = sorted(
+            [p for p in active.parent.iterdir() if p.is_file() and p.name.startswith(active.name + ".")]
+        )
+        while len(archives) > max_archives:
+            try:
+                archives[0].unlink()
+            except OSError:
+                break
+            archives = archives[1:]
+    except OSError:
+        # Rotation must never block the audit write path.
+        return

@@ -1,5 +1,429 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-21 (后续开发计划：LLM 与 RAG 优先级)
+
+> **状态：文档规划更新，无代码变更**
+
+### 结论
+
+- P3 仍以 LLM 增强为优先方向：分类、tag 推荐、候选生成、冲突解释和摘要提炼。
+- 不再把中文分词增强列为独立计划；当前继续保留已实现的 CJK bigram/trigram 作为中文检索兜底。
+- 中文模糊查询优先通过 LLM query rewrite / metadata hint 增强，再交给当前 FTS 检索。
+- 本地 RAG / 向量召回排在 LLM 增强之后，仅用于语义模糊召回、相似记录推荐和候选冲突提示。
+- RAG 索引必须是 `.ai-memory/` 下的派生产物，可删除重建，不能替代 Markdown + Front Matter 真源。
+
+### 约束
+
+- LLM 和 RAG 都不能直接发布系统记忆。
+- `candidate -> validated -> published` 治理流不变。
+- 无 LLM、无向量模型时，基础写入、FTS 检索、编译和治理必须继续可用。
+
+## 2026-04-21 (v0.4.1 严肃评审 P0 修复轮)
+
+> **状态：已实现，向后兼容；测试 106 → 113 全部通过**
+
+### 背景
+
+针对 vNext 设计目标做了一轮严肃评审，定位到 7 个会在多人 / 多客户端 / 真实文本场景下踩雷的正确性与设计风险，本次集中修复。
+
+### 修复清单
+
+1. **FTS5 MATCH 查询语法**（`memory_record_index.py`）
+   - 旧实现 `f"search_text : {query_text}"` 同时存在两个错误：
+     1) FTS5 列限定符不允许空格；
+     2) 用户输入直接拼接，含 `-` / `OR` / `"` / `:` 时会触发 `OperationalError`。
+   - 新实现 `build_fts5_match_query()`：复用索引侧 tokenizer，对每个 token 加双引号包成 phrase，去掉列限定符（`search_text` 仍是覆盖最广的索引列，所有列 MATCH 等价或更宽）。
+   - 新增 `_escape_fts5_token` / `build_fts5_match_query` 公共函数，便于复用与单测。
+
+2. **编译器禁止反向修改源记录**（`memory_compiler.py`）
+   - 旧 `_mark_records_used` 会把 `last_used_at` 写回真源 `.md`，违反"编译产物可重建、源是真源"的设计原则，污染 Git diff，且不刷新 FTS 索引。
+   - 新实现 `_record_usage_stats` 把使用情况写到 `.ai-memory/usage-stats.json`（与 compile-cache 同级，可整体删除重建）。
+   - 新增 `get_record_last_used_at(config, record_id)` 公共读 API。
+
+3. **记录写入原子化**（`memory_records.py`）
+   - 改用 `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` 创建记录，关闭 `already_exists` 检查与 `write_text` 之间的 TOCTOU 窗口；并发 MCP 客户端碰到同 id 时一方失败而非互相覆盖。
+   - 写入失败时回滚被 `O_EXCL` 创建出来的空文件，避免留下半成品。
+
+4. **治理状态迁移原子化**（`memory_governance.py`）
+   - 旧 `write_text(new) → unlink(old)` 路径在异常时可能留下两份或丢失记录。
+   - 新实现：临时文件 `tmp` → `os.replace(tmp, new)` → 仅在新路径就绪后删除旧路径；任一步失败都不会破坏既有真源。
+
+5. **`memory_write` 用户标签注入策略**（`memory_writer.py` + `server.py`）
+   - 旧实现无差别向所有写入末尾注入 `<!-- last overwritten by ... -->`；写入 JSON / YAML / TOML / 源码会破坏文件。
+   - 新实现新增 `inject_user_tag` 参数：默认按扩展名自动判断（仅 `.md` / `.markdown` 注入），`True` 强制开启，`False` 强制关闭。
+   - MCP `memory_write` 工具 schema 同步暴露 `inject_user_tag`。
+
+6. **`resolve_user_path` 自动迁移加归属警告**（`memory_paths.py`）
+   - 旧逻辑会把多人共写的旧 `activeContext.md` 直接复制到第一个登场的用户分区文件，造成事实归属错误。
+   - 新逻辑在迁移内容前插入 `<!-- migrated-from-shared: ... attribution to '{user}' is NOT verified ... -->` banner，提示人工核对。
+
+7. **审计日志 rotation**（`memory_events.py`）
+   - 新增 `_rotate_events_if_needed()`：`events.jsonl` 超过阈值（默认 5 MB，可由 `MEMORY_MCP_EVENTS_MAX_BYTES` 覆盖）时按时间戳重命名为 `events.jsonl.YYYYMMDDTHHMMSS`，仅保留最新 N 份归档（默认 5，可由 `MEMORY_MCP_EVENTS_MAX_ARCHIVES` 覆盖）。
+   - rotation 过程中的所有 OS 错误都被吞掉，绝不阻塞审计写入路径。
+
+8. **去除默认 tag 词表的双源**（`memory_config.py` + `memory_records.py`）
+   - 把内置默认 tag 集合提取为 `memory_config.DEFAULT_ALLOWED_TAGS` 单一定义。
+   - `memory_records.ALLOWED_TAGS` 改为从 `memory_config` 引入；`DEFAULT_CONFIG_CONTENT` 也复用同一份列表。后续增减 tag 只改一处。
+
+### 新增测试
+
+- `test_record_index.py::test_search_records_handles_fts5_reserved_characters` — 覆盖 `texture-size` / `round-trip` / `OR fallback` / `"quoted phrase"` 四种触发旧 syntax error 的查询。
+- `test_record_index.py::test_search_records_empty_after_normalization_returns_no_hits` — 全标点查询不再抛错。
+- `test_record_index.py::test_search_records_query_plan_uses_sqlite_fts_index` — 同步到新查询表达式。
+- `test_runtime_maintenance.py::test_compile_updates_last_used_at_and_writes_cache_manifest` — 改为断言"源记录未被改动 + `usage-stats.json` 写入 + 二次编译不改源 mtime"。
+- `test_governance.py::test_validate_candidate_does_not_leave_two_copies` — 状态迁移后无残留 staging 文件。
+- `test_write.py::test_inject_user_tag_default_skips_non_markdown` — `.json` 写入不被注释污染，且仍是有效 JSON。
+- `test_write.py::test_inject_user_tag_default_marks_markdown` — `.md` 默认仍带尾注。
+- `test_write.py::test_inject_user_tag_can_be_force_disabled` — 显式关闭注入。
+- `test_multi_user.py::test_user_scoped_migration_includes_attribution_banner` — 自动迁移携带归属警告 banner。
+
+### 验证结果
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 113 passed
+
+.\scripts\run_memory_all_tests.ps1
+# 113 passed
+```
+
+### 行为兼容性说明
+
+- MCP 工具数量不变（仍 18 个）。
+- 默认场景下：旧的 `.md` 写入仍带用户尾注；旧的搜索查询仍可命中；治理迁移路径不变；候选发布规则不变。
+- 行为差异需调用方注意：
+  - `memory_compile` 不再修改源记录的 `last_used_at`；改读 `.ai-memory/usage-stats.json` 或 `get_record_last_used_at()`。
+  - `memory_write` 写入非 `.md` 路径默认不再注入 HTML 注释；如需保留旧行为，显式传 `inject_user_tag=true`。
+  - 多人模式下首次自动迁移会带 banner，下游脚本读取 `activeContext/{user}.md` 时若期望"纯净文本"需自行剥离 banner 行。
+
+---
+
+## 2026-04-21 (P0/P1/P2 完成: 治理质量、运行时维护、配置化)
+
+> **状态：已实现，不包含 P3 LLM 增强**
+
+### 背景
+
+在记录写入、检索、编译和基础治理闭环之后，继续补齐非 LLM 的 P0/P1/P2 能力：治理质量、运行时使用追踪、维护健康检查、schema 迁移、增量索引和删除策略。
+
+### 本次实现
+
+#### P0 治理质量
+
+- `governance.min_confidence`：候选验证时检查最低可信度。
+- `governance.require_source_refs_for`：指定候选类型必须有 `source_refs`。
+- `governance.reviewers`：限制 `validated_by`。
+- `governance.publish_owners`：限制 `published_by`。
+- 验证时检查重复标题/正文。
+- 发布时检查与 existing shared published system rule 标题相同但正文不同的冲突。
+
+#### P1 编译与运行时
+
+- `memory_compile` 会更新 included records 的 `last_used_at`。
+- `memory_compile` 会写入 `.ai-memory/compile-cache/{target...}.json` manifest。
+- `runtime_digest` 会包含旧文件摘要 section：`activeContext.md` / `progress.md`，保持与旧文件级记忆兼容。
+
+#### P2 配置化与维护
+
+- `tag_schema.allowed_tags` / `tag_schema.version` 配置化。
+- `memory_health_check`：检查缺失 metadata、未知 tag、缺失 `search.db`。
+- `memory_migrate_records`：迁移记录 `schema_version`，写入 `schema_migrated_from`。
+- `memory_update_index`：对指定记录路径增量更新 SQLite FTS。
+- `memory_delete_record`：只允许删除 archived 记录，并写入 `.ai-memory/tombstones.jsonl`。
+- MCP 工具列表从 14 个扩展为 18 个。
+- 更新 `README.md` 与 `MemorySystemDesignDocument.md`。
+
+#### 健壮性收口
+
+- `memory_compile` 明确拒绝非 `list[str]` 的 `include_scopes` / `include_statuses` / `preferred_tags`，避免字符串被误拆成字符过滤器。
+- `memory_get_runtime_digest` 在读文件前校验 `max_chars >= 0`，错误输入稳定返回 `invalid_input`。
+- `memory_write_record` 的 tag schema 校验改为显式参数传递，去掉函数属性形式的隐式全局状态，避免多配置/并发场景串配置。
+- `memory_compile` 的 legacy section 与 `last_used_at` 更新改为显式传入 config，去掉编译流程中的模块级临时状态。
+- `memory_health_check` 增加未闭合 Front Matter 报告。
+- `memory_update_index` 增加 `paths` 参数类型防御；治理记录移动后会在已有 `search.db` 上刷新索引。
+- 新增 MCP stdio `tools/list` 烟测，确认 18 个工具可被 MCP 客户端发现。
+- 修复 `scripts/run_memory_*_tests.ps1`：测试脚本优先使用 `MCP/Memory/.venv`，若该环境缺少 `pytest` 则自动回退到仓库根 `.venv`；同时从 `MCP/Memory` 目录执行 pytest，确保 `tests/memory_server/conftest.py` 被加载。
+
+### TDD 验证
+
+新增：
+
+- `tests/memory_server/test_governance_quality.py`
+- `tests/memory_server/test_runtime_maintenance.py`
+- `tests/memory_server/test_robustness_edges.py`
+
+覆盖：
+
+- 缺少 `source_refs` 的候选验证拒绝。
+- 低 `confidence` 的候选验证拒绝。
+- 重复 candidate 拒绝。
+- 与已发布系统规则冲突的 candidate 发布拒绝。
+- 非 owner 发布拒绝。
+- tag schema version 来自配置。
+- 编译更新 `last_used_at`。
+- 编译写入 compile-cache manifest。
+- runtime digest 包含旧文件 section。
+- health check 报告坏记录和缺失 search.db。
+- schema migration 更新旧记录。
+- `memory_update_index` 增量索引单条记录。
+- 非 archived 记录禁止删除。
+- archived 记录删除时写 tombstone。
+- MCP dispatch 暴露维护工具。
+- 缺失记录治理返回 `not_found`。
+- 非列表编译过滤器返回 `invalid_input`。
+- runtime digest 负数截断长度返回 `invalid_input`。
+- dispatch 层错误参数不会触发内部异常。
+- 配置化 tag schema 不会泄漏到其他 config。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 106 passed
+
+.\scripts\run_memory_all_tests.ps1
+# 106 passed
+```
+
+---
+
+## 2026-04-21 (vNext 治理闭环: validate / publish / archive)
+
+> **状态：已实现**
+
+### 背景
+
+记录级写入、检索、编译已经可用，但候选记录仍缺少从 candidate 到 published / archive 的治理闭环。根据设计文档，系统记忆不能由 LLM 直接发布，必须经过验证与发布流程。
+
+### 本次实现
+
+- 新增 `memory_governance.py`。
+- 新增 `memory_validate_candidate`：
+  - 支持 candidate/raw -> validated。
+  - 写入 `validated_by` 和 `updated_at`。
+  - 将候选从 `memory-bank/candidates/` 移入对应治理层。
+- 新增 `memory_publish_candidate`：
+  - 只允许发布 `status=validated` 且带 `validated_by` 的记录。
+  - 发布后写入 `published_by` / `published_at`。
+  - 发布后进入 `memory-bank/shared/{id}.md`。
+  - `*_candidate` 发布后转为 `system_rule`。
+- 新增 `memory_archive_record`：
+  - 将任意记录移入 `memory-bank/archive/{id}.md`。
+  - 写入 `archive_reason` / `archived_at`。
+- 扩展 `memory_compile`：
+  - 新增 `target="system_digest"`。
+  - 新增 `target="publish_queue"`。
+- MCP 工具列表从 11 个扩展为 14 个。
+- 更新 `README.md` 与 `MemorySystemDesignDocument.md`。
+
+### TDD 验证
+
+新增 `tests/memory_server/test_governance.py`，覆盖：
+
+- candidate 验证后元数据更新，并移出候选池。
+- validated candidate 发布为 shared system rule。
+- 未验证 candidate 发布被拒绝。
+- 任意记录可归档，并写入归档元数据。
+- `publish_queue` 编译列出 candidate 记录。
+- `system_digest` 编译列出 published shared rule。
+- MCP dispatch 暴露并调用 validate / publish / archive。
+- `_build_tools` 包含治理工具。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 81 passed
+```
+
+---
+
+## 2026-04-21 (vNext 编译层: runtime digest 与 task handoff)
+
+> **状态：已实现**
+
+### 背景
+
+记录写入、Front Matter 解析、SQLite FTS 和记录搜索已经完成，但设计文档中的编译层仍缺失。根据 vNext 设计，编译必须是无 LLM 可运行、确定性、可重建的派生视图，而不是新的真源。
+
+### 本次实现
+
+- 新增 `memory_compiler.py`。
+- 新增 `memory_compile`：
+  - 支持 `target="runtime_digest"`。
+  - 支持 `target="task_handoff"`。
+  - 默认只包含 `validated` / `published` 记录。
+  - 支持 `user`、`task_id`、`branch`、`include_scopes`、`include_statuses`、`preferred_tags` 过滤。
+  - 个人记录在指定 `user` 时只包含该用户自己的记录。
+  - 输出确定性 Markdown，不包含当前时间戳，重复编译内容稳定。
+- 新增 `memory_get_runtime_digest`，读取已有 runtime digest。
+- 编译产物路径：
+  - `memory-bank/compiled/runtime/task/{task_id}.md`
+  - `memory-bank/compiled/runtime/branch/{branch}.md`
+  - `memory-bank/compiled/runtime/people/{user}-digest.md`
+  - `memory-bank/compiled/runtime/system-digest.md`
+  - `memory-bank/compiled/runtime/task/{task_id}-handoff.md`
+- MCP 工具列表从 9 个扩展为 11 个。
+- 更新 `README.md` 与 `MemorySystemDesignDocument.md`。
+
+### TDD 验证
+
+新增 `tests/memory_server/test_compile.py`，覆盖：
+
+- `runtime_digest` 默认过滤 candidate，只包含 validated/published。
+- personal 记录按 `user` 过滤。
+- shared published 记录可被编译进 digest。
+- 编译结果重复生成内容稳定。
+- `memory_get_runtime_digest` 可读取已有编译产物。
+- `task_handoff` 可生成交接视图。
+- 未知 target 返回 `invalid_input`。
+- MCP dispatch 暴露并调用 `memory_compile` / `memory_get_runtime_digest`。
+- `_build_tools` 包含编译工具。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 73 passed
+```
+
+---
+
+## 2026-04-21 (测试加固: 多人读写与用户分区搜索)
+
+> **状态：已完成，未改生产代码**
+
+### 背景
+
+Memory MCP 是项目协作基础设施，多人模式下的读写行为必须被测试明确固定，尤其是 `activeContext.md` 到 `activeContext/{user}.md` 的重定向、旧文件迁移、用户身份识别和共享文件 append 策略。
+
+### 本次新增测试
+
+新增 `tests/memory_server/test_multi_user.py`，覆盖：
+
+- 同一逻辑路径 `memory-bank/activeContext.md` 在不同用户下写入独立文件：
+  - `memory-bank/activeContext/alice.md`
+  - `memory-bank/activeContext/bob.md`
+- 不同用户读取同一逻辑路径时，只返回自己的用户分区文件。
+- 首次读取旧版 `activeContext.md` 时自动迁移到当前用户分区，且保留旧单文件。
+- 缺少有效用户身份时，`user_scoped` 写入返回 `user_required`。
+- `.vscode/settings.json` 中的 `memory-mcp.userName` 优先于环境变量。
+- 共享文件 `progress.md` 在 `append_only` 策略下将 overwrite 请求降级为 append。
+- `memory_guard_check` 对每个用户分区文件分别报告。
+- `_dispatch_tool` 下 `memory_write` / `memory_get` 使用同一套用户重定向。
+- `memory_search` 可以扫描 `activeContext/{user}.md`，并可用 `include_paths` 定位单个用户文件。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 65 passed
+```
+
+---
+
+## 2026-04-21 (测试加固: SQLite FTS 查询计划)
+
+> **状态：已完成，未改生产代码**
+
+### 背景
+
+记录级搜索已经通过功能测试证明能重建 `.ai-memory/search.db` 并命中记录，但还需要直接固定“搜索确实走 SQLite FTS 虚拟表索引”，避免后续改动退化成普通表扫描或绕过 FTS。
+
+### 本次新增测试
+
+- 在 `tests/memory_server/test_record_index.py` 新增 `test_search_records_query_plan_uses_sqlite_fts_index`。
+- 测试会写入记录、重建索引、检查 `memory_records_fts` 包含 `search_text` 列。
+- 使用 `EXPLAIN QUERY PLAN` 验证 `MATCH` 查询计划包含 `VIRTUAL TABLE INDEX`。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 66 passed
+```
+
+---
+
+## 2026-04-21 (记录级检索增强: 零依赖中文 n-gram)
+
+> **状态：已实现**
+
+### 背景
+
+`memory_search_records` 初版依赖 SQLite FTS 默认 tokenizer。该方案对英文和 metadata 检索可用，但中文短词搜索效果不稳定；如果立即引入 `jieba` 等分词库，又会增加离线 wheel 预下载和部署维护成本。
+
+### 本次实现
+
+- 未新增任何 Python 第三方依赖。
+- 在 `memory_record_index.py` 中新增 `build_search_text`：
+  - 英文/数字/下划线/短横线按普通 token 保留。
+  - 中文连续文本生成 bigram/trigram。
+  - `tags`、`record_kind`、`scope`、`status`、`author`、`task_id`、`branch` 一并写入搜索文本。
+- `memory_rebuild_index` 的 FTS 表新增 `search_text` 列。
+- `memory_search_records` 查询统一转换为同一套 search text，再查 `search_text`。
+- 增加旧版 `.ai-memory/search.db` 自动迁移：如果已有 FTS 表缺少 `search_text`，重建索引时自动 drop/recreate 派生表。
+- 更新 `README.md` 与 `MemorySystemDesignDocument.md`，明确中文检索策略为无依赖 CJK n-gram。
+
+### TDD 验证
+
+- 新增中文短词搜索测试：`尺寸约束` 可命中 `导出链路尺寸约束`。
+- 新增 metadata 搜索测试：`task_id` 可命中记录。
+- 新增 tokenizer 单元测试：确认生成 CJK bigram/trigram。
+- 新增旧 FTS schema 迁移测试。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 55 passed
+```
+
+---
+
+## 2026-04-21 (vNext 实现起步: 记录级写入与 SQLite FTS 索引)
+
+> **状态：已实现首个 TDD 增量**
+
+### 背景
+
+基于 `MemorySystemDesignDocument.md` 的阶段 1 建议，本次没有推翻现有文件级接口，而是在 `v0.4.0` 的 `memory_get` / `memory_write` / `memory_search` / `memory_guard_check` 等能力旁边新增记录级基础能力。
+
+### 本次实现
+
+- 新增 `memory_write_record`，支持将结构化记忆写为 `Markdown + YAML Front Matter`。
+- 新增记录级基础字段校验：`record_kind`、`scope`、`status`、受控 `tags`、`confidence` 范围。
+- 新增候选、共享、个人、归档的基础落盘路由：
+  - `memory-bank/candidates/{id}.md`
+  - `memory-bank/shared/{id}.md`
+  - `memory-bank/people/{user}/{id}.md`
+  - `memory-bank/archive/{id}.md`
+- 新增 Front Matter 解析与序列化工具，当前使用无额外依赖的 YAML 子集解析，保证无 LLM / 无新增运行时依赖时可用。
+- 新增 `memory_rebuild_index`，从记录 Markdown 重建 `.ai-memory/search.db`。
+- 新增 `memory_search_records`，通过 SQLite FTS 查询结构化记录，并返回记录元数据。
+- MCP 工具列表从 6 个扩展为 9 个，同时保留既有文件级工具行为不变。
+
+### TDD 验证
+
+- 新增 `tests/memory_server/test_records.py` 覆盖记录写入、Front Matter 解析、非法枚举、受控标签和 dispatch。
+- 新增 `tests/memory_server/test_record_index.py` 覆盖索引重建、记录级搜索和 dispatch。
+- 更新动态工具描述测试，确认新增工具暴露在 MCP tool list 中。
+
+验证结果：
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 51 passed
+```
+
+### 后续建议
+
+- 下一步可在现有记录层上继续实现 `memory_compile` / `memory_get_runtime_digest`。
+- 候选验证、发布、归档流程仍应放在记录层稳定之后推进。
+- 当前 Front Matter 解析器只覆盖本项目记录 schema 需要的 YAML 子集，若后续需要复杂 YAML，应再评估是否引入运行时依赖。
+
+---
+
 ## 2026-04-21 (vNext 设计稿: 从文件级 Memory MCP 走向记录级治理与编译架构)
 
 > **状态：设计方案，未执行开发**

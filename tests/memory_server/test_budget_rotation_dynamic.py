@@ -160,7 +160,7 @@ def test_build_tools_dynamic_descriptions(repo: Path) -> None:
     """_build_tools produces descriptions containing dynamic file roles."""
     config = load_config(repo)
     tools = _build_tools(config)
-    assert len(tools) == 6
+    assert len(tools) == 18
 
     # memory_get should have file roles
     get_tool = next(t for t in tools if t.name == "memory_get")
@@ -173,6 +173,22 @@ def test_build_tools_dynamic_descriptions(repo: Path) -> None:
     # memory_write should have file roles
     write_tool = next(t for t in tools if t.name == "memory_write")
     assert "notes" in write_tool.description
+
+    # record-level write is available without changing file-level role hints
+    record_tool = next(t for t in tools if t.name == "memory_write_record")
+    assert "Front Matter" in record_tool.description
+
+    rebuild_tool = next(t for t in tools if t.name == "memory_rebuild_index")
+    assert "SQLite FTS" in rebuild_tool.description
+
+    compile_tool = next(t for t in tools if t.name == "memory_compile")
+    assert "deterministic" in compile_tool.description
+
+    validate_tool = next(t for t in tools if t.name == "memory_validate_candidate")
+    assert "Validate" in validate_tool.description
+
+    health_tool = next(t for t in tools if t.name == "memory_health_check")
+    assert "health" in health_tool.description
 
 
 def test_build_tools_path_hints(repo: Path) -> None:

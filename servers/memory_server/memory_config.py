@@ -8,6 +8,25 @@ from typing import Any
 DEFAULT_ALLOWED_ROOTS = [".ai-context", "memory-bank"]
 DEFAULT_EXCLUDED_DIRS = ["Binaries", "Intermediate", "DerivedDataCache", "Saved/Cooked"]
 
+# Single source of truth for the built-in tag controlled vocabulary.
+# memory_records imports this list so both the runtime validator and the
+# default config stay in sync (previously they drifted as two parallel lists).
+DEFAULT_ALLOWED_TAGS: list[str] = [
+    "archive_candidate",
+    "asset_pipeline",
+    "build",
+    "handoff_ready",
+    "high_value",
+    "material",
+    "mcp",
+    "needs_validation",
+    "skill_possible",
+    "texture",
+    "ui",
+    "validation",
+    "workflow",
+]
+
 DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
     "allowed_roots": DEFAULT_ALLOWED_ROOTS,
     "excluded_dirs": DEFAULT_EXCLUDED_DIRS,
@@ -47,6 +66,16 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
             {"path": "memory-bank/systemPatterns.md", "max_chars": 10_000, "policy": "warm_context", "role": "architecture patterns, coding conventions, design decisions", "write_policy": "append_only"},
             {"path": "memory-bank/projectbrief.md", "max_chars": 8_000, "policy": "warm_context", "role": "project scope, core requirements, MVP goals", "write_policy": "append_only"},
         ],
+    },
+    "governance": {
+        "min_confidence": 0.0,
+        "require_source_refs_for": [],
+        "publish_owners": [],
+        "reviewers": [],
+    },
+    "tag_schema": {
+        "allowed_tags": list(DEFAULT_ALLOWED_TAGS),
+        "version": "v1",
     },
 }
 
@@ -90,6 +119,12 @@ class MemoryConfig:
     backup_max_total_bytes: int | None = None
     backup_max_batches: int | None = None
     multi_user: MultiUserConfig | None = None
+    governance_min_confidence: float = 0.0
+    governance_require_source_refs_for: list[str] | None = None
+    governance_publish_owners: list[str] | None = None
+    governance_reviewers: list[str] | None = None
+    tag_allowed_tags: list[str] | None = None
+    tag_schema_version: str = "v1"
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -214,6 +249,13 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         events_file.touch()
 
     backup_cfg = merged.get("backup", {}) if isinstance(merged.get("backup"), dict) else {}
+    governance_cfg = merged.get("governance", {}) if isinstance(merged.get("governance"), dict) else {}
+    tag_schema_cfg = merged.get("tag_schema", {}) if isinstance(merged.get("tag_schema"), dict) else {}
+
+    def _string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     return MemoryConfig(
         repo_root=root,
@@ -248,4 +290,14 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
             int(backup_cfg.get("max_batches")) if isinstance(backup_cfg.get("max_batches"), (int, float)) else None
         ),
         multi_user=_parse_multi_user(merged.get("multi_user")),
+        governance_min_confidence=(
+            float(governance_cfg.get("min_confidence"))
+            if isinstance(governance_cfg.get("min_confidence"), (int, float))
+            else 0.0
+        ),
+        governance_require_source_refs_for=_string_list(governance_cfg.get("require_source_refs_for")),
+        governance_publish_owners=_string_list(governance_cfg.get("publish_owners")),
+        governance_reviewers=_string_list(governance_cfg.get("reviewers")),
+        tag_allowed_tags=_string_list(tag_schema_cfg.get("allowed_tags")),
+        tag_schema_version=str(tag_schema_cfg.get("version", "v1")),
     )

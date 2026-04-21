@@ -1,6 +1,6 @@
 # MCP 记忆系统设计文档
 
-> 状态：vNext 设计稿
+> 状态：vNext 设计稿；P0/P1/P2 与 v0.4.1 P0 加固已落地
 >
 > 日期：2026-04-21
 >
@@ -506,6 +506,14 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 当前任务关键状态
 - 当前分支注意事项
 
+当前首版实现状态：
+
+- 已实现 `memory_compile(target="runtime_digest")`
+- 编译产物写入 `memory-bank/compiled/runtime/`
+- 默认只包含 `validated` / `published` 记录
+- 支持按 `user`、`task_id`、`branch`、`include_scopes`、`include_statuses`、`preferred_tags` 过滤
+- 输出为确定性 Markdown，可删除后重建，不作为唯一真源
+
 `task handoff`
 
 供交接或跨会话继续工作：
@@ -516,6 +524,12 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 下一步动作
 - 来源引用
 
+当前首版实现状态：
+
+- 已实现 `memory_compile(target="task_handoff")`
+- 产物写入 `memory-bank/compiled/runtime/task/{task_id}-handoff.md`
+- 当前为无 LLM 模板式视图，后续可在治理层稳定后增强分类和章节提取
+
 `system digest`
 
 供团队共享：
@@ -525,12 +539,26 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 冲突项
 - 待验证项
 
+当前首版实现状态：
+
+- 已实现 `memory_compile(target="system_digest")`
+- 默认读取 shared + published 记录
+- 输出 `memory-bank/compiled/runtime/system-digest.md`
+- 当前为确定性模板输出，后续可增加冲突检测和健康检查
+
 `publish queue`
 
 供治理流程使用：
 
 - 待审 system 候选
 - 待审 skill 候选
+
+当前首版实现状态：
+
+- 已实现 `memory_compile(target="publish_queue")`
+- 默认读取 candidate 记录
+- 输出 `memory-bank/compiled/publish/publish-queue.md`
+- 可用于审核前查看 system / skill 候选池
 
 ### 8.4 编译原则
 
@@ -595,12 +623,14 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 派生索引：
 
 - SQLite FTS
+- 中文检索采用无新增依赖的 CJK bigram/trigram 派生 token 作为基础兜底，避免第一阶段引入分词库和离线包维护成本
 
 检索流程：
 
 - 解析 Front Matter
 - 建立元数据索引
-- 建立正文 FTS 索引
+- 建立正文与 metadata 的 FTS 索引
+- 为中文标题和正文生成 bigram/trigram 搜索文本
 - 检索时先做作用域过滤
 - 再做 metadata/tag 过滤
 - 最后做全文检索与排序
@@ -646,9 +676,25 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 通过规则校验
 - 必要时通过 owner 审核
 
+当前实现：
+
+- `memory_validate_candidate` 将 candidate/raw 记录标记为 `validated`
+- 写入 `validated_by`
+- 将记录从 `memory-bank/candidates/` 移入对应治理层
+- 可通过配置限制 reviewer
+- 可校验 `source_refs`、`confidence`、重复记录
+
 `published`
 
 - 正式进入 `shared/` 或 skill 正式层
+
+当前实现：
+
+- `memory_publish_candidate` 只允许发布 `validated` 且带 `validated_by` 的记录
+- 发布后记录进入 `memory-bank/shared/{id}.md`
+- 若原类型为 `*_candidate`，发布后转为 `system_rule`
+- 可通过配置限制 publish owner
+- 发布前检查与现有 shared published system rule 的标题冲突
 
 `degraded/archive`
 
@@ -656,6 +702,33 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 失效
 - 被 supersede
 - 降级归档
+
+当前实现：
+
+- `memory_archive_record` 将记录移入 `memory-bank/archive/{id}.md`
+- 写入 `archive_reason` / `archived_at`
+- `memory_delete_record` 只允许删除 archived 记录，并写入 `.ai-memory/tombstones.jsonl`
+
+### 10.4 维护与健康检查
+
+当前实现：
+
+- `memory_health_check`：检查 metadata 缺失、未知 tag、未闭合 Front Matter、缺失 `search.db`
+- `memory_migrate_records`：迁移 `schema_version` 并写入 `schema_migrated_from`
+- `memory_update_index`：对指定记录路径增量更新 SQLite FTS，并拒绝非 `list[str]` 的路径参数
+- 编译时记录 `last_used_at`（v0.4.1 起改为写入 `.ai-memory/usage-stats.json`，不再回写源记录的 Front Matter，保持源记录可重建、Git diff 干净；如需读取请通过 `get_record_last_used_at(config, record_id)`）
+- 编译时写入 `.ai-memory/compile-cache/` manifest
+- 编译参数执行显式类型校验，`include_scopes` / `include_statuses` / `preferred_tags` 必须为 `list[str]`
+- 配置化 tag schema 通过显式参数传递，避免多配置或多人场景下的隐式全局状态串扰
+
+### 10.5 安全与原子性保证（v0.4.1 加固）
+
+- 记录写入：`memory_write_record` 用 `os.open(..., O_CREAT | O_EXCL | O_WRONLY)` 创建文件，关闭 already-exists 检查与写入之间的 TOCTOU 窗口；并发同 id 写入由 OS 仲裁，败者收到 `already_exists`。
+- 状态迁移：`memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record` 全部走 "临时文件 → `os.replace` → 删除旧路径" 顺序，任意一步失败都不会出现两份或丢失记录。
+- 检索查询：`memory_search_records` 对用户输入用 `build_fts5_match_query()` 生成全 phrase 包裹的 MATCH 表达式，避免 `-` / `OR` / `:` / 引号触发 SQLite FTS5 语法错误。
+- 普通写入：`memory_write` 的用户尾注按文件扩展名自动判断（仅 `.md` / `.markdown`），可通过 `inject_user_tag` 强制开启或关闭，避免破坏 JSON / YAML / 源码。
+- 多人迁移：`resolve_user_path` 在第一次自动迁移共享文件到 `{user}.md` 时，会在文件顶部插入 `migrated-from-shared` banner，提示作者归属未经验证。
+- 审计日志：`events.jsonl` 超过阈值（默认 5 MB，环境变量 `MEMORY_MCP_EVENTS_MAX_BYTES`）会按时间戳归档，仅保留最近 N 份（默认 5，环境变量 `MEMORY_MCP_EVENTS_MAX_ARCHIVES`）。
 
 ### 10.2 验证规则
 
@@ -850,6 +923,23 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 周期性 lint
 - 系统记忆健康检查
 
+优先级说明：
+
+- LLM 增强优先于 RAG / 向量检索。
+- LLM 只作为分类、提炼、候选生成、冲突解释和摘要增强器。
+- LLM 不得直接发布系统记忆，不得绕过治理流程。
+- 无 LLM 时，基础写入、FTS 检索、编译和治理必须继续可用。
+
+### 阶段 5：本地 RAG / 向量召回增强版
+
+目标：
+
+- 在 LLM 增强稳定后，再评估本地 embedding / 向量召回。
+- 只用于语义模糊召回、相似记录推荐、候选去重建议和冲突候选提示。
+- 向量索引放在 `.ai-memory/` 下，作为可删除、可重建的派生产物。
+- RAG 不参与真源判定，不参与权限判断，不直接决定正式发布。
+- 推荐检索顺序为：metadata 过滤 -> SQLite FTS -> 向量补召回 -> 规则或 LLM 重排 -> 返回带 record id / path 的结果。
+
 ### 15.5 与当前仓库的落地顺序建议
 
 结合 `ToolTest/MCP/Memory` 当前已落地的 v0.4.0 能力，建议按以下顺序推进：
@@ -858,7 +948,8 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 2. 优先补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引，形成真正的记录模型。
 3. 以“兼容现有 `memory-bank/*.md` 文件”为前提实现 `runtime digest` 和 `task handoff` 编译，避免一次性迁移所有调用方。
 4. 等记录层稳定后，再引入候选验证、发布、归档和 skill 候选治理。
-5. 最后再接入本地模型或云端 LLM，把 LLM 能力限制在分类、提炼、冲突解释和候选生成等增强位。
+5. 之后接入本地模型或云端 LLM，把 LLM 能力限制在分类、提炼、冲突解释和候选生成等增强位。
+6. 最后再评估本地 RAG / 向量召回；RAG 的优先级低于 LLM 增强，且只能作为语义召回补充。
 
 ## 16. 最终结论
 

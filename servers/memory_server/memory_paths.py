@@ -146,7 +146,16 @@ def resolve_user_path(config: MemoryConfig, path: str, user: str) -> str:
                 try:
                     new_abs.parent.mkdir(parents=True, exist_ok=True)
                     content = old_abs.read_text(encoding="utf-8", errors="replace")
-                    new_abs.write_text(content, encoding="utf-8")
+                    # 历史归属警告：旧单文件可能由多人覆盖过，第一个登场的用户
+                    # 不应被默认为唯一作者。加一条注释让人/工具明确这条
+                    # 内容的真实归属未知，必须人工核对后再继续编辑。
+                    banner = (
+                        "<!-- migrated-from-shared: this content was copied from "
+                        f"{scoped_norm} during multi-user activation. The original "
+                        "file may have been edited by multiple users; attribution to "
+                        f"'{user}' is NOT verified. Please review before continuing. -->\n\n"
+                    )
+                    new_abs.write_text(banner + content, encoding="utf-8")
                 except OSError:
                     pass  # 迁移失败不阻塞正常流程
 

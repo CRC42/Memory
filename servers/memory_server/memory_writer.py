@@ -58,6 +58,7 @@ def memory_write(
     backup: bool = True,
     create_if_missing: bool = True,
     reason: str | None = None,
+    inject_user_tag: bool | None = None,
 ) -> dict[str, Any]:
     """Write content to a memory file with safety controls.
 
@@ -69,6 +70,12 @@ def memory_write(
         backup: Whether to auto-backup before writing (default True).
         create_if_missing: Create the file if it doesn't exist (default True).
         reason: Optional reason for the write (logged in audit event).
+        inject_user_tag: Whether to inject an HTML comment with the writing
+            user and timestamp into the file content. When None (default), the
+            writer auto-detects: Markdown files (`.md`/`.markdown`) get the
+            tag for traceability, every other extension is left untouched so
+            JSON / YAML / TOML / source files cannot be silently corrupted.
+            Pass False to force-disable injection even for Markdown.
 
     Returns:
         Result dict with ok/error status and metadata.
@@ -153,18 +160,27 @@ def memory_write(
 
     # Build final content
     current_user = get_current_user(config.repo_root)
-    if effective_mode == "append":
-        # 多人协作：append 模式自动在内容前添加用户+时间戳标识
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        user_header = f"\n<!-- written by {current_user} at {timestamp} -->\n"
-        # Ensure separator newline when appending
-        separator = "" if original_content.endswith("\n") or not original_content else "\n"
-        final_content = original_content + separator + user_header + content
+    suffix = resolved.suffix.lower()
+    if inject_user_tag is None:
+        tag_enabled = suffix in {".md", ".markdown"}
     else:
-        # 多人协作：overwrite 模式在末尾注入用户标签尾注，便于追溯
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        footer = f"\n<!-- last overwritten by {current_user} at {timestamp} -->\n"
-        final_content = content.rstrip("\n") + "\n" + footer
+        tag_enabled = bool(inject_user_tag)
+    if effective_mode == "append":
+        if tag_enabled:
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            user_header = f"\n<!-- written by {current_user} at {timestamp} -->\n"
+            separator = "" if original_content.endswith("\n") or not original_content else "\n"
+            final_content = original_content + separator + user_header + content
+        else:
+            separator = "" if original_content.endswith("\n") or not original_content else "\n"
+            final_content = original_content + separator + content
+    else:
+        if tag_enabled:
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            footer = f"\n<!-- last overwritten by {current_user} at {timestamp} -->\n"
+            final_content = content.rstrip("\n") + "\n" + footer
+        else:
+            final_content = content
 
     # Ensure final content ends with newline
     if final_content and not final_content.endswith("\n"):

@@ -183,3 +183,39 @@ def test_trailing_newline_ensured(repo: Path) -> None:
     assert result["ok"] is True
     text = (repo / "memory-bank/notes.md").read_text(encoding="utf-8")
     assert text.endswith("\n")
+
+
+# ── User-tag injection control ──────────────────────────────────────────
+
+def test_inject_user_tag_default_skips_non_markdown(repo: Path) -> None:
+    """JSON / non-Markdown files must NOT receive the HTML user-tag comment."""
+    config = _load(repo)
+    json_payload = '{"key": "value"}'
+    result = memory_write(config, "memory-bank/notes.json", json_payload)
+    assert result["ok"] is True
+    saved = (repo / "memory-bank/notes.json").read_text(encoding="utf-8")
+    assert "<!--" not in saved
+    # Round-trips as valid JSON.
+    import json as _json
+    assert _json.loads(saved) == {"key": "value"}
+
+
+def test_inject_user_tag_default_marks_markdown(repo: Path) -> None:
+    config = _load(repo)
+    result = memory_write(config, "memory-bank/notes.md", "# Hello\n")
+    assert result["ok"] is True
+    saved = (repo / "memory-bank/notes.md").read_text(encoding="utf-8")
+    assert "<!-- last overwritten by" in saved
+
+
+def test_inject_user_tag_can_be_force_disabled(repo: Path) -> None:
+    config = _load(repo)
+    result = memory_write(
+        config,
+        "memory-bank/notes.md",
+        "# Hello\n",
+        inject_user_tag=False,
+    )
+    assert result["ok"] is True
+    saved = (repo / "memory-bank/notes.md").read_text(encoding="utf-8")
+    assert "<!--" not in saved
