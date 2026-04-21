@@ -1,5 +1,181 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-21 (vNext 设计稿: 从文件级 Memory MCP 走向记录级治理与编译架构)
+
+> **状态：设计方案，未执行开发**
+
+### 背景
+
+`v0.4.0` 已经解决了多人协作下最现实的几个问题：
+
+- `activeContext` 高频写入冲突
+- 共享记忆文件的 append 策略
+- 用户分区重定向
+- guard / backup / compaction / 审计等基础设施
+
+但当前系统的主抽象仍然是“文件”，而不是“记忆记录”。这会带来几个后续开发阶段绕不开的问题：
+
+1. 系统记忆、个人记忆、候选记录、归档记录还没有统一的结构化外壳
+2. 检索仍以文件粒度为主，尚未形成记录级索引与检索排序能力
+3. 缺少候选验证、正式发布、降级归档这条治理链路
+4. 缺少运行时 digest、handoff、publish queue 等“编译产物”层
+5. MCP 对外能力仍偏向文件操作，尚未升级为记录级接口
+
+因此，本次设计稿的目标不是推翻 `v0.4.0`，而是在兼容现有 `memory_get` / `memory_write` / `memory_search` / `memory_guard_check` 工作方式的前提下，补齐 Memory MCP 的长期架构。
+
+### 本次设计结论
+
+#### 1. 真源定义上移到“记录层”
+
+系统真源不再仅仅理解为几份 Markdown 摘要文件，而是以下对象的组合：
+
+- Markdown 记忆文件
+- YAML Front Matter 元数据
+- 事件日志
+- 候选记录
+- 已发布系统记忆
+
+LLM 只能参与提炼、分类和填表，不能成为唯一真源。
+
+#### 2. 记忆分层从 3 层扩展为 5 层
+
+在当前 `memory-bank/`、`.ai-context/`、`.ai-memory/` 的基础上，设计稿将记忆职责明确拆分为：
+
+- 个人记忆
+- 系统记忆
+- 历史记忆
+- 本地临时记忆
+- 编译记忆
+
+这意味着后续实现不应再把所有长期知识都塞进少数几个共享 Markdown 文件，而应引入 `shared/`、`people/{user}/`、`candidates/`、`archive/`、`compiled/` 等正式目录层。
+
+#### 3. 正式存储格式确定为 Markdown + Front Matter
+
+本次设计明确了后续正式记录格式：
+
+- MCP 传输层使用 JSON
+- 落盘正文使用 Markdown
+- 结构化元数据使用 YAML Front Matter
+- 检索索引使用 SQLite FTS
+- 审计与事件流使用 JSONL
+
+这一步很关键，因为它把当前“文件写入工具”继续保留下来，同时为后续的记录级 schema、索引、编译和发布能力提供稳定底座。
+
+#### 4. 正式引入“记忆编译”概念
+
+设计稿将编译定义为一种确定性聚合过程，而不是让 LLM 再写一遍总结。编译输入优先依赖结构化字段，例如：
+
+- `record_kind`
+- `scope`
+- `status`
+- `tags`
+- `source_refs`
+- `confidence`
+- `task_id`
+- `branch`
+
+编译输出初步划分为：
+
+- `runtime digest`
+- `task handoff`
+- `system digest`
+- `publish queue`
+
+这意味着当前的 `activeContext.md`、`progress.md` 等文件，在长期演进里更适合作为“编译视图”或“人类可读摘要”，而不是唯一主真源。
+
+#### 5. 正式引入候选治理与发布流
+
+本次设计稿把系统记忆与 skill 治理流程统一定义为：
+
+`raw -> candidate -> validated -> published -> degraded/archive`
+
+同时明确以下边界：
+
+- 允许自动创建候选、归档建议、编译视图
+- 不允许 LLM 自动发布正式系统记忆
+- 不允许 LLM 自动发布正式 skill
+- 不允许 LLM 自动删除正式系统规则
+
+这让后续 Memory MCP 能从“记录信息”升级到“治理知识”。
+
+#### 6. 无 LLM 兜底能力被提升为硬要求
+
+设计稿明确要求：即使没有 LLM，系统也必须完整支持：
+
+- 原始记录写入
+- Front Matter 解析
+- 规则校验
+- SQLite FTS 检索
+- 模板式 digest 编译
+- 候选验证与发布流程
+
+换句话说，LLM 在后续架构中的定位是增强器，不是依赖前提。
+
+### 目录模型调整建议
+
+设计稿提出的 vNext 目标目录如下：
+
+```text
+memory-bank/
+  shared/
+  people/{user}/
+  candidates/
+  archive/
+  compiled/
+    runtime/
+    publish/
+
+.ai-context/{user}/
+
+.ai-memory/
+  config.json
+  search.db
+  events.jsonl
+  compile-cache/
+  temp/
+  backups/
+```
+
+这里最重要的不是目录本身，而是职责变化：
+
+- `shared/` 用于已发布系统记忆
+- `people/{user}/` 用于个人长期沉淀
+- `candidates/` 用于 system / skill 候选池
+- `archive/` 用于降级和长期历史
+- `compiled/` 用于运行时和发布流程所需的派生视图
+
+### 与 v0.4.0 的关系
+
+这次设计稿不是否定 `v0.4.0`，而是把 `v0.4.0` 放在更清晰的阶段定位上：
+
+- `v0.4.0` 解决的是“多人协作下文件级记忆系统如何可用”
+- 2026-04-21 设计稿解决的是“记忆系统如何从文件工具演进为长期治理系统”
+
+因此后续实施应遵循以下顺序：
+
+1. 先保留现有文件级接口，避免破坏当前工作流
+2. 在此基础上增加记录级 schema、Front Matter 解析和 SQLite FTS 索引
+3. 再补齐 compile / validate / publish / archive 能力
+4. 最后才接入本地小模型或云端 LLM 做增强能力
+
+### 对后续开发的直接约束
+
+根据本次设计稿，后续继续开发 `ToolTest/MCP/Memory` 时应遵守以下约束：
+
+1. 不再把少量共享 Markdown 文件当作唯一真源
+2. 新能力优先围绕“记录级 schema”设计，而不是继续堆文件级特判
+3. 所有 compile 结果必须可重建，不得成为唯一真源
+4. 系统记忆正式发布必须经过候选验证，不允许 LLM 直接跳过治理流程
+5. 任何增强能力都不得阻断无 LLM 的基础链路
+
+### 产出
+
+- 新增设计文档：`MemorySystemDesignDocument.md`
+- 文档用途：作为 `MCP/Memory` 后续开发的 vNext 架构基线
+- README 应继续维护“当前实现说明”，设计文档负责维护“下一阶段架构设计”
+
+---
+
 ## 2026-03-31 (v0.4.0 设计稿: 十人团队多人协作 — 用户分区写入 + 冲突消除)
 
 > **状态：设计方案，未执行开发**
