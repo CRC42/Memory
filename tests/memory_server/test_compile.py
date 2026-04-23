@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from servers.memory_server.memory_compiler import memory_compile, memory_get_runtime_digest
@@ -100,6 +101,46 @@ def test_compile_runtime_digest_can_include_shared_published_records(repo: Path)
     assert "Published system memory" in result["content"]
 
 
+def test_compile_defaults_to_compact_body_mode(repo: Path) -> None:
+    config = load_config(repo)
+    written = memory_write_record(
+        config,
+        content_markdown=(
+            "# Compact Record\n\n"
+            "Intro paragraph should be ignored when a higher value section exists.\n\n"
+            "## Decision\n\n"
+            "Keep only the key decision for runtime context.\n\n"
+            "## Long Note\n\n"
+            "This verbose implementation detail should remain in the source record but not the compact digest. "
+            "It repeats a lot of low-value text that is useful for traceability but wasteful in prompts.\n"
+        ),
+        record_kind="note",
+        scope="personal",
+        status="validated",
+        author="alice",
+        tags=["mcp", "high_value"],
+        task_id="task_compile",
+    )
+
+    compact = memory_compile(config, target="runtime_digest", user="alice", task_id="task_compile")
+    full = memory_compile(config, target="runtime_digest", user="alice", task_id="task_compile", body_mode="full")
+
+    assert compact["ok"] is True
+    assert compact["body_mode"] == "compact"
+    assert full["ok"] is True
+    assert full["body_mode"] == "full"
+    assert len(compact["content"]) < len(full["content"])
+    assert f"- id: `{written['id']}`" in compact["content"]
+    assert f"- source: `{written['path']}`" in compact["content"]
+    assert "- status: `validated`" in compact["content"]
+    assert "Keep only the key decision" in compact["content"]
+    assert "verbose implementation detail" not in compact["content"]
+    assert "- tags:" not in compact["content"]
+    assert "- author:" not in compact["content"]
+    assert "- tags: `mcp, high_value`" in full["content"]
+    assert "verbose implementation detail" in full["content"]
+
+
 def test_get_runtime_digest_reads_existing_compiled_output(repo: Path) -> None:
     config = load_config(repo)
     memory_write_record(
@@ -153,6 +194,16 @@ def test_compile_rejects_unknown_target(repo: Path) -> None:
     assert "target" in result["message"]
 
 
+def test_compile_rejects_unknown_body_mode(repo: Path) -> None:
+    config = load_config(repo)
+
+    result = memory_compile(config, target="runtime_digest", body_mode="summary")
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
+    assert "body_mode" in result["message"]
+
+
 def test_dispatch_compile_and_get_runtime_digest(repo: Path) -> None:
     config = load_config(repo)
     memory_write_record(
@@ -186,5 +237,11 @@ def test_build_tools_includes_compile_tools(repo: Path) -> None:
     config = load_config(repo)
     tool_names = {tool.name for tool in _build_tools(config)}
 
-    assert "memory_compile" in tool_names
-    assert "memory_get_runtime_digest" in tool_names
+    assert "memory_context" in tool_names
+    assert "memory_compile" not in tool_names
+    assert "memory_get_runtime_digest" not in tool_names
+
+    admin_config = replace(config, mcp_expose_admin_tools=True)
+    admin_tool_names = {tool.name for tool in _build_tools(admin_config)}
+    assert "memory_compile" in admin_tool_names
+    assert "memory_get_runtime_digest" in admin_tool_names

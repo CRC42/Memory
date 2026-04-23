@@ -1,0 +1,116 @@
+{
+  "allowed_roots": [
+    ".ai-context",
+    "memory-bank"
+  ],
+  "excluded_dirs": [
+    "Binaries",
+    "Intermediate",
+    "DerivedDataCache",
+    "Saved/Cooked"
+  ],
+  "max_file_size_bytes": 1048576,
+  "skip_binary_files": true,
+  "events_file": ".ai-memory/events.jsonl",
+  "backups_dir": ".ai-memory/backups",
+  "temp_dir": ".ai-memory/temp",
+  "multi_user": {
+    "enabled": false,
+    "user_scoped_paths": [
+      "memory-bank/activeContext.md"
+    ],
+    "shared_paths_policy": {
+      "memory-bank/progress.md": "append_only",
+      "memory-bank/techContext.md": "append_only",
+      "memory-bank/systemPatterns.md": "append_only",
+      "memory-bank/projectbrief.md": "append_only"
+    }
+  },
+  "backup": {
+    "max_total_bytes": 524288,
+    "max_file_bytes": 262144,
+    "max_batches": 5
+  },
+  "guard": {
+    "default_max_chars": 12000,
+    "default_max_tokens": 3000,
+    "total_max_chars": 60000,
+    "total_max_tokens": 15000,
+    "targets": [
+      {
+        "path": ".ai-context/current-task.md",
+        "max_chars": 6000,
+        "policy": "hot_task",
+        "role": "hot task context for current working session"
+      },
+      {
+        "path": ".ai-context/latest-error.md",
+        "max_chars": 4000,
+        "policy": "error_summary",
+        "role": "latest valid error summary"
+      },
+      {
+        "path": "memory-bank/activeContext.md",
+        "max_chars": 8000,
+        "policy": "warm_context",
+        "role": "current sprint focus, recent decisions, TODOs",
+        "write_policy": "user_scoped"
+      },
+      {
+        "path": "memory-bank/progress.md",
+        "max_chars": 12000,
+        "policy": "warm_context",
+        "role": "feature completion status, milestones",
+        "write_policy": "append_only"
+      },
+      {
+        "path": "memory-bank/techContext.md",
+        "max_chars": 10000,
+        "policy": "warm_context",
+        "role": "tech stack, plugin matrix, architecture config",
+        "write_policy": "append_only"
+      },
+      {
+        "path": "memory-bank/systemPatterns.md",
+        "max_chars": 10000,
+        "policy": "warm_context",
+        "role": "architecture patterns, coding conventions, design decisions",
+        "write_policy": "append_only"
+      },
+      {
+        "path": "memory-bank/projectbrief.md",
+        "max_chars": 8000,
+        "policy": "warm_context",
+        "role": "project scope, core requirements, MVP goals",
+        "write_policy": "append_only"
+      }
+    ]
+  },
+  "governance": {
+    "min_confidence": 0.0,
+    "require_source_refs_for": [],
+    "publish_owners": [],
+    "reviewers": []
+  },
+  "tag_schema": {
+    "allowed_tags": [
+      "archive_candidate",
+      "asset_pipeline",
+      "build",
+      "handoff_ready",
+      "high_value",
+      "material",
+      "mcp",
+      "needs_validation",
+      "skill_possible",
+      "texture",
+      "ui",
+      "validation",
+      "workflow"
+    ],
+    "version": "v1"
+  },
+  "mcp": {
+    "expose_admin_tools": false
+  }
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from servers.memory_server.memory_compiler import memory_compile
@@ -185,7 +186,7 @@ def test_dispatch_governance_tools(repo: Path) -> None:
 
 
 def test_build_tools_includes_governance_tools(repo: Path) -> None:
-    config = load_config(repo)
+    config = replace(load_config(repo), mcp_expose_admin_tools=True)
     tool_names = {tool.name for tool in _build_tools(config)}
 
     assert "memory_validate_candidate" in tool_names

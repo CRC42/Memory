@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from servers.memory_server.memory_config import load_config
+from servers.memory_server.memory_records import memory_write_record
 from servers.memory_server.server import _dispatch_tool
 
 
@@ -107,3 +108,80 @@ def test_dispatch_write_none_content_rejected(repo: Path) -> None:
     })
     assert result["ok"] is False
     assert "content" in result["message"]
+
+
+def test_dispatch_facade_read_get_and_search(repo: Path) -> None:
+    config = load_config(repo)
+
+    get_result = _dispatch_tool(config, "memory_read", {"operation": "get", "path": "memory-bank/notes.md"})
+    search_result = _dispatch_tool(config, "memory_read", {"operation": "search", "query": "Boss"})
+
+    assert get_result["ok"] is True
+    assert "Boss Notes" in get_result["content"]
+    assert search_result["ok"] is True
+    assert search_result["stats"]["total_hits"] >= 1
+
+
+def test_dispatch_facade_write_record_and_context_compile(repo: Path) -> None:
+    config = load_config(repo)
+
+    record = _dispatch_tool(
+        config,
+        "memory_write",
+        {
+            "operation": "record",
+            "content_markdown": "# Facade Record\n\nCompiled through facade tools.\n",
+            "record_kind": "note",
+            "scope": "personal",
+            "status": "validated",
+            "author": "alice",
+            "tags": ["mcp"],
+            "task_id": "task_facade",
+        },
+    )
+    compiled = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "compile",
+            "target": "runtime_digest",
+            "user": "alice",
+            "task_id": "task_facade",
+        },
+    )
+    fetched = _dispatch_tool(
+        config,
+        "memory_read",
+        {"operation": "runtime_digest", "user": "alice", "task_id": "task_facade"},
+    )
+
+    assert record["ok"] is True
+    assert compiled["ok"] is True
+    assert fetched["ok"] is True
+    assert record["id"] in compiled["included_record_ids"]
+    assert fetched["content"] == compiled["content"]
+
+
+def test_dispatch_facade_write_observation_and_trace_lineage(repo: Path) -> None:
+    config = load_config(repo)
+    source = memory_write_record(config, content_markdown="# Source\n\nBase.\n", record_kind="observation", tags=["mcp"])
+
+    observation = _dispatch_tool(
+        config,
+        "memory_write",
+        {
+            "operation": "observation",
+            "content_markdown": "# Observation\n\nDerived evidence.\n",
+            "tags": ["mcp"],
+            "derived_from_record_ids": [source["id"]],
+        },
+    )
+    traced = _dispatch_tool(
+        config,
+        "memory_context",
+        {"operation": "trace_lineage", "record_id": observation["id"]},
+    )
+
+    assert observation["ok"] is True
+    assert traced["ok"] is True
+    assert traced["record_id"] == observation["id"]

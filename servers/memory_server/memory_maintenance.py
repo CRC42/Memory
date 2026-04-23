@@ -7,21 +7,16 @@ from typing import Any
 
 from .memory_config import MemoryConfig
 from .memory_events import append_event
-from .memory_paths import PathManager, PathSecurityError
+from .memory_paths import PathSecurityError
+from .memory_record_io import (
+    find_record_by_id as _find_record,
+    iter_record_files as _iter_record_files,
+)
 from .memory_records import parse_record_markdown, render_record_markdown
 from .memory_result import error_result, ok_result
 
 
 REQUIRED_METADATA = {"schema_version", "id", "record_kind", "scope", "status", "author"}
-
-
-def _iter_record_files(config: MemoryConfig) -> list[tuple[Path, str]]:
-    manager = PathManager(config)
-    return [
-        (abs_path, rel_path)
-        for abs_path, rel_path in manager.iter_files(scopes=["memory-bank"], include_paths=["memory-bank/**/*.md"])
-        if not rel_path.startswith("memory-bank/compiled/")
-    ]
 
 
 def memory_health_check(config: MemoryConfig) -> dict[str, Any]:
@@ -103,21 +98,6 @@ def memory_migrate_records(config: MemoryConfig, *, target_schema_version: str =
 
     append_event(config, "memory_migrate_records", {"target_schema_version": target_schema_version, "paths": migrated})
     return ok_result("records migrated", migrated_records=len(migrated), paths=migrated)
-
-
-def _find_record(config: MemoryConfig, record_id: str) -> tuple[Path, str, dict[str, Any], str] | dict[str, Any]:
-    try:
-        files = _iter_record_files(config)
-    except (PathSecurityError, FileNotFoundError) as exc:
-        return error_result("path_error", str(exc))
-    for abs_path, rel_path in files:
-        try:
-            metadata, body = parse_record_markdown(abs_path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        if str(metadata.get("id")) == record_id:
-            return abs_path, rel_path, metadata, body
-    return error_result("not_found", f"record not found: {record_id}", record_id=record_id)
 
 
 def memory_delete_record(config: MemoryConfig, record_id: str, *, reason: str | None = None) -> dict[str, Any]:

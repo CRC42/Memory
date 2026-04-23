@@ -139,6 +139,38 @@ def test_record_search_matches_metadata_without_new_dependencies(repo: Path) -> 
     assert result["results"][0]["id"] == written["id"]
 
 
+def test_record_search_indexes_schema_v2_facets(repo: Path) -> None:
+    config = load_config(repo)
+    written = memory_write_record(
+        config,
+        content_markdown="# Module Decision\n\nKeep memory facets searchable without vector dependencies.\n",
+        record_kind="decision",
+        scope="project_shared",
+        tags=["mcp"],
+        memory_tier="warm",
+        cognitive_level="fa",
+        importance_score=0.91,
+        module_names=["MemoryServer"],
+        plugin_names=["ProjectMemoryMCP"],
+        system_area="memory",
+    )
+    memory_rebuild_index(config)
+
+    result = memory_search_records(config, query="MemoryServer")
+
+    assert result["ok"] is True
+    assert result["results"]
+    hit = result["results"][0]
+    assert hit["id"] == written["id"]
+    assert hit["schema_version"] == "2.0"
+    assert hit["scope"] == "project_shared"
+    assert hit["memory_tier"] == "warm"
+    assert hit["cognitive_level"] == "fa"
+    assert hit["importance_score"] == 0.91
+    assert hit["system_area"] == "memory"
+    assert "MemoryServer" in hit["facets"]
+
+
 def test_build_search_text_generates_cjk_ngrams() -> None:
     text = build_search_text(
         title="导出链路尺寸约束",

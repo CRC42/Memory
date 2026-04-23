@@ -10,14 +10,17 @@
 
 当前状态：
 
-- MCP 工具数：18 个
-- 测试数：113 个
+- MCP 默认工具数：3 个
+- legacy/admin 兼容工具数：23 个（需 `mcp.expose_admin_tools=true`）
+- 测试数：143 个
 - 支持中文搜索：是
 - 支持多人协作：是
 - 支持离线/预下载依赖：优先使用 `vendor/` 里的 wheel
 - P0/P1/P2：已完成
 - v0.4.1 P0 修复轮：已完成
-- P3 LLM 增强：暂不做
+- P3：已完成 schema v2、时间快照、deterministic scoring、review/rollback/dao-fa-shu 视图、snapshot compare 与 context retrieval v1
+- 最近重构：record IO 公共层已抽出，路径 NUL 字节与损坏 SQLite 索引自愈已加固
+- LLM / RAG：后移为 P4 / P5 增强层
 
 详细设计记录见 [MemorySystemDesignDocument.md](./MemorySystemDesignDocument.md)，开发日志见 [DEVLOG.md](./DEVLOG.md)。
 
@@ -35,7 +38,7 @@
 
 - 结构化记录：把一条记忆写成 `Markdown + Front Matter`。
 - SQLite FTS 搜索：把记录建索引，搜索更快。
-- 记忆编译：把零散记录编译成 runtime digest、handoff、system digest。
+- 记忆编译：把零散记录编译成 compact runtime digest、handoff、system digest。
 - 治理流程：candidate -> validated -> published -> archived。
 - 维护工具：健康检查、schema 迁移、增量索引、归档删除 tombstone。
 
@@ -127,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 当前结果：
 
 ```text
-113 passed
+143 passed
 ```
 
 测试脚本会自动找一个带 `pytest` 的 Python：
@@ -152,7 +155,58 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_backup_te
 powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_compact_tests.ps1
 ```
 
-## 常用工具
+## 常用 MCP 工具
+
+默认情况下，MCP 只暴露 3 个 facade 工具，避免 AI 客户端在低频管理工具里迷路：
+
+| 工具 | 说明 |
+|------|------|
+| `memory_read` | 读取文件、搜索普通记忆、搜索结构化记录、读取 runtime digest |
+| `memory_write` | 写普通文件、写结构化记录、写 observation、关联 artifact/facet |
+| `memory_context` | 编译 runtime context / snapshot / review 视图、读取 digest、追踪 lineage、列出 conflicts、对比 snapshot、装配上下文 |
+
+### facade operation 速查
+
+`memory_read`：
+
+| operation | 用途 |
+|-----------|------|
+| `get` | 读取允许范围内的记忆文件 |
+| `search` | 搜索普通 Markdown 记忆文件 |
+| `search_records` | 搜索结构化记录 FTS 索引 |
+| `runtime_digest` | 读取已编译 runtime digest |
+
+`memory_write`：
+
+| operation | 用途 |
+|-----------|------|
+| `file` | 写普通文件，默认兼容旧 `memory_write` |
+| `record` | 写 Markdown + Front Matter 结构化记录 |
+| `observation` | 写 schema v2 observation 证据记录 |
+| `link_artifact` | 给现有记录追加 artifact / 工程 facet |
+
+`memory_context`：
+
+| operation | 用途 |
+|-----------|------|
+| `compile` | 编译 runtime / snapshot / review / rollback / dao-fa-shu 视图 |
+| `runtime_digest` | 读取已编译 runtime digest |
+| `trace_lineage` | 追踪 derived_from / supersedes / conflicts_with 谱系 |
+| `list_conflicts` | 列出 open conflicts 与缺失目标 |
+| `compare_snapshots` | 对比两个 snapshot 的 added / removed / persisted |
+| `retrieve_context` | 按 scope / time / facet / recall / rerank 装配上下文 |
+
+如需开发调试或兼容纯 MCP 客户端，可在 `.ai-memory/config.json` 中开启：
+
+```json
+{
+  "mcp": {
+    "expose_admin_tools": true
+  }
+}
+```
+
+开启后会额外暴露 legacy/admin 工具：
 
 | 工具 | 说明 |
 |------|------|
@@ -161,11 +215,10 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_compact_t
 | `memory_guard_check` | 检查记忆文件是否超出容量 |
 | `memory_backup` | 备份指定记忆文件 |
 | `memory_compact` | 压缩过长记忆文件 |
-| `memory_write` | 安全写入普通记忆文件 |
 | `memory_write_record` | 写入结构化记忆记录 |
 | `memory_rebuild_index` | 重建 SQLite FTS 记录索引 |
 | `memory_search_records` | 搜索结构化记录 |
-| `memory_compile` | 编译 runtime digest / handoff / system digest |
+| `memory_compile` | 编译 runtime / snapshot / review / rollback / dao-fa-shu 视图 |
 | `memory_get_runtime_digest` | 读取已编译 runtime digest |
 | `memory_validate_candidate` | 验证候选记录 |
 | `memory_publish_candidate` | 发布已验证记录 |
@@ -174,6 +227,9 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_compact_t
 | `memory_health_check` | 健康检查 |
 | `memory_migrate_records` | 迁移记录 schema |
 | `memory_delete_record` | 删除 archived 记录并写 tombstone |
+| `memory_record_observation` | 写入 schema v2 observation 证据记录 |
+| `memory_link_artifact` | 给现有记录追加 artifact / 工程 facet |
+| `memory_trace_lineage` | 追踪 derived_from / supersedes / conflicts_with 谱系 |
 
 ## 文件放在哪里
 
@@ -218,7 +274,7 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_compact_t
 | `.ai-memory/backups/` | 写入前备份 |
 | `.ai-memory/temp/` | 原子写入临时文件 |
 | `.ai-memory/compile-cache/` | 编译 manifest |
-| `.ai-memory/usage-stats.json` | 编译时记录使用统计（`record_id → last_used_at`），不写回源 |
+| `.ai-memory/usage-stats.json` | 编译时记录使用统计（`record_id → last_used_at / compile_hit_count / compile_targets`），不写回源 |
 | `.ai-memory/tombstones.jsonl` | 删除记录 |
 
 > 审计日志轮转阈值与归档份数可通过环境变量 `MEMORY_MCP_EVENTS_MAX_BYTES` 与 `MEMORY_MCP_EVENTS_MAX_ARCHIVES` 调整。
@@ -238,12 +294,16 @@ MCP/Memory/
 │   ├── memory_guard.py         # 容量检查
 │   ├── memory_compactor.py     # 压缩
 │   ├── memory_records.py       # 结构化记录
+│   ├── memory_record_io.py     # 公共 record IO（iter / find / refresh / write）
 │   ├── memory_record_index.py  # SQLite FTS 和中文 n-gram
-│   ├── memory_compiler.py      # 记忆编译
+│   ├── memory_compiler.py      # 记忆编译、snapshot / review / rollback 视图
+│   ├── memory_lineage.py       # observation、artifact/facet 关联、lineage/conflict
+│   ├── memory_scoring.py       # deterministic importance scoring
+│   ├── memory_retrieval.py     # context retrieval / assembly
 │   ├── memory_governance.py    # 验证、发布、归档
 │   ├── memory_maintenance.py   # 健康检查、迁移、删除
 │   └── memory_events.py        # 审计日志
-├── tests/memory_server/        # 113 个测试
+├── tests/memory_server/        # 143 个测试
 ├── scripts/                    # 启动和测试脚本
 ├── vendor/                     # 预下载依赖
 ├── deploy.ps1
@@ -268,7 +328,9 @@ MCP/Memory/
 - SQLite FTS 查询计划
 - FTS5 保留字符查询，如 `texture-size`、`OR fallback`、引号短语
 - 记忆编译
+- `memory_compile` 默认 compact 输出，`body_mode=full` 可显式保留完整记录正文
 - 编译使用统计写入 `.ai-memory/usage-stats.json`，不回写源记录
+- P3 snapshot 编译、snapshot 对比、importance scoring、review/rollback/dao-fa-shu 视图、context retrieval
 - 治理发布
 - 记录写入和治理迁移的原子性
 - 健康检查和迁移
@@ -276,6 +338,7 @@ MCP/Memory/
 - archived-only 删除
 - MCP dispatch
 - 错误参数健壮性
+- 深度健壮性：并发 overwrite、残留 `.tmp`、坏 Front Matter 跳过、空 corpus not_found、损坏 `search.db` 自愈、NUL/绝对路径/`..` 路径攻击拒绝、Unicode 往返、全局预算拒绝、非法 record_kind 不落盘
 - 非 Markdown 写入默认不注入 HTML 用户尾注，避免破坏 JSON / YAML / 源码
 - 多人迁移 banner，提示旧共享 `activeContext.md` 的归属未经验证
 - 审计日志轮转
@@ -293,8 +356,12 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 | v0.4.0 | 多人协作：activeContext 用户分区、append_only、自动迁移 |
 | vNext P0/P1/P2 | 结构化记录、FTS 搜索、中文 n-gram、编译、治理、维护、健壮性测试 |
 | v0.4.1 | P0 修复轮：FTS5 查询转义、源记录不被编译回写、原子写入/迁移、尾注注入策略、迁移归属提示、审计日志轮转、默认 tag 单源 |
-| P3 | LLM 辅助分类、合并、冲突解释等，暂不实现 |
-| P4 | 本地 RAG / 向量召回，排在 LLM 增强之后，仅作为语义召回增强，暂不实现 |
+| v0.4.2 | 编译默认 compact 输出，按关键段落生成更短 runtime context，并保留 `body_mode=full` 兼容模式 |
+| v0.5.0 / P3 | 结构升级版：schema v2、扩展 scope/kind、tier / cognitive level / facet 索引、observation / artifact / lineage、时间快照、importance scoring、分层召回、snapshot compare 与 context retrieval v1 已落地 |
+| v0.5.1 / P3 hardening | record IO 公共层、深度健壮性测试、NUL 路径拒绝、损坏 SQLite 索引自愈 |
+| v0.5.5 / P3+ | 多人联合治理版：promote/degrade、reviewer / owner / publisher 角色、dao 层晋升约束强化 |
+| v0.6.0 / P4 | LLM 软增强：query rewrite、tag/facet 推荐、snapshot narrative、conflict explanation |
+| v0.6.5 / P5 | 本地 RAG / 向量补召回：只做语义模糊召回和低关键词命中补召回 |
 
 ## 后续开发计划
 
@@ -307,19 +374,74 @@ Markdown + Front Matter 真源
   -> governance
 ```
 
-后续增强按以下优先级推进：
+后续开发不再把 LLM 或 RAG 放在下一优先级。当前优先级是：
 
-1. **P3：LLM 增强**
-   - LLM 只用于辅助分类、tag 推荐、候选生成、冲突解释、摘要提炼。
-   - LLM 可辅助 query rewrite，把模糊中文问题改写为多组中英关键词和 metadata hint，再交给当前 FTS 检索。
-   - LLM 不能直接发布系统记忆，不能跳过 `candidate -> validated -> published`。
-   - 无 LLM 时，基础写入、检索、编译和治理必须继续可用。
+0. **最高优先级：MCP 对外接口收敛**（已完成首版）
+   - 默认 MCP 只暴露 3 个 facade tools：`memory_read`、`memory_write`、`memory_context`。
+   - legacy/admin 兼容工具保留为内部函数或显式配置暴露，不作为默认工具列表。
+   - guard、backup、compact、index rebuild/update、health、migrate、governance、snapshot 管理动作迁移到 CLI / scripts / skill。
+   - 后续新增 `memory-admin`、`memory-governance`、`memory-snapshot-review` 等管理 skill。
+   - 已增加配置开关 `mcp.expose_admin_tools=true`，用于开发期或纯 MCP 客户端兼容完整工具集。
 
-2. **P4：本地 RAG / 向量召回**
-   - 排在 LLM 增强之后，不作为当前优先项。
-   - 只解决语义模糊召回，例如“上次那个导出方向问题”找不到精确关键词。
-   - 向量索引必须是 `.ai-memory/` 下的派生产物，可删除重建，不能成为真源。
-   - 检索顺序应保持：metadata 过滤 -> FTS 召回 -> 向量补召回 -> 规则/LLM 重排。
+1. **P3：结构升级与联合项目记忆能力**（已完成首版）
+   - 已把当前“结构化项目记忆服务器”升级成“证据驱动的联合项目记忆编译器”。
+   - 已补齐时间快照、谱系关系、importance scoring、facet、分层召回和回顾入口。
+   - P3 保持无 LLM 可运行，所有快照、评分和上下文装配都可重建、可追溯。
+
+1.5. **P3+：多人联合治理增强**
+   - 继续补 promote / degrade、reviewer / owner / publisher 角色、dao 层晋升约束。
+   - 把 snapshot review / governance 的低频管理动作迁移到 CLI / scripts / 管理 skill。
+
+1.6. **内部重构 / hardening**
+   - 已完成：`memory_record_io.py` 作为公共 record IO 层，减少 compiler / governance / lineage / maintenance 的重复记录遍历与写回逻辑。
+   - 已完成：路径 NUL 字节拒绝、损坏 `search.db` 自动重建、深度健壮性测试。
+   - 待做：拆 `memory_compiler.py`（cache / render / targets / 入口）、拆 `server.py`（schema / dispatch / admin / main）、抽 `memory_corpus.py`、抽 `memory_frontmatter.py`。
+
+2. **P4：LLM 软增强**
+   - LLM 只用于 query rewrite、tag/facet 推荐、candidate draft、snapshot narrative、conflict explanation、title/abstract 优化。
+   - LLM 不能直接发布系统记忆，不能覆盖真源，不能替代 deterministic compile，不能决定 dao 层内容。
+
+3. **P5：本地 RAG / 向量补召回**
+   - 只用于语义模糊召回、长尾别名补召回、低关键词命中场景下的 recall 增强。
+   - 向量索引只放 `.ai-memory/`，可删除重建，永远不是正式真源。
+   - 检索顺序仍是：metadata -> FTS -> vector supplement -> rerank。
+
+### P3 结构升级拆分
+
+`Phase 3A：证据层与记录模型升级`
+
+- 扩展 record schema v2：`occurred_at`、`valid_from`、`valid_to`、`memory_tier`、`cognitive_level`、`importance_score`。
+- 扩展 scope：`session`、`user_private`、`task_or_branch`、`project_shared`、`org_shared`。
+- 新增谱系字段：`derived_from_record_ids`、`derived_from_snapshot_ids`、`derived_from_revision_ids`、`supersedes`、`conflicts_with`。
+- 新增工程 facet：`asset_paths`、`map_names`、`plugin_names`、`module_names`、`class_names`、`blueprint_paths`、`system_area`。
+- 新增 record kind：`observation`、`artifact_ref`、`incident`、`decision`、`procedure`、`snapshot_daily`、`snapshot_weekly`、`snapshot_monthly`。
+
+`Phase 3B：时间快照编译器`
+
+- 新增编译目标：`daily_snapshot`、`weekly_snapshot`、`monthly_snapshot`。
+- 新增上下文视图：`rollback_context`、`review_queue`、`dao_digest`、`fa_digest`、`shu_digest`。
+- daily 关注 `top_changes`、`top_reused_memories`、`open_questions`、`candidate_for_weekly`。
+- weekly 关注 `resolved_this_week`、`still_open`、`new_rules`、`stale_but_relevant`、`candidate_for_monthly`。
+- monthly 关注 `theme_clusters`、`promoted_knowledge`、`discarded_paths`、`architecture_shifts`、`what_stayed_true`、`what_changed`。
+
+`Phase 3C：importance scoring 与回顾入口`
+
+- 新增 deterministic scorer：`importance = governance + usage + impact + novelty + conflict + decay`。
+- 拆分函数：`score_governance()`、`score_usage()`、`score_impact()`、`score_novelty()`、`score_conflict()`、`score_decay()`。
+- 新增回顾入口：本日/本周/本月最重要记录、本月新稳定规则、本月高复用旧记录、被放弃路线、open conflicts、rollback chain。
+
+`Phase 3D：检索升级为上下文装配`
+
+- 已实现：`memory_record_observation`、`memory_link_artifact`、`memory_trace_lineage`、`memory_context(operation="list_conflicts")`、`memory_context(operation="compare_snapshots")`、`memory_context(operation="retrieve_context")`。
+- `memory_retrieve_context` 固定顺序：scope filter -> time window filter -> facet filter -> metadata / FTS recall -> importance rerank -> context assembly。
+- 输出结构不只是记录列表，而是 `core_constraints`、`relevant_rules`、`recent_snapshots`、`key_evidence`、`open_conflicts`、`next_steps`。
+
+`P3+：多人联合项目治理增强`
+
+- 支持按 user / task / branch / project / org 过滤与编译。
+- 候选晋升区分个人候选、项目共享候选、组织级规则候选。
+- 引入 reviewer / owner / publisher 角色。
+- dao 层记忆设置更严格晋升条件：`shu` 可较快沉淀，`fa` 需要多次复用或多人验证，`dao` 只能从稳定 `fa` 上升且必须人工确认。
 
 ## 核心逻辑
 
@@ -437,10 +559,41 @@ source_refs:
 | `task_handoff` | 任务交接摘要 |
 | `system_digest` | 系统级记忆摘要 |
 | `publish_queue` | 待发布候选列表 |
+| `daily_snapshot` | 按日生成 top changes / reused memories / open questions |
+| `weekly_snapshot` | 按周汇总 daily snapshot 与本周关键记录 |
+| `monthly_snapshot` | 按月汇总 weekly snapshot 与长期变化 |
+| `review_queue` | 按 deterministic scoring 输出回顾队列 |
+| `rollback_context` | 生成任务/分支相关的 rollback chain |
+| `dao_digest` | 原则、边界、长期稳定共识 |
+| `fa_digest` | 规则、流程、治理、编译秩序 |
+| `shu_digest` | 具体做法、操作手册、常用 skill |
 
 编译是确定性的，不依赖 LLM。也就是说，同样输入会得到同样输出。
 
-v0.4.1 起，编译不会再把 `last_used_at` 回写到源记录 Front Matter，避免污染 Git diff。使用统计写入 `.ai-memory/usage-stats.json`，需要读取时走 `get_record_last_used_at(config, record_id)`。
+默认输出使用 `body_mode="compact"`：
+
+- 保留每条记录的 `id`、`source`、`status`，方便追溯。
+- 不再逐条输出 `author`、`task_id`、`branch`、`tags` 等筛选 metadata。
+- 优先抽取 `Decision`、`Expected Behavior`、`Acceptance Checks`、`Next Step(s)`、`Notes`、`Details` 等关键段落。
+- 如果没有关键段落，则截取正文开头作为 compact 内容。
+
+如需旧版完整记录渲染，可显式传：
+
+```json
+{
+  "target": "runtime_digest",
+  "body_mode": "full"
+}
+```
+
+v0.4.1 起，编译不会再把 `last_used_at` 回写到源记录 Front Matter，避免污染 Git diff。使用统计写入 `.ai-memory/usage-stats.json`，包括 `last_used_at`、`compile_hit_count`、`compile_targets`，需要读取时走 `get_record_last_used_at(config, record_id)`。
+
+P3 起，`memory_context` 还支持两个上下文操作：
+
+| operation | 用途 |
+|-----------|------|
+| `compare_snapshots` | 基于 compile cache 对比两个 snapshot 的 added / removed / persisted 记录 |
+| `retrieve_context` | 按 scope -> time window -> facet -> metadata/FTS recall -> importance rerank -> context assembly 装配运行时上下文 |
 
 ### 6. 治理流程
 

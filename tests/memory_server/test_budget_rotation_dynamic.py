@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from servers.memory_server.memory_backup import backup_files, _list_backup_files, _rotate_backups
@@ -160,42 +161,36 @@ def test_build_tools_dynamic_descriptions(repo: Path) -> None:
     """_build_tools produces descriptions containing dynamic file roles."""
     config = load_config(repo)
     tools = _build_tools(config)
-    assert len(tools) == 18
+    assert len(tools) == 3
+    assert {tool.name for tool in tools} == {"memory_read", "memory_write", "memory_context"}
 
-    # memory_get should have file roles
-    get_tool = next(t for t in tools if t.name == "memory_get")
-    assert "hot task context" in get_tool.description
+    read_tool = next(t for t in tools if t.name == "memory_read")
+    assert "hot task context" in read_tool.description
 
-    # memory_guard_check should NOT have file roles (static only)
-    guard_tool = next(t for t in tools if t.name == "memory_guard_check")
-    assert "hot task context" not in guard_tool.description
-
-    # memory_write should have file roles
     write_tool = next(t for t in tools if t.name == "memory_write")
     assert "notes" in write_tool.description
 
-    # record-level write is available without changing file-level role hints
-    record_tool = next(t for t in tools if t.name == "memory_write_record")
-    assert "Front Matter" in record_tool.description
+    context_tool = next(t for t in tools if t.name == "memory_context")
+    assert "context" in context_tool.description
 
-    rebuild_tool = next(t for t in tools if t.name == "memory_rebuild_index")
-    assert "SQLite FTS" in rebuild_tool.description
+    admin_config = replace(config, mcp_expose_admin_tools=True)
+    admin_tools = _build_tools(admin_config)
+    admin_tool_names = {tool.name for tool in admin_tools}
+    assert len(admin_tools) == 23
+    assert "memory_write_record" in admin_tool_names
+    assert "memory_rebuild_index" in admin_tool_names
+    assert "memory_validate_candidate" in admin_tool_names
+    assert "memory_health_check" in admin_tool_names
+    assert "memory_record_observation" in admin_tool_names
+    assert "memory_trace_lineage" in admin_tool_names
 
-    compile_tool = next(t for t in tools if t.name == "memory_compile")
-    assert "deterministic" in compile_tool.description
-
-    validate_tool = next(t for t in tools if t.name == "memory_validate_candidate")
-    assert "Validate" in validate_tool.description
-
-    health_tool = next(t for t in tools if t.name == "memory_health_check")
-    assert "health" in health_tool.description
 
 
 def test_build_tools_path_hints(repo: Path) -> None:
     """inputSchema path descriptions contain target paths from config."""
     config = load_config(repo)
     tools = _build_tools(config)
-    get_tool = next(t for t in tools if t.name == "memory_get")
-    path_desc = get_tool.inputSchema["properties"]["path"]["description"]
+    read_tool = next(t for t in tools if t.name == "memory_read")
+    path_desc = read_tool.inputSchema["properties"]["path"]["description"]
     assert "memory-bank/long.md" in path_desc
     assert ".ai-context/current-task.md" in path_desc

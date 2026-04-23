@@ -1,8 +1,378 @@
 # DEVLOG - MCP Memory
 
-## 2026-04-21 (后续开发计划：LLM 与 RAG 优先级)
+## 2026-04-23 (健壮性深度测试 + 两处加固)
+
+> **状态：新增 10 个健壮性测试；2 处真实缺陷已修复；总计 143 测试全部通过**
+
+### 背景
+
+P0-3 完成后对系统做一轮深度健壮性评估，覆盖原 133 测试矩阵未触达的边界：原子写并发、崩溃残留 `.tmp`、损坏 Front Matter、SQLite 索引文件损坏、路径攻击变体（NUL 字节 / 绝对路径 / `..` 链 / Windows 盘符）、Unicode 往返、全局预算上限、`memory_write_record` 拒绝非法元数据。
+
+### 发现并修复的真实缺陷
+
+1. **路径含 NUL 字节会让 `pathlib` 抛 `ValueError`，越过安全层。**
+   - 修复：`memory_paths.PathManager.resolve` 在最前面拒绝 `\x00`，统一抛 `PathSecurityError`，调用方得到 `path_not_allowed` 而不是 500-级异常。
+2. **SQLite 索引文件损坏后 `memory_rebuild_index` 永久失败，无法自愈。**
+   - 修复：新增 `_is_index_healthy`（基于 `PRAGMA integrity_check`）与 `_reset_corrupted_index`（含 GC + 重试，处理 Windows 文件锁），rebuild 前自动检测并清掉坏 db / WAL / SHM 副本。
+
+### 新增测试（`tests/memory_server/test_robustness_deep.py`）
+
+- 并发 overwrite 不产生半截/交错文件（成功者写入完整 payload，失败者得到 `write_failed`）。
+- 残留 `.tmp` 兄弟文件不阻塞下一次写入。
+- `iter_parsed_records` 跳过坏 YAML / 无 Front Matter 的 markdown，并在 stats 中可观测。
+- `find_record_by_id` 在空 corpus 下返回 `not_found`。
+- 损坏 `search.db` 后 rebuild 自愈、search 可命中。
+- 6 种路径攻击（含 NUL）全部被 `path_not_allowed` 拒绝。
+- CJK + emoji + RTL 字符 write→read 字节级保持。
+- 超出全局预算（5000 chars）被预先拒绝。
+- 非法 `record_kind` 被拒绝且不留下任何文件。
+
+### 验证
+
+`cd MCP/Memory; ..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q` -> **143 passed**。
+
+---
+
+## 2026-04-23 (P0-3 重构：抽取 record IO 公共层)
+
+> **状态：已实现，测试 133 全部通过**
+
+### 背景
+
+随着 P3 完成，22 个模块里有 4 处独立实现的 `_iter_records` / `_find_record` / `_refresh_index_if_exists` / `_write_record_to_target`（散落在 `memory_governance.py`、`memory_lineage.py`、`memory_maintenance.py`、`memory_compiler.py`），签名不一致、容易漂移。本轮把这一层抽出公共模块，作为 P0 重构的第一步。
+
+### 改动
+
+- 新增 `servers/memory_server/memory_record_io.py`：
+  - `ParsedRecord` dataclass。
+  - `iter_record_files(config)`：返回 `memory-bank/` 下未编译的 markdown 文件。
+  - `iter_parsed_records(config)`：解析记录并附带 scan stats。
+  - `find_record_by_id(config, record_id)`：返回 4 元组或 `error_result`。
+  - `refresh_index_if_exists(config, path)`：FTS 索引存在则增量刷新，best-effort。
+  - `write_same_record(...)`：原子重写同路径记录（用于 lineage facet 追加）。
+  - `write_record_to_target(...)`：临时文件 + `os.replace` + 旧路径清理，用于 governance 状态迁移。
+- `memory_governance.py`：删除本地 `_iter_record_paths` / `_find_record` / `_write_record_to_target` / `_refresh_index_if_exists`，改为从 `memory_record_io` 导入；`_other_records` 改用 `iter_parsed_records`。
+- `memory_lineage.py`：删除本地 `_iter_records` / `_find_record` / `_write_same_record` / `_refresh_index_if_exists`；保留薄壳 `_iter_records` 适配旧 4 元组用法。
+- `memory_maintenance.py`：删除本地 `_iter_record_files` / `_find_record`，改为公共层导入。
+- `memory_compiler.py`：`_iter_records` 改为在 `iter_parsed_records` 之上做 `CompilableRecord` 投影，保留对外签名 `(records, stats)`。
+- `memory_retrieval.py`：仍通过 `memory_compiler` 的 `CompilableRecord` 接口工作，间接受益。
+
+### 受益
+
+- 4 处重复实现 → 1 处公共实现，行为差异从此固定（特别是 `os.replace` 原子写入和 PathSecurityError 错误码）。
+- 单文件最大行数：`memory_compiler.py` 1188→1158，`memory_governance.py` 326→215，`memory_lineage.py` 385→306。
+- MCP 对外接口零变更，默认仍只暴露 3 个 facade。
+- 测试零修改通过：`memory_server` 全量 133 passed。
+
+### 后续重构计划（已识别，未实施）
+
+- P0-1 拆 `memory_compiler.py`（cache / render / targets / 入口分文件）。
+- P0-2 拆 `server.py`（schema / dispatch / admin / main 分文件）。
+- P1-4 把 `CompilableRecord` 与 `_compact_body` 上提到独立 corpus 模块，消除 `memory_retrieval` 对 compiler 私有函数的反向依赖。
+- P1-5 把 `parse_front_matter` / `dump_front_matter` 抽到 `memory_frontmatter.py`，便于未来替换实现。
+
+### 验证
+
+```powershell
+cd MCP/Memory; ..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 133 passed in 2.02s
+```
+
+## 2026-04-23 (P3 completion：snapshots / scoring / retrieve context)
+
+> **状态：已实现，测试 133 全部通过**
+
+### 背景
+
+上一轮已完成 schema v2、evidence/lineage 和 conflict listing。本轮收尾 P3B/P3C/P3D 剩余项，在不增加默认 MCP tool 数量的前提下，把时间快照、deterministic scoring、review/rollback 分层视图、snapshot compare 和 context retrieval v1 接入 `memory_context` / `memory_compile`。
+
+### 改动
+
+- 新增 `memory_scoring.py`：
+  - `score_governance()`、`score_usage()`、`score_impact()`、`score_novelty()`、`score_conflict()`、`score_decay()`。
+  - scorer 输出 deterministic `importance_score` 和 effective memory tier，不回写源记录。
+- 扩展 `memory_compile`：
+  - 新增 `daily_snapshot`、`weekly_snapshot`、`monthly_snapshot`。
+  - 新增 `review_queue`、`rollback_context`、`dao_digest`、`fa_digest`、`shu_digest`。
+  - compile cache 记录 snapshot id、窗口、派生 snapshot ids 和 included record ids。
+- 新增 `memory_compare_snapshots()`：
+  - 基于 compile cache 对比 added / removed / persisted record ids。
+- 新增 `memory_retrieval.py`：
+  - `memory_retrieve_context()` 固定执行 scope filter -> time window filter -> facet filter -> metadata/FTS recall -> importance rerank -> context assembly。
+  - 输出 `core_constraints`、`relevant_rules`、`recent_snapshots`、`key_evidence`、`open_conflicts`、`next_steps`。
+- `memory_context` 新增：
+  - `operation="compare_snapshots"`
+  - `operation="retrieve_context"`
+- 默认 MCP facade 仍保持 3 个工具。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 133 passed
+```
+
+## 2026-04-23 (P3D conflict listing：memory_context list_conflicts)
+
+> **状态：已实现，测试 130 全部通过**
+
+### 背景
+
+P3D 计划把检索升级为上下文装配，其中 open conflicts 是后续 `memory_retrieve_context` 和 review queue 的关键输入。本轮不新增 MCP tool，保持默认 3 个 facade，只在 `memory_context` 中增加一个 operation。
+
+### 改动
+
+- 新增 `memory_list_conflicts(config, include_resolved=False)`：
+  - 扫描 Markdown + Front Matter 真源记录。
+  - 读取 `conflicts_with` 谱系字段。
+  - 返回冲突双方 record summary、缺失目标、resolved 状态和统计信息。
+  - 默认隐藏已 archived / degraded 的 resolved 冲突，可用 `include_resolved=true` 查看。
+- `memory_context` 新增 `operation="list_conflicts"`。
+- 不新增 MCP tool，默认对外仍只有 `memory_read`、`memory_write`、`memory_context`。
+- 更新 README 与设计文档 P3D 状态。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 130 passed
+```
+
+## 2026-04-23 (MCP facade 收敛实现：默认 3 工具)
+
+> **状态：已实现，测试 127 全部通过**
+
+### 背景
+
+按最新开发计划，优先把 MCP 对外工具列表从开发期的细粒度工具集收敛为少量 facade，降低 AI 客户端误选低频管理工具的概率。
+
+### 改动
+
+- 默认 MCP tool list 只暴露 3 个工具：
+  - `memory_read`
+  - `memory_write`
+  - `memory_context`
+- `memory_read` 支持：
+  - `operation="get"`
+  - `operation="search"`
+  - `operation="search_records"`
+  - `operation="runtime_digest"`
+- `memory_write` 支持：
+  - `operation="file"`，并作为默认操作兼容旧 `memory_write(path, content, ...)` 调用
+  - `operation="record"`
+  - `operation="observation"`
+  - `operation="link_artifact"`
+- `memory_context` 支持：
+  - `operation="compile"`
+  - `operation="runtime_digest"`
+  - `operation="trace_lineage"`
+- 新增配置：
+
+```json
+{
+  "mcp": {
+    "expose_admin_tools": true
+  }
+}
+```
+
+- 默认 `mcp.expose_admin_tools=false`，只暴露 3 个 facade。
+- 开启后暴露 facade + legacy/admin 工具，便于开发调试或纯 MCP 客户端兼容。
+- 旧细粒度工具的 `_dispatch_tool` 兼容入口仍保留，内部函数未删除。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 127 passed
+```
+
+## 2026-04-23 (开发计划调整：MCP facade 收敛列为最高优先级)
+
+> **状态：文档计划更新，无代码变更**
+
+### 背景
+
+当前 Memory MCP 为了开发验证和测试覆盖，已经暴露到 18/21 个细粒度工具。这个形态适合开发期调试，但对 AI 客户端不够友好，也会把 guard、backup、migrate、governance、delete 等低频或高风险管理动作直接放到默认工具列表里。
+
+### 决策
+
+后续最高优先级改为先收敛 MCP 对外接口：
+
+- 默认 MCP 只暴露 3 个 facade tools：
+  - `memory_read`
+  - `memory_write`
+  - `memory_context`
+- 现有细粒度能力继续作为内部 Python 函数保留。
+- 管理动作迁移到 CLI / scripts / skill：
+  - guard / backup / compact
+  - index rebuild/update
+  - health / migrate
+  - validate / publish / archive / delete
+  - snapshot rebuild / compare
+  - conflict review / promote / degrade
+- 后续补管理 skill：
+  - `memory-admin`
+  - `memory-governance`
+  - `memory-snapshot-review`
+- 增加配置开关用于兼容开发期和纯 MCP 客户端，例如 `expose_admin_tools=true`。
+
+### 文档
+
+- 已更新 `MemorySystemDesignDocument.md` 的 MCP 接口设计、落地顺序建议和最终优先级。
+- 已更新 `README.md` 的后续开发计划。
+
+## 2026-04-23 (v0.5.0 P3A 继续推进：observation / artifact / lineage 工具)
+
+> **状态：已实现，测试 124 全部通过**
+
+### 背景
+
+上一轮已完成 schema v2 字段、扩展 kind/scope、tier/cognitive/facet 索引基础。本轮继续沿 P3A/P3D 交界处推进，让 schema v2 不只是一组可写字段，而是具备基础证据写入、artifact 关联和谱系追踪入口。
+
+### 改动
+
+- 新增 `memory_lineage.py`。
+- 新增 `memory_record_observation`：
+  - 固定写入 `schema_version="2.0"`、`record_kind="observation"`、`scope="session"`、`status="raw"`。
+  - 默认 `memory_tier="hot"`、`cognitive_level="shu"`。
+  - 支持 artifact / 工程 facet 字段。
+- 新增 `memory_link_artifact`：
+  - 给既有记录追加 `related_artifact_ids`、`asset_paths`、`map_names`、`plugin_names`、`module_names`、`class_names`、`blueprint_paths`、`system_area`。
+  - 自动升级记录为 schema v2。
+  - 如果 `.ai-memory/search.db` 已存在，会增量刷新对应记录索引。
+- 新增 `memory_trace_lineage`：
+  - 从指定记录开始追踪 `derived_from_record_ids`、`supersedes`、`conflicts_with`。
+  - 返回 `nodes`、`edges`、`missing` 和统计信息。
+- MCP 工具数从 18 增至 21。
+- README 与设计文档已同步 P3A 当前状态。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 124 passed
+```
+
+## 2026-04-23 (v0.5.0 P3A 启动：schema v2 记录模型基础)
+
+> **状态：已实现，测试 119 全部通过**
+
+### 背景
+
+按新的 P3 结构升级计划，优先从不依赖 LLM 的记录模型扩展开始。目标是让现有 Markdown + Front Matter 真源先能承载时间、分层、谱系和工程 facet 信息，并让 SQLite 派生索引可以检索这些结构化字段。
+
+### 改动
+
+- `memory_write_record` 支持 `schema_version="2.0"`，并在使用 P3 record kind、scope 或 v2 字段时自动升级为 schema v2。
+- 扩展 `record_kind`：
+  - `observation`
+  - `artifact_ref`
+  - `incident`
+  - `decision`
+  - `procedure`
+  - `snapshot_daily`
+  - `snapshot_weekly`
+  - `snapshot_monthly`
+- 扩展 `scope`：
+  - `session`
+  - `user_private`
+  - `task_or_branch`
+  - `project_shared`
+  - `org_shared`
+- 新增 v2 metadata 字段：
+  - 时间：`occurred_at`、`valid_from`、`valid_to`
+  - 分层：`memory_tier`、`cognitive_level`
+  - 谱系：`derived_from_record_ids`、`derived_from_snapshot_ids`、`derived_from_revision_ids`、`supersedes`、`conflicts_with`
+  - 工程 facet：`related_artifact_ids`、`asset_paths`、`map_names`、`plugin_names`、`module_names`、`class_names`、`blueprint_paths`、`system_area`
+  - 评分预留：`importance_score`
+- `memory_record_index.py` 将 schema v2 字段写入 SQLite metadata 表，并把 tier、cognitive level、system area 和 facets 纳入 FTS 搜索文本。
+- MCP `memory_write_record` 工具 schema 同步暴露 P3A 新字段。
+
+### 兼容性
+
+- 默认写入仍保持 schema `1.0`，旧记录和旧调用方不受影响。
+- 如果显式传 `schema_version="1.0"` 同时使用 P3 kind / scope / v2 字段，会返回 `invalid_input`，避免 silently 丢字段。
+- `memory-bank/shared/` 现在承接 `project_shared` / `org_shared` 记录；个人、任务和会话级记录仍进入 `memory-bank/people/{user}/`。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 119 passed
+```
+
+## 2026-04-23 (开发计划重排：P3 结构升级优先)
 
 > **状态：文档规划更新，无代码变更**
+
+### 背景
+
+此前 README / 设计文档将后续方向写成 P3 LLM 增强、P4 本地 RAG / 向量召回。结合后续评估，当前系统真正更急的不是先接 LLM，而是把现有 Markdown + Front Matter 真源、SQLite 派生索引、deterministic compile、governance 主干升级为可支撑多人联合项目的结构化记忆编译器。
+
+### 调整
+
+- 新 P3：结构升级与联合项目记忆能力。
+  - schema v2
+  - daily / weekly / monthly snapshot
+  - lineage / derived_from / supersedes / conflicts_with
+  - memory_tier: hot / warm / cold / fossil
+  - cognitive_level: dao / fa / shu
+  - importance scoring
+  - facet / artifact / scope 扩展
+  - `memory_retrieve_context` 上下文装配
+- 新 P4：LLM 软增强。
+  - query rewrite
+  - tag / facet 推荐
+  - candidate draft
+  - snapshot narrative
+  - conflict explanation
+- 新 P5：本地 RAG / 向量补召回。
+  - 仅做语义模糊召回、长尾别名补召回、低关键词命中补召回。
+
+### 约束
+
+- 真源仍然是 Markdown + Front Matter。
+- SQLite / FTS / CJK n-gram 仍然只是派生索引。
+- deterministic compile 仍然是主编译链路。
+- governance 仍然是正式发布入口。
+- 无 LLM 必须完整可运行。
+- LLM 和向量检索均不得替代真源、发布权限或 deterministic compile。
+
+### 维护
+
+- 已运行 `memory_compact(policy=warm_context)` 压缩 `memory-bank/activeContext.md`：约 8974 chars -> 2576 chars。
+
+## 2026-04-22 (v0.4.2 编译默认 compact 输出)
+
+> **状态：已实现，测试 115 全部通过**
+
+### 背景
+
+实测多段记忆编译后发现，旧 `runtime_digest` 能按 task/status/tag 过滤记录，但默认会把匹配记录的详细 metadata 和完整正文都写入编译产物。它能减少“不相关记录”的上下文，却不能减少“相关记录本身”的上下文体积。
+
+### 改动
+
+- `memory_compile` 新增 `body_mode` 参数。
+- 默认 `body_mode="compact"`：
+  - 每条记录只输出 `id`、`source`、`status`。
+  - 不逐条输出 `author`、`task_id`、`branch`、`tags` 等筛选 metadata。
+  - 优先抽取 `Decision`、`Expected Behavior`、`Acceptance Checks`、`Next Step(s)`、`Notes`、`Details` 等关键段落。
+  - 没有关键段落时截取正文开头。
+- 保留 `body_mode="full"`，用于旧版完整记录渲染和调试。
+- MCP `memory_compile` schema 暴露 `body_mode`，并在 cache manifest / audit event / tool result 中记录实际模式。
+- 修复 `Resolve-MemoryTestPython.ps1`：候选 Python 缺少 pytest 时继续尝试下一个环境，避免官方测试脚本在回退到仓库 `.venv` 前中断。
+
+### 验证
+
+```powershell
+..\..\.venv\Scripts\python.exe -m pytest tests\memory_server -q
+# 115 passed
+```
+
+## 2026-04-21 (后续开发计划：LLM 与 RAG 优先级)
+
+> **状态：历史规划；已被 2026-04-23 的 P3 结构升级路线后移和替代**
 
 ### 结论
 

@@ -1,113 +1,18 @@
 from __future__ import annotations
 
-import os
-import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
 from .memory_events import append_event, get_current_user
-from .memory_paths import PathManager, PathSecurityError
-from .memory_records import parse_record_markdown, render_record_markdown, target_path_for_record
+from .memory_paths import PathSecurityError
+from .memory_record_io import (
+    find_record_by_id as _find_record,
+    iter_parsed_records,
+    refresh_index_if_exists as _refresh_index_if_exists,
+    write_record_to_target as _write_record_to_target,
+)
 from .memory_result import error_result, ok_result
-
-
-def _iter_record_paths(config: MemoryConfig) -> list[tuple[Path, str]]:
-    manager = PathManager(config)
-    return list(manager.iter_files(scopes=["memory-bank"], include_paths=["memory-bank/**/*.md"]))
-
-
-def _find_record(config: MemoryConfig, record_id: str) -> tuple[Path, str, dict[str, Any], str] | dict[str, Any]:
-    try:
-        files = _iter_record_paths(config)
-    except PathSecurityError as exc:
-        return error_result("path_not_allowed", str(exc))
-    except FileNotFoundError as exc:
-        return error_result("not_found", str(exc))
-
-    for abs_path, rel_path in files:
-        if rel_path.startswith("memory-bank/compiled/"):
-            continue
-        try:
-            metadata, body = parse_record_markdown(abs_path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        if str(metadata.get("id")) == record_id:
-            return abs_path, rel_path, metadata, body
-    return error_result("not_found", f"record not found: {record_id}", record_id=record_id)
-
-
-def _write_record_to_target(
-    config: MemoryConfig,
-    *,
-    old_abs_path: Path,
-    old_rel_path: str,
-    metadata: dict[str, Any],
-    body: str,
-) -> dict[str, Any]:
-    record_id = str(metadata.get("id", ""))
-    rel_path = target_path_for_record(
-        record_id,
-        str(metadata.get("record_kind", "")),
-        str(metadata.get("scope", "")),
-        str(metadata.get("status", "")),
-        str(metadata.get("author", "")),
-    )
-    manager = PathManager(config)
-    try:
-        new_abs_path = manager.resolve(rel_path, must_exist=False, must_be_file=False)
-    except PathSecurityError as exc:
-        return error_result("path_not_allowed", str(exc))
-
-    content = render_record_markdown(metadata, body)
-    same_path = old_abs_path.resolve() == new_abs_path.resolve()
-    try:
-        new_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        # Stage the new content in a sibling temp file, then atomically rename.
-        # This avoids the previous "write new -> unlink old" path that could leave
-        # two copies (or zero) on partial failure during status transitions.
-        tmp_name = f".{new_abs_path.name}.{uuid.uuid4().hex[:8]}.tmp"
-        tmp_path = new_abs_path.parent / tmp_name
-        tmp_path.write_text(content, encoding="utf-8")
-        try:
-            os.replace(tmp_path, new_abs_path)
-        except OSError:
-            # Best-effort cleanup of staging file before re-raising.
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            raise
-        if not same_path:
-            # Only remove the previous file once the new one is in place.
-            try:
-                old_abs_path.unlink()
-            except FileNotFoundError:
-                pass
-    except OSError as exc:
-        return error_result("write_failed", f"failed to update record: {exc}")
-
-    return ok_result(
-        "record updated",
-        id=record_id,
-        path=rel_path,
-        previous_path=old_rel_path,
-        status=metadata.get("status"),
-        scope=metadata.get("scope"),
-        record_kind=metadata.get("record_kind"),
-    )
-
-
-def _refresh_index_if_exists(config: MemoryConfig, path: str) -> None:
-    if not (config.repo_root / ".ai-memory/search.db").exists():
-        return
-    try:
-        from .memory_record_index import memory_update_index
-
-        memory_update_index(config, paths=[path])
-    except Exception:
-        pass
 
 
 def _now() -> str:
@@ -135,17 +40,12 @@ def _body_fingerprint(body: str) -> str:
 
 
 def _other_records(config: MemoryConfig, record_id: str) -> list[tuple[str, dict[str, Any], str]]:
-    records: list[tuple[str, dict[str, Any], str]] = []
-    for abs_path, rel_path in _iter_record_paths(config):
-        if rel_path.startswith("memory-bank/compiled/"):
-            continue
-        try:
-            metadata, body = parse_record_markdown(abs_path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        if str(metadata.get("id")) != record_id:
-            records.append((rel_path, metadata, body))
-    return records
+    parsed, _stats = iter_parsed_records(config)
+    return [
+        (record.rel_path, record.metadata, record.body)
+        for record in parsed
+        if str(record.metadata.get("id")) != record_id
+    ]
 
 
 def _validation_errors(config: MemoryConfig, record_id: str, metadata: dict[str, Any], body: str) -> list[str]:

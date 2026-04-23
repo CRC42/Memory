@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from servers.memory_server.memory_compiler import get_record_last_used_at, memory_compile
@@ -201,7 +202,7 @@ def test_dispatch_exposes_runtime_maintenance_tools(repo: Path) -> None:
 
 
 def test_build_tools_includes_runtime_maintenance_tools(repo: Path) -> None:
-    config = load_config(repo)
+    config = replace(load_config(repo), mcp_expose_admin_tools=True)
     tool_names = {tool.name for tool in _build_tools(config)}
 
     assert "memory_health_check" in tool_names

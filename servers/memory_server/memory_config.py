@@ -77,6 +77,9 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
         "allowed_tags": list(DEFAULT_ALLOWED_TAGS),
         "version": "v1",
     },
+    "mcp": {
+        "expose_admin_tools": False,
+    },
 }
 
 
@@ -125,6 +128,7 @@ class MemoryConfig:
     governance_reviewers: list[str] | None = None
     tag_allowed_tags: list[str] | None = None
     tag_schema_version: str = "v1"
+    mcp_expose_admin_tools: bool = False
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -251,6 +255,7 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
     backup_cfg = merged.get("backup", {}) if isinstance(merged.get("backup"), dict) else {}
     governance_cfg = merged.get("governance", {}) if isinstance(merged.get("governance"), dict) else {}
     tag_schema_cfg = merged.get("tag_schema", {}) if isinstance(merged.get("tag_schema"), dict) else {}
+    mcp_cfg = merged.get("mcp", {}) if isinstance(merged.get("mcp"), dict) else {}
 
     def _string_list(value: Any) -> list[str]:
         if not isinstance(value, list):
@@ -300,4 +305,5 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         governance_reviewers=_string_list(governance_cfg.get("reviewers")),
         tag_allowed_tags=_string_list(tag_schema_cfg.get("allowed_tags")),
         tag_schema_version=str(tag_schema_cfg.get("version", "v1")),
+        mcp_expose_admin_tools=bool(mcp_cfg.get("expose_admin_tools", False)),
     )

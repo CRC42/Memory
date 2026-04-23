@@ -1,8 +1,8 @@
 # MCP 记忆系统设计文档
 
-> 状态：vNext 设计稿；P0/P1/P2 与 v0.4.1 P0 加固已落地
+> 状态：vNext 设计稿；P0/P1/P2、P3 结构升级首版与 P3 hardening 已落地
 >
-> 日期：2026-04-21
+> 日期：2026-04-23
 >
 > 适用范围：`ToolTest/MCP/Memory` 后续演进设计、多人协作治理、MCP 对外接口扩展
 
@@ -12,14 +12,14 @@
 
 ### 0.1 已有实现
 
-当前仓库中的 Memory MCP 已具备以下基础能力：
+当前仓库中的 Memory MCP 默认对外暴露 3 个 facade tools，并保留 legacy/admin 兼容工具：
 
-- `memory_get`：读取记忆文件内容，支持截断和多人模式重定向
-- `memory_search`：关键词检索，支持 CJK 文本
-- `memory_guard_check`：记忆容量与预算检查
-- `memory_backup`：记忆文件备份与轮转
-- `memory_compact`：基于规则的压缩与摘要
-- `memory_write`：受控写入，支持原子写入、备份、策略降级和用户标签注入
+- `memory_read`：读取文件、普通搜索、结构化记录搜索、读取 runtime digest
+- `memory_write`：普通文件写入、结构化记录写入、observation 证据写入、artifact/facet 关联
+- `memory_context`：编译 runtime / snapshot / review 视图、读取 digest、追踪 lineage、列出 conflicts、对比 snapshot、装配上下文
+- `mcp.expose_admin_tools=true`：开发期或纯 MCP 客户端兼容完整 legacy/admin 工具集
+
+内部已具备：路径安全、原子写入、备份/压缩/guard、CJK 搜索、结构化记录、SQLite FTS、治理发布、确定性编译、P3 snapshot/scoring/retrieval、record IO 公共层和深度健壮性加固。
 
 ### 0.2 当前存储分层
 
@@ -38,15 +38,15 @@
 
 ### 0.3 当前能力边界
 
-当前版本已经解决了“多人协作下的高频写入冲突”和“基础读写、检索、压缩、预算保护”问题，但仍存在以下演进空间：
+当前版本已经解决了“多人协作下的高频写入冲突”“基础读写、检索、压缩、预算保护”“结构化记录治理”“P3 证据驱动上下文装配”和“深度健壮性边界”问题，但仍存在以下演进空间：
 
-- 正式记忆记录缺少统一的结构化外壳
-- 系统记忆与个人记忆还没有完整的治理与发布流
-- 检索层仍以文件粒度为主，尚未形成统一记录索引
-- 缺少候选池、归档层、编译产物层的正式目录模型
-- MCP 对外接口仍偏文件操作，尚未提升到“记录级”和“发布级”能力
+- 内部实现仍有大文件：`memory_compiler.py`、`server.py` 需要继续拆分
+- `memory_retrieval` 仍依赖 compiler 的 `CompilableRecord` / `_compact_body`，后续应抽 `memory_corpus.py`
+- Front Matter parser/dumper 仍在 `memory_records.py`，后续应抽 `memory_frontmatter.py`
+- P3+ 还需要 promote/degrade、reviewer/owner/publisher 角色、dao 层晋升约束
+- CLI / 管理 skill 需要承接 guard、backup、compact、index、governance、snapshot review 等低频管理动作
 
-因此，本文档定义的目标不是替换当前系统，而是在兼容现有 Memory MCP 的前提下，为后续开发提供统一的架构设计。
+因此，本文档定义的目标不是替换当前系统，而是在当前 3-tool facade 与 P3 完成态之上，为后续内部拆分、P3+ 治理、P4/P5 增强提供统一架构基线。
 
 ## 1. 文档目标
 
@@ -512,6 +512,8 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 编译产物写入 `memory-bank/compiled/runtime/`
 - 默认只包含 `validated` / `published` 记录
 - 支持按 `user`、`task_id`、`branch`、`include_scopes`、`include_statuses`、`preferred_tags` 过滤
+- 默认使用 `body_mode="compact"` 输出较短上下文，只保留 `id`、`source`、`status` 和关键段落
+- `body_mode="full"` 可显式恢复完整记录正文与详细 metadata 渲染
 - 输出为确定性 Markdown，可删除后重建，不作为唯一真源
 
 `task handoff`
@@ -528,7 +530,7 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 - 已实现 `memory_compile(target="task_handoff")`
 - 产物写入 `memory-bank/compiled/runtime/task/{task_id}-handoff.md`
-- 当前为无 LLM 模板式视图，后续可在治理层稳定后增强分类和章节提取
+- 当前为无 LLM 模板式 compact 视图，后续可在治理层稳定后增强分类和章节提取
 
 `system digest`
 
@@ -592,6 +594,16 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 当前用户
 - 当前候选池
 - 当前系统 digest
+
+原则 5：默认面向运行时上下文压缩。
+
+编译产物默认不机械复制完整记录，而是：
+
+- metadata 用于筛选和路由，不默认逐条展示
+- 每条记录保留最小追溯信息：`id`、`source`、`status`
+- 正文优先抽取 `Decision`、`Expected Behavior`、`Acceptance Checks`、`Next Step(s)`、`Notes`、`Details`
+- 无关键段落时截取正文开头
+- 需要审计或调试时可用 `body_mode="full"` 查看完整渲染
 
 ## 9. 检索模型
 
@@ -764,19 +776,114 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 ## 11. MCP 接口设计
 
-### 11.1 基础能力接口（无 LLM 也可运行）
+### 11.0 对外接口收敛策略（最高优先级）
+
+当前实现为了验证功能与测试覆盖，曾把内部能力较细粒度地暴露为多个 MCP tools。这个形态适合开发期调试，但不适合作为长期对外接口：AI 客户端会看到过多工具，容易误选高风险管理动作，也会让工具 schema 变得嘈杂。
+
+当前首版已完成：**MCP 对外默认只保留运行时高频读写与上下文能力，管理能力迁移到 CLI / scripts / skill。**
+
+默认 MCP 对外只暴露 3 个 facade tools：
+
+- `memory_read`
+  - 负责读取、搜索、搜索结构化记录、读取 runtime digest。
+  - 内部可路由到 `memory_get`、`memory_search`、`memory_search_records`、`memory_get_runtime_digest`。
+- `memory_write`
+  - 负责普通文件写入、结构化记录写入、observation 证据写入、artifact/facet 关联。
+  - 内部可路由到现有 `memory_write`、`memory_write_record`、`memory_record_observation`、`memory_link_artifact`。
+- `memory_context`
+  - 负责面向当前 AI 会话的上下文装配、编译、lineage、conflict、snapshot compare。
+  - 内部可路由到 `memory_compile`、`memory_get_runtime_digest`、`memory_trace_lineage`、`memory_list_conflicts`、`memory_compare_snapshots`、`memory_retrieve_context`。
+
+以下能力不再默认暴露为 MCP tools，改为 CLI / scripts / 管理 skill 调用：
+
+- guard / backup / compact
+- rebuild index / update index
+- health check / schema migrate
+- validate / publish / archive / delete
+- snapshot rebuild
+- conflict review / promote / degrade
+
+推荐最终外观：
+
+```text
+MCP:
+  memory_read
+  memory_write
+  memory_context
+
+CLI:
+  memory admin guard
+  memory admin backup
+  memory admin compact
+  memory index rebuild/update
+  memory govern validate/publish/archive/delete
+  memory snapshot daily/weekly/monthly
+  memory health
+  memory migrate
+
+Skill:
+  memory-admin
+  memory-governance
+  memory-snapshot-review
+```
+
+当前兼容策略：
+
+- 内部 Python 函数继续保留，不立即删除。
+- 开发期可通过配置开关继续暴露完整工具集：`mcp.expose_admin_tools=true`，当前兼容工具数为 23（含 3 个 facade）。
+- 默认 MCP tool list 收敛为 3 个 facade。
+- CLI 和 skill 负责高风险、低频、管理类操作。
+- 如果某些纯 MCP 客户端不能执行 CLI，可用配置显式开启 legacy/admin tools。
+
+### 11.1 facade operation 契约（当前 MCP 对外接口）
+
+`memory_read`：
+
+| operation | 内部路由 | 用途 |
+|-----------|----------|------|
+| `get` | `memory_get` | 读取允许范围内的记忆文件 |
+| `search` | `memory_search` | 搜索普通 Markdown 记忆文件 |
+| `search_records` | `memory_search_records` | 搜索结构化记录 FTS 索引 |
+| `runtime_digest` | `memory_get_runtime_digest` | 读取已编译 runtime digest |
+
+`memory_write`：
+
+| operation | 内部路由 | 用途 |
+|-----------|----------|------|
+| `file` | `memory_write` | 写普通文件，兼容旧调用 |
+| `record` | `memory_write_record` | 写 Markdown + Front Matter 结构化记录 |
+| `observation` | `memory_record_observation` | 写 schema v2 observation 证据 |
+| `link_artifact` | `memory_link_artifact` | 给现有记录追加 artifact / 工程 facet |
+
+`memory_context`：
+
+| operation | 内部路由 | 用途 |
+|-----------|----------|------|
+| `compile` | `memory_compile` | 编译 runtime / snapshot / review / rollback / dao-fa-shu 视图 |
+| `runtime_digest` | `memory_get_runtime_digest` | 读取已编译 runtime digest |
+| `trace_lineage` | `memory_trace_lineage` | 追踪 `derived_from` / `supersedes` / `conflicts_with` |
+| `list_conflicts` | `memory_list_conflicts` | 列出 open conflicts 与缺失目标 |
+| `compare_snapshots` | `memory_compare_snapshots` | 对比两个 snapshot 的 added / removed / persisted |
+| `retrieve_context` | `memory_retrieve_context` | 按 scope / time / facet / recall / rerank 装配上下文 |
+
+### 11.2 内部能力（无 LLM 也可运行）
 
 - `memory_write_record`
 - `memory_append_event`
 - `memory_search`
 - `memory_compile`
+- `memory_record_observation`
+- `memory_link_artifact`
+- `memory_trace_lineage`
+- `memory_compare_snapshots`
+- `memory_retrieve_context`
 - `memory_validate_candidate`
 - `memory_publish_candidate`
 - `memory_archive_record`
 - `memory_rebuild_index`
 - `memory_get_runtime_digest`
 
-### 11.2 增强能力接口（可选依赖 LLM）
+### 11.3 增强能力接口（可选依赖 LLM）
 
 - `memory_classify_record`
 - `memory_extract_candidate`
@@ -787,10 +894,11 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 这些接口失败时不得影响基础链路。
 
-### 11.3 MCP 写入接口示例
+### 11.4 MCP 写入接口示例
 
 ```json
 {
+  "operation": "record",
   "record_kind": "rule_candidate",
   "scope": "personal",
   "status": "candidate",
@@ -804,10 +912,11 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 }
 ```
 
-### 11.4 MCP 编译接口示例
+### 11.5 MCP 编译接口示例
 
 ```json
 {
+  "operation": "compile",
   "target": "runtime_digest",
   "user": "yangskin",
   "task_id": "task_sp_sync",
@@ -815,6 +924,20 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
   "include_scopes": ["shared", "personal"],
   "include_statuses": ["validated", "published"],
   "preferred_tags": ["asset_pipeline", "texture"]
+}
+```
+
+### 11.6 MCP 上下文装配接口示例
+
+```json
+{
+  "operation": "retrieve_context",
+  "query": "texture pipeline",
+  "include_scopes": ["shared", "project_shared", "session"],
+  "include_statuses": ["raw", "candidate", "validated", "published"],
+  "system_area": "memory",
+  "module_names": ["MemoryServer"],
+  "top_k": 10
 }
 ```
 
@@ -913,43 +1036,413 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 发布与降级流程
 - owner 审核机制
 
-### 阶段 4：高级增强版
+### 阶段 4：P3 结构升级版
 
 目标：
 
-- 本地小模型支持
-- 云端 LLM 批处理提炼
-- 重分类与 schema 升级
-- 周期性 lint
-- 系统记忆健康检查
+把当前“结构化项目记忆服务器”升级成“证据驱动的联合项目记忆编译器”。这一阶段不依赖 LLM，也不引入向量索引，优先补齐时间、谱系、评分、分层召回和回顾入口。
 
-优先级说明：
+#### Phase 3A：证据层与记录模型升级
 
-- LLM 增强优先于 RAG / 向量检索。
-- LLM 只作为分类、提炼、候选生成、冲突解释和摘要增强器。
-- LLM 不得直接发布系统记忆，不得绕过治理流程。
-- 无 LLM 时，基础写入、FTS 检索、编译和治理必须继续可用。
+新增 record schema v2 字段：
 
-### 阶段 5：本地 RAG / 向量召回增强版
+- `occurred_at`
+- `valid_from`
+- `valid_to`
+- `memory_tier`: `hot | warm | cold | fossil`
+- `cognitive_level`: `dao | fa | shu`
+- `derived_from_record_ids`
+- `derived_from_snapshot_ids`
+- `derived_from_revision_ids`
+- `supersedes`
+- `conflicts_with`
+- `related_artifact_ids`
+- `importance_score`
+- `asset_paths`
+- `map_names`
+- `plugin_names`
+- `module_names`
+- `class_names`
+- `blueprint_paths`
+- `system_area`
+
+扩展 scope：
+
+- `session`
+- `user_private`
+- `task_or_branch`
+- `project_shared`
+- `org_shared`
+
+新增 record kind：
+
+- `observation`
+- `artifact_ref`
+- `incident`
+- `decision`
+- `procedure`
+- `snapshot_daily`
+- `snapshot_weekly`
+- `snapshot_monthly`
+
+当前首版实现状态：
+
+- `memory_write_record` 已支持 `schema_version="2.0"`，并在使用 P3 record kind、scope 或 v2 字段时自动写入 schema v2 Front Matter。
+- 默认写入仍保持 schema `1.0`，旧调用方不受影响。
+- 已增加 `memory_tier`、`cognitive_level`、`importance_score` 校验。
+- 已支持 v2 时间字段、谱系字段和工程 facet 字段落盘。
+- `memory_record_index.py` 已将 schema v2 字段写入 SQLite metadata 表，并把 tier、cognitive level、system area 与 facets 纳入 FTS 检索。
+- `memory_write_record` MCP 工具 schema 已暴露 P3A 字段。
+- 已实现 `memory_record_observation`，用于以 schema v2 observation 形式记录原始证据。
+- 已实现 `memory_link_artifact`，用于给既有记录追加 artifact / 工程 facet，并刷新已有索引。
+- 已实现 `memory_trace_lineage`，用于追踪 `derived_from_record_ids`、`supersedes`、`conflicts_with` 记录谱系。
+
+#### Phase 3B：时间快照编译器
+
+新增正式 snapshot：
+
+- `daily_snapshot`
+- `weekly_snapshot`
+- `monthly_snapshot`
+
+daily snapshot 字段：
+
+- `window_start`
+- `window_end`
+- `derived_from_record_ids`
+- `top_changes`
+- `top_reused_memories`
+- `open_questions`
+- `candidate_for_weekly`
+
+weekly snapshot 字段：
+
+- `derived_from_daily_snapshot_ids`
+- `derived_from_record_ids`
+- `resolved_this_week`
+- `still_open`
+- `new_rules`
+- `stale_but_relevant`
+- `candidate_for_monthly`
+
+monthly snapshot 字段：
+
+- `derived_from_weekly_snapshot_ids`
+- `theme_clusters`
+- `promoted_knowledge`
+- `discarded_paths`
+- `architecture_shifts`
+- `what_stayed_true`
+- `what_changed`
+
+新增编译目标：
+
+- `daily_snapshot`
+- `weekly_snapshot`
+- `monthly_snapshot`
+- `rollback_context`
+- `review_queue`
+- `dao_digest`
+- `fa_digest`
+- `shu_digest`
+
+其中：
+
+- `dao_digest`：原则、边界、长期稳定共识
+- `fa_digest`：规则、流程、治理、编译秩序
+- `shu_digest`：具体做法、操作手册、常用 skill
+
+当前首版实现状态：
+
+- 已实现 `memory_compile(target="daily_snapshot" | "weekly_snapshot" | "monthly_snapshot", as_of=...)`。
+- snapshot 输出为 `memory-bank/compiled/snapshots/...` 下的可重建视图，不回写真源记录。
+- 已通过 compile cache 记录 `snapshot_id`、`window_start`、`window_end`、`derived_from_snapshot_ids` 和 `included_record_ids`，支持 weekly 派生 daily、monthly 派生 weekly。
+- 已实现 `rollback_context`、`review_queue`、`dao_digest`、`fa_digest`、`shu_digest` 编译目标。
+
+#### Phase 3C：importance scoring 与回顾入口
+
+新增 deterministic scorer：
+
+```text
+importance = governance + usage + impact + novelty + conflict + decay
+```
+
+拆分函数：
+
+- `score_governance()`
+- `score_usage()`
+- `score_impact()`
+- `score_novelty()`
+- `score_conflict()`
+- `score_decay()`
+
+主要信号：
+
+- 治理信号：candidate -> validated -> published、supersede、conflict
+- 使用信号：被 compile 命中次数、被多少任务引用、被多少用户引用、被多少 snapshot 继承
+- 影响面信号：涉及多少模块、资产、地图、shared 层
+- 事件信号：incident、迁移、回归、接口变化
+- 时间衰减信号：新近性 + 老记录复用反增权
+
+新增回顾入口：
+
+- 本日最重要 10 条
+- 本周最重要 10 条
+- 本月新稳定规则
+- 本月高复用旧记录
+- 本月被放弃路线
+- 当前 open conflicts
+- 当前 rollback chain
+
+当前首版实现状态：
+
+- 已新增 `memory_scoring.py`，实现 deterministic scorer：`governance + usage + impact + novelty + conflict + decay`。
+- usage stats 继续放在 `.ai-memory/usage-stats.json`，compile 命中会累加 `compile_hit_count` 和 `compile_targets`，不修改源记录。
+- `review_queue` 使用 scorer 输出本轮最重要记录、hot tier、新稳定规则和 discarded paths。
+- `dao_digest`、`fa_digest`、`shu_digest` 按 `cognitive_level` 生成分层视图。
+
+#### Phase 3D：检索升级为上下文装配
+
+新增工具：
+
+- `memory_record_observation`
+- `memory_link_artifact`
+- `memory_trace_lineage`
+- `memory_compare_snapshots`
+- `memory_list_conflicts`
+- `memory_retrieve_context`
+
+当前首版实现状态：
+
+- 已实现 `memory_record_observation`
+- 已实现 `memory_link_artifact`
+- 已实现 `memory_trace_lineage`
+- 已实现 `memory_context(operation="list_conflicts")`，用于列出 `conflicts_with` 冲突边、缺失目标和 resolved 状态
+- 已实现 `memory_context(operation="compare_snapshots")`，基于 compile cache 对比两个 snapshot 的 added / removed / persisted record ids
+- 已实现 `memory_context(operation="retrieve_context")`，按固定 pipeline 输出上下文装配结构
+
+`memory_retrieve_context` 固定顺序：
+
+1. scope filter
+2. time window filter
+3. facet filter
+4. metadata / FTS recall
+5. importance rerank
+6. context assembly
+
+输出结构：
+
+- `core_constraints`
+- `relevant_rules`
+- `recent_snapshots`
+- `key_evidence`
+- `open_conflicts`
+- `next_steps`
+
+#### P3+：多人联合项目治理增强
 
 目标：
 
-- 在 LLM 增强稳定后，再评估本地 embedding / 向量召回。
-- 只用于语义模糊召回、相似记录推荐、候选去重建议和冲突候选提示。
-- 向量索引放在 `.ai-memory/` 下，作为可删除、可重建的派生产物。
-- RAG 不参与真源判定，不参与权限判断，不直接决定正式发布。
-- 推荐检索顺序为：metadata 过滤 -> SQLite FTS -> 向量补召回 -> 规则或 LLM 重排 -> 返回带 record id / path 的结果。
+- 支持按 user / task / branch / project / org 过滤与编译
+- 候选晋升区分个人候选、项目共享候选、组织级规则候选
+- 引入 reviewer / owner / publisher 角色
+- 对 dao 层记忆设置更严格晋升条件
+
+晋升逻辑：
+
+- `shu`：允许较快沉淀，优先从 observation / procedure 产生
+- `fa`：要求多次复用或多人验证
+- `dao`：只能从稳定 fa 上升，且必须人工确认
+
+### 阶段 5：P4 LLM 软增强版
+
+目标：
+
+- query rewrite
+- tag / facet 推荐
+- candidate draft
+- snapshot narrative
+- conflict explanation
+- title / abstract 优化
+
+限制：
+
+- 不直接发布正式系统记忆
+- 不覆盖真源
+- 不替代 deterministic compile
+- 不直接决定 dao 层内容
+- 无 LLM 时，基础写入、检索、快照、评分、编译和治理必须继续可用
+
+### 阶段 6：P5 本地 RAG / 向量补召回版
+
+目标：
+
+- 语义模糊召回
+- 长尾别名补召回
+- 低关键词命中场景下的 recall 增强
+
+限制：
+
+- 向量索引只放 `.ai-memory/`
+- 可删除、可重建
+- 永远不是正式真源
+- 检索顺序仍是 metadata -> FTS -> vector supplement -> rerank
 
 ### 15.5 与当前仓库的落地顺序建议
 
-结合 `ToolTest/MCP/Memory` 当前已落地的 v0.4.0 能力，建议按以下顺序推进：
+结合 `ToolTest/MCP/Memory` 当前已落地的 P3 首版与 hardening 结果，建议按以下顺序推进：
 
-1. 先在现有 `memory_write` / `memory_search` / `memory_guard_check` 基础上增加“记录级”抽象，而不是立即推翻现有文件级接口。
-2. 优先补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引，形成真正的记录模型。
-3. 以“兼容现有 `memory-bank/*.md` 文件”为前提实现 `runtime digest` 和 `task handoff` 编译，避免一次性迁移所有调用方。
-4. 等记录层稳定后，再引入候选验证、发布、归档和 skill 候选治理。
-5. 之后接入本地模型或云端 LLM，把 LLM 能力限制在分类、提炼、冲突解释和候选生成等增强位。
-6. 最后再评估本地 RAG / 向量召回；RAG 的优先级低于 LLM 增强，且只能作为语义召回补充。
+0. **最高优先级：先收敛 MCP 对外暴露面。（首版已完成）**
+   - 默认 MCP 只暴露 `memory_read`、`memory_write`、`memory_context` 三个 facade tools。
+   - legacy/admin 兼容工具降为内部函数或显式配置暴露。
+   - guard、backup、compact、index、health、migrate、governance、snapshot 管理动作迁移到 CLI / scripts / skill。
+   - 已增加配置开关 `mcp.expose_admin_tools=true` 支持开发期或纯 MCP 客户端继续暴露 admin/legacy tools。
+1. 已保留内部实现稳定性，不立即删除已验证函数，默认只通过 facade 暴露。
+2. 已在现有文件级接口上增加记录级抽象，旧调用仍可继续用。
+3. 已补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引、schema v2 字段。
+4. 已实现 `runtime digest`、`task handoff`、`system_digest`、`publish_queue` 和 P3 snapshot/review/rollback/dao-fa-shu 编译目标。
+5. 已引入候选验证、发布、归档和 tombstone 删除治理。
+6. P3 首版已完成：schema v2、时间快照、谱系关系、importance scoring、facet、回顾入口和上下文装配。
+7. 下一步优先做内部拆分与 P3+ 联合治理：promote/degrade、reviewer/owner/publisher 角色、dao 层晋升约束。
+8. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、候选草稿、快照叙事和冲突解释。
+9. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
+
+### 15.6 P3 模块落地状态
+
+已修改现有模块：
+
+- `memory_records.py`：已扩 schema v2，支持 snapshot、lineage、tier、cognitive_level、facet。
+- `memory_record_index.py`：已索引 schema v2 metadata / facets，并支持损坏 SQLite 索引自愈。
+- `memory_compiler.py`：已扩成 runtime / snapshot / review / rollback / dao-fa-shu compiler。
+- `memory_governance.py`：已保留 validate / publish / archive 治理；promote / degrade 进入 P3+。
+- `memory_maintenance.py`：已支持 health / migrate / tombstone delete。
+- `memory_events.py`：继续作为审计日志底层。
+
+已新增模块：
+
+- `memory_scoring.py`
+- `memory_lineage.py`
+- `memory_retrieval.py`
+- `memory_record_io.py`
+
+暂不新增独立 `memory_snapshots.py` / `memory_facets.py`，snapshot 逻辑先收在 `memory_compiler.py`，facet 逻辑先由 record schema / index / retrieval 共同承载。后续内部拆分时再按复杂度拆出。
+
+### 15.6.1 P0 内部重构（2026-04-23 起）
+
+P3 完成后，对内部实现进行不改变 MCP 对外契约的轻量重构。目标：消除重复 IO、收敛超大文件、为后续拆分铺路。
+
+P0-3 已完成（2026-04-23）：
+
+- 新增 `memory_record_io.py` 作为唯一的 record IO 公共层。
+- `iter_record_files` / `iter_parsed_records` / `find_record_by_id` / `refresh_index_if_exists` / `write_same_record` / `write_record_to_target` 在此集中实现。
+- `memory_governance.py` / `memory_lineage.py` / `memory_maintenance.py` / `memory_compiler.py` 不再各自实现这些函数。
+- 默认 MCP facade 工具数仍为 3 个；P0-3 完成时测试 133 全部通过。
+
+P0-4 已完成（2026-04-23）：
+
+- 深度健壮性测试新增 `tests/memory_server/test_robustness_deep.py`。
+- `PathManager.resolve` 前置拒绝 NUL 字节，避免 `pathlib` 抛 `ValueError` 越过安全层。
+- `memory_rebuild_index` 在 rebuild 前用 `PRAGMA integrity_check` 探测损坏 SQLite，并自动清理坏 db / WAL / SHM 后重建。
+- 覆盖并发 overwrite、残留 `.tmp`、坏 Front Matter 跳过、空 corpus not_found、路径攻击、Unicode 往返、全局预算拒绝、非法 record_kind 不落盘。
+- 当前 Memory 测试为 143 全部通过。
+
+P0-1 / P0-2 计划（未实施）：
+
+- P0-1：拆 `memory_compiler.py`（cache / render / targets / 入口）。
+- P0-2：拆 `server.py`（schema / dispatch / admin / main）。
+- P1-4：把 `CompilableRecord` 与 `_compact_body` 上提到独立 corpus 模块，消除 `memory_retrieval` 对 compiler 私有函数的反向依赖。
+- P1-5：把 Front Matter parser/dumper 抽到 `memory_frontmatter.py`，便于未来替换实现。
+
+### 15.7 P3/P4 测试计划与当前覆盖
+
+P3A 测试：
+
+- schema v2 兼容旧记录
+- 新字段缺省值与迁移
+- dao / fa / shu 字段校验
+- memory_tier 校验
+- artifact / observation 落盘与读取
+- 当前状态：已覆盖。
+
+P3B 测试：
+
+- daily / weekly / monthly snapshot 生成
+- derived_from 链完整性
+- snapshot 重建一致性
+- snapshot 不回写真源
+- 当前状态：已覆盖。
+
+P3C 测试：
+
+- importance scoring 稳定性
+- usage / governance / impact 组合打分
+- hot / warm / cold / fossil 路由正确
+- 当前状态：已覆盖首版 scorer 和 review/dao-fa-shu 输出。
+
+P3D 测试：
+
+- `memory_retrieve_context` 装配顺序
+- scope / time / facet / FTS / rerank 结果正确
+- rollback context 生成
+- 当前状态：已覆盖。
+
+Hardening 测试：
+
+- 并发 overwrite 原子性
+- 残留 `.tmp` 不影响读取/遍历
+- 坏 Front Matter / 非 record Markdown 跳过
+- 空 corpus `find_record_by_id` 返回 `not_found`
+- 损坏 `search.db` rebuild 自愈
+- NUL / 绝对路径 / `..` 等路径攻击拒绝
+- Unicode 往返
+- 全局预算拒绝
+- 非法 `record_kind` 不落盘
+
+P4 测试：
+
+- LLM 不可用时主链路不受影响
+- LLM 只增强、不改变发布权限
+
+### 15.8 建议版本路线
+
+`v0.5.0`：结构升级版
+
+- schema v2
+- observation / artifact_ref / incident
+- snapshot_daily / weekly / monthly
+- lineage 基础字段
+- importance scoring v1
+- hot / warm / cold / fossil
+- `memory_retrieve_context` v1
+
+`v0.5.1`：内部重构与健壮性加固版
+
+- record IO 公共层
+- NUL 路径拒绝
+- 损坏 SQLite 索引自愈
+- 深度健壮性测试
+- 当前测试数 143
+
+`v0.5.5`：多人联合治理版
+
+- conflict / supersede / promote / degrade
+- reviewer / owner / publisher 角色
+- dao 层晋升约束强化
+- snapshot review / governance 管理 skill
+
+`v0.6.0`：LLM 软增强版
+
+- query rewrite
+- tag / facet 推荐
+- snapshot narrative
+- conflict explanation
+- candidate draft
+
+`v0.6.5`：向量补召回版
+
+- 本地向量索引
+- FTS 失败时语义补召回
+- 规则重排融合
 
 ## 16. 最终结论
 
@@ -985,6 +1478,14 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 - 无 LLM 时系统仍可完整运行
 - 有 LLM 时只增强质量，不改变基础依赖关系
+
+下一阶段优先级：
+
+- MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
+- P3 首版已完成：时间快照、谱系关系、importance scoring、facet、分层召回、上下文装配和 dao/fa/shu 视图已落地。
+- 当前下一步是内部拆分与 P3+ 治理增强：拆 `memory_compiler.py` / `server.py`，抽 `memory_corpus.py` / `memory_frontmatter.py`，补 promote/degrade 与 reviewer/owner/publisher 角色。
+- P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、候选草稿、快照叙事和冲突解释。
+- P5 最后做本地 RAG / 向量补召回，且只作为 metadata / FTS 后的语义补充。
 
 ### 16.1 对当前项目的直接意义
 

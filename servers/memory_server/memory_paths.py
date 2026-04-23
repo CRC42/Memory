@@ -31,6 +31,10 @@ class PathManager:
         must_exist: bool = True,
         must_be_file: bool = True,
     ) -> Path:
+        # Reject pathological inputs early so they can't reach pathlib /
+        # os.replace and raise unhelpful ValueError / OSError downstream.
+        if not isinstance(path_value, str) or "\x00" in path_value:
+            raise PathSecurityError(f"path contains illegal character: {path_value!r}")
         candidate = Path(path_value)
         if candidate.is_absolute():
             resolved = candidate.resolve()

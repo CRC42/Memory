@@ -43,6 +43,86 @@ def test_write_record_creates_candidate_markdown_with_front_matter(repo: Path) -
     assert body.startswith("# Export Size Rule")
 
 
+def test_write_record_accepts_schema_v2_phase3_metadata(repo: Path) -> None:
+    config = load_config(repo)
+
+    result = memory_write_record(
+        config,
+        content_markdown="# Widget Incident\n\nTexture replacement regressed in the editor widget path.\n",
+        record_kind="incident",
+        scope="task_or_branch",
+        author="alice",
+        tags=["mcp"],
+        occurred_at="2026-04-23T08:30:00+00:00",
+        memory_tier="hot",
+        cognitive_level="shu",
+        derived_from_record_ids=["mem_source"],
+        conflicts_with=["mem_conflict"],
+        related_artifact_ids=["asset:/Game/UI/WBP_Test"],
+        importance_score=0.74,
+        asset_paths=["/Game/UI/WBP_Test"],
+        plugin_names=["AssetCustoms"],
+        module_names=["ToolTest"],
+        class_names=["UToolTestWidget"],
+        blueprint_paths=["/Game/UI/WBP_Test.WBP_Test"],
+        system_area="memory",
+    )
+
+    assert result["ok"] is True
+    assert result["path"].startswith("memory-bank/people/")
+
+    metadata, body = parse_record_markdown((repo / result["path"]).read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == "2.0"
+    assert metadata["record_kind"] == "incident"
+    assert metadata["scope"] == "task_or_branch"
+    assert metadata["memory_tier"] == "hot"
+    assert metadata["cognitive_level"] == "shu"
+    assert metadata["derived_from_record_ids"] == ["mem_source"]
+    assert metadata["conflicts_with"] == ["mem_conflict"]
+    assert metadata["related_artifact_ids"] == ["asset:/Game/UI/WBP_Test"]
+    assert metadata["importance_score"] == 0.74
+    assert metadata["asset_paths"] == ["/Game/UI/WBP_Test"]
+    assert metadata["plugin_names"] == ["AssetCustoms"]
+    assert metadata["module_names"] == ["ToolTest"]
+    assert metadata["class_names"] == ["UToolTestWidget"]
+    assert metadata["blueprint_paths"] == ["/Game/UI/WBP_Test.WBP_Test"]
+    assert metadata["system_area"] == "memory"
+    assert body.startswith("# Widget Incident")
+
+
+def test_write_record_rejects_v2_fields_with_schema_v1(repo: Path) -> None:
+    config = load_config(repo)
+
+    result = memory_write_record(
+        config,
+        content_markdown="# Bad Version\n",
+        schema_version="1.0",
+        record_kind="note",
+        tags=["mcp"],
+        memory_tier="hot",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
+    assert "schema_version 2.0" in result["message"]
+
+
+def test_write_record_rejects_unknown_memory_tier(repo: Path) -> None:
+    config = load_config(repo)
+
+    result = memory_write_record(
+        config,
+        content_markdown="# Bad Tier\n",
+        record_kind="note",
+        tags=["mcp"],
+        memory_tier="lukewarm",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
+    assert "memory_tier" in result["message"]
+
+
 def test_write_record_rejects_unknown_record_kind(repo: Path) -> None:
     config = load_config(repo)
 

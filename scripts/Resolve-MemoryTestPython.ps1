@@ -15,9 +15,14 @@ function Resolve-MemoryTestPython {
         if (!(Test-Path $candidate)) {
             continue
         }
-        & $candidate -c "import pytest" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return $candidate
+        try {
+            & $candidate -c "import pytest" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $candidate
+            }
+        }
+        catch {
+            continue
         }
     }
 
