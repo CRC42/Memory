@@ -4,7 +4,7 @@
 >
 > 日期：2026-04-23
 >
-> 适用范围：`ToolTest/MCP/Memory` 后续演进设计、多人协作治理、MCP 对外接口扩展
+> 适用范围：`ToolTest/MCP/Memory` 后续演进设计、重要记忆输出、MCP 对外接口扩展
 
 ## 0. 当前项目基线
 
@@ -41,19 +41,24 @@
 当前版本已经解决了“多人协作下的高频写入冲突”“基础读写、检索、压缩、预算保护”“结构化记录治理”“P3 证据驱动上下文装配”和“深度健壮性边界”问题，但仍存在以下演进空间：
 
 - 内部实现仍有大文件：`memory_compiler.py`、`server.py` 需要继续拆分
-- `memory_retrieval` 仍依赖 compiler 的 `CompilableRecord` / `_compact_body`，后续应抽 `memory_corpus.py`
+- `memory_retrieval` 已切到 `memory_corpus.CompilableRecord` / `compact_body`，不再依赖 compiler 私有符号；后续可继续把 corpus 与 compiler 之间的接口稳定化
 - Front Matter parser/dumper 仍在 `memory_records.py`，后续应抽 `memory_frontmatter.py`
-- P3+ 还需要 promote/degrade、reviewer/owner/publisher 角色、dao 层晋升约束
+- `memory_retrieval` 仍是 `top_k` 驱动，尚未升级为严格 `budget-first` 的小上下文输出（`important_memories` 已 budget-first）
+- `memory_context(operation="important_memories")` 已上线，提供小预算重要记忆输出，外部规则沉淀流程可直接消费
+- 当前文档仍把联合治理扩展写成主线，但新的产品方向应是“动态记忆供给”，而不是“插件内自动审查”
 - CLI / 管理 skill 需要承接 guard、backup、compact、index、governance、snapshot review 等低频管理动作
 
-因此，本文档定义的目标不是替换当前系统，而是在当前 3-tool facade 与 P3 完成态之上，为后续内部拆分、P3+ 治理、P4/P5 增强提供统一架构基线。
+因此，本文档定义的目标不是替换当前系统，而是在当前 3-tool facade 与 P3 完成态之上，把后续主线明确收敛为：以小预算输出重要记忆，供用户或外部 agent/规则系统继续沉淀；联合治理能力保留为兼容层，不再作为最高优先级。
+
+当前默认产品定位也随之明确为：**用户不需要做任何维护**。日常使用只涉及记忆写入、普通检索和简洁上下文装配；只有在需要提取“当前重要信息”时，才调用详细的重要记忆输出接口。
 
 ## 1. 文档目标
 
 构建一套适用于多人协作的项目记忆系统，满足以下目标：
 
 - 支持个人长期沉淀与协作交接
-- 支持系统共识治理与正式发布
+- 支持输出“小而准”的重要记忆供 LLM / agent 复用
+- 支持把值得长期沉淀的记忆导出为外部规则系统的候选输入
 - 支持全文检索与历史追溯
 - 支持与 Git 工作流兼容
 - 支持以 MCP 形式对外提供统一接口
@@ -94,16 +99,25 @@ LLM 只能参与提炼和填表，不能成为唯一真源。
 
 编译阶段以确定性逻辑为主，LLM 仅作增强。
 
-### 2.4 治理原则
+### 2.4 预算优先原则
 
-系统记忆不是自由编辑的大文档，而是经过治理的知识层：
+上下文装配的第一目标不是“尽可能多返回”，而是“在严格预算内返回最重要的记忆”：
 
-- 写入候选
-- 校验来源、冲突、重复、作用域
-- 审核通过后发布
-- 长期不用可降级或归档
+- 先确定 `max_tokens` / `max_chars` / `max_items`
+- 再在预算内选择价值最高的记忆块
+- 同一条记忆正文不应在多个 section 中重复展开
+- 超预算时优先降级渲染，而不是继续扩张返回体
 
-### 2.5 降级原则
+### 2.5 自动化边界原则
+
+本系统的自动化边界是“动态记忆供给”，而不是“插件内自动审查”：
+
+- 自动化负责写 observation / incident / note 等动态记忆
+- 自动化负责 scoring、retention、压缩和重要记忆输出
+- 自动化可以提示“值得外部沉淀”，但不在插件内维护项目规则真源
+- 项目规则由外部系统维护；本插件只提供候选记忆与证据上下文
+
+### 2.6 降级原则
 
 整个系统必须支持三档运行模式：
 
@@ -120,9 +134,10 @@ LLM 只能参与提炼和填表，不能成为唯一真源。
 - 记忆写入
 - 结构化记录管理
 - 标签与分类管理
-- 候选验证与发布
 - 编译生成运行时记忆视图
 - 检索与索引
+- 重要记忆评分、保留、压缩与小上下文输出
+- 供外部规则系统消费的重要记忆与证据载荷
 - Git 兼容存储
 - 通过 MCP 暴露能力
 
@@ -131,7 +146,9 @@ LLM 只能参与提炼和填表，不能成为唯一真源。
 - 直接替代项目文档系统
 - 直接替代 issue 管理系统
 - 直接替代代码仓库
+- 维护项目规则真源
 - 让 LLM 自动决定正式系统共识
+- 让插件内自动审查成为主流程
 - 让 LLM 直接自动发布正式 skill
 
 ## 4. 记忆分层模型
@@ -168,6 +185,7 @@ LLM 只能参与提炼和填表，不能成为唯一真源。
 - 内容必须稳定
 - 不允许所有人直接自由改写
 - 必须经过 candidate -> validated -> published
+- 这是当前实现的兼容层；长期稳定项目规则建议由外部系统维护，而不是继续在本插件中扩张治理能力
 
 ### 4.3 历史记忆
 
@@ -651,11 +669,18 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 默认优先级：
 
-- 已发布系统记忆
+- 当前任务/分支强相关记录
 - 当前用户个人记忆
-- 当前任务/分支相关记录
-- 候选与归档
+- 高 importance 的共享/个人记录
+- 明确命中的候选与归档
 - 全量历史
+
+预算策略：
+
+- 检索入口必须优先接受 `max_tokens` / `max_chars` / `max_items`
+- 排序之后不是简单取 `top_k`，而是按预算逐条装配
+- 优先保留高价值密度内容；低价值或长正文内容在预算紧张时自动降级
+- 返回结果必须包含 `budget_report`，说明已选、已截断、已丢弃的内容
 
 回退策略：
 
@@ -667,11 +692,13 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 关键词
 - 全文检索
 
-## 10. 验证与发布治理
+## 10. 验证与发布治理（兼容层）
 
 ### 10.1 候选流程
 
-系统记忆与 skill 必须经过：
+当前仓库仍保留记录验证、发布、归档这条治理链路，用于兼容现有实现、测试和历史数据迁移；但它不再是后续最高优先级。
+
+系统记忆与 skill 当前仍可经过：
 
 `raw -> candidate -> validated -> published -> degraded/archive`
 
@@ -776,11 +803,13 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 ## 11. MCP 接口设计
 
-### 11.0 对外接口收敛策略（最高优先级）
+### 11.0 对外接口收敛（已完成）与重要记忆输出（新的最高优先级）
 
 当前实现为了验证功能与测试覆盖，曾把内部能力较细粒度地暴露为多个 MCP tools。这个形态适合开发期调试，但不适合作为长期对外接口：AI 客户端会看到过多工具，容易误选高风险管理动作，也会让工具 schema 变得嘈杂。
 
 当前首版已完成：**MCP 对外默认只保留运行时高频读写与上下文能力，管理能力迁移到 CLI / scripts / skill。**
+
+在此基础上，后续最高优先级不再是扩展插件内治理，而是补齐“重要记忆输出”接口：让 LLM / agent 能在严格预算内拿到之前最重要的动态记忆，再由外部流程决定是否沉淀为项目规则。
 
 默认 MCP 对外只暴露 3 个 facade tools：
 
@@ -791,7 +820,7 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
   - 负责普通文件写入、结构化记录写入、observation 证据写入、artifact/facet 关联。
   - 内部可路由到现有 `memory_write`、`memory_write_record`、`memory_record_observation`、`memory_link_artifact`。
 - `memory_context`
-  - 负责面向当前 AI 会话的上下文装配、编译、lineage、conflict、snapshot compare。
+  - 负责面向当前 AI 会话的上下文装配、编译、重要记忆输出、lineage、conflict、snapshot compare。
   - 内部可路由到 `memory_compile`、`memory_get_runtime_digest`、`memory_trace_lineage`、`memory_list_conflicts`、`memory_compare_snapshots`、`memory_retrieve_context`。
 
 以下能力不再默认暴露为 MCP tools，改为 CLI / scripts / 管理 skill 调用：
@@ -864,7 +893,13 @@ Skill:
 | `trace_lineage` | `memory_trace_lineage` | 追踪 `derived_from` / `supersedes` / `conflicts_with` |
 | `list_conflicts` | `memory_list_conflicts` | 列出 open conflicts 与缺失目标 |
 | `compare_snapshots` | `memory_compare_snapshots` | 对比两个 snapshot 的 added / removed / persisted |
-| `retrieve_context` | `memory_retrieve_context` | 按 scope / time / facet / recall / rerank 装配上下文 |
+| `retrieve_context` | `memory_retrieve_context` | 当前 v1：按 scope / time / facet / recall / rerank 装配简洁上下文 |
+
+下一步计划新增：
+
+| operation | 目标 | 用途 |
+|-----------|------|------|
+| `important_memories` | 已上线（v0.5.2） | 按 budget-first 输出详细重要记忆、证据引用、丢弃原因和预算报告 |
 
 ### 11.2 内部能力（无 LLM 也可运行）
 
@@ -1230,6 +1265,12 @@ importance = governance + usage + impact + novelty + conflict + decay
 5. importance rerank
 6. context assembly
 
+当前局限：
+
+- 仍以 `top_k` 为主，而不是严格预算优先
+- `core_constraints` / `relevant_rules` / `key_evidence` 可能重复展开同一条记录
+- 返回结构更像“上下文草图”，还不是稳定的小预算“重要记忆输出”
+
 输出结构：
 
 - `core_constraints`
@@ -1239,14 +1280,64 @@ importance = governance + usage + impact + novelty + conflict + decay
 - `open_conflicts`
 - `next_steps`
 
-#### P3+：多人联合项目治理增强
+#### P3.5：重要记忆输出接口（新的最高优先级）
 
 目标：
 
-- 支持按 user / task / branch / project / org 过滤与编译
-- 候选晋升区分个人候选、项目共享候选、组织级规则候选
-- 引入 reviewer / owner / publisher 角色
-- 对 dao 层记忆设置更严格晋升条件
+- 为 LLM / agent 提供稳定、可控、可复用的重要记忆输出接口
+- 把“记忆查询”升级为“budget-first 的重要记忆供给”
+- 明确区分“插件负责动态记忆”与“外部系统负责项目规则”
+
+建议接口：
+
+- `memory_context(operation="important_memories")`
+
+建议输入：
+
+- `query`
+- `max_tokens`
+- `max_chars`
+- `max_items`
+- `window_start` / `window_end`
+- `include_scopes` / `include_statuses`
+- facet 过滤字段
+
+建议输出：
+
+- `important_memories`
+- `reason_selected`
+- `importance_score`
+- `evidence_refs`
+- `suggested_externalization`
+- `dropped_candidates`
+- `budget_report`
+
+装配顺序：
+
+1. scope / task / branch 过滤
+2. time window 过滤
+3. facet 过滤
+4. metadata / FTS recall
+5. importance rerank
+6. retention cutoff
+7. budget-first packing
+8. 去重与降级渲染
+
+接口目标不是自动审查或自动发布，而是输出“值得人或外部 agent 继续沉淀”的重要记忆。
+
+职责边界：
+
+- `retrieve_context`：面向日常会话，返回简洁可直接消费的上下文
+- `important_memories`：只在需要提取“当前重要信息”时返回详细结果
+- maintenance / governance / admin：作为兼容层保留，不要求普通用户参与
+
+#### P3+：多人联合项目治理增强（降级为兼容方向）
+
+目标：
+
+- 保持现有治理链路可用，服务历史数据、兼容测试和管理场景
+- 把治理动作迁移到 CLI / scripts / 管理 skill
+- 不再把插件内自动审查和规则晋升当作主产品方向
 
 晋升逻辑：
 
@@ -1292,20 +1383,24 @@ importance = governance + usage + impact + novelty + conflict + decay
 
 结合 `ToolTest/MCP/Memory` 当前已落地的 P3 首版与 hardening 结果，建议按以下顺序推进：
 
-0. **最高优先级：先收敛 MCP 对外暴露面。（首版已完成）**
+0. **最高优先级：把 `retrieve_context` 升级为严格 budget-first**
+   - `memory_context(operation="important_memories")` 已上线（v0.5.2），返回体受 `max_tokens` / `max_chars` / `max_items` 约束，输出最重要记忆、证据引用、丢弃原因和预算报告。
+   - 待做：把 `retrieve_context` 的预算路径与 `important_memories` 对齐，不再以 `top_k` 为主；并扩展 `evidence_refs` 来源（不仅 `source_refs`）。
+   - `retrieve_context` 保持简洁；详细结果通过 `important_memories` 提供。
+1. **MCP 对外接口收敛**（首版已完成）
    - 默认 MCP 只暴露 `memory_read`、`memory_write`、`memory_context` 三个 facade tools。
    - legacy/admin 兼容工具降为内部函数或显式配置暴露。
    - guard、backup、compact、index、health、migrate、governance、snapshot 管理动作迁移到 CLI / scripts / skill。
    - 已增加配置开关 `mcp.expose_admin_tools=true` 支持开发期或纯 MCP 客户端继续暴露 admin/legacy tools。
-1. 已保留内部实现稳定性，不立即删除已验证函数，默认只通过 facade 暴露。
-2. 已在现有文件级接口上增加记录级抽象，旧调用仍可继续用。
-3. 已补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引、schema v2 字段。
-4. 已实现 `runtime digest`、`task handoff`、`system_digest`、`publish_queue` 和 P3 snapshot/review/rollback/dao-fa-shu 编译目标。
-5. 已引入候选验证、发布、归档和 tombstone 删除治理。
+2. 已保留内部实现稳定性，不立即删除已验证函数，默认只通过 facade 暴露。
+3. 已在现有文件级接口上增加记录级抽象，旧调用仍可继续用。
+4. 已补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引、schema v2 字段。
+5. 已实现 `runtime digest`、`task handoff`、`system_digest`、`publish_queue` 和 P3 snapshot/review/rollback/dao-fa-shu 编译目标。
 6. P3 首版已完成：schema v2、时间快照、谱系关系、importance scoring、facet、回顾入口和上下文装配。
-7. 下一步优先做内部拆分与 P3+ 联合治理：promote/degrade、reviewer/owner/publisher 角色、dao 层晋升约束。
-8. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、候选草稿、快照叙事和冲突解释。
-9. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
+7. 下一步优先做内部拆分与重要记忆供给增强：拆 `memory_compiler.py` / `server.py`，抽 `memory_frontmatter.py`，把 `retrieve_context` 升级为严格 budget-first（`memory_corpus.py` 抽离已完成 v0.5.2）。
+8. 治理相关能力保留为兼容层：validate / publish / archive / promote / degrade 不再作为主路线扩张。
+9. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
+10. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
 
 ### 15.6 P3 模块落地状态
 
@@ -1344,14 +1439,19 @@ P0-4 已完成（2026-04-23）：
 - `PathManager.resolve` 前置拒绝 NUL 字节，避免 `pathlib` 抛 `ValueError` 越过安全层。
 - `memory_rebuild_index` 在 rebuild 前用 `PRAGMA integrity_check` 探测损坏 SQLite，并自动清理坏 db / WAL / SHM 后重建。
 - 覆盖并发 overwrite、残留 `.tmp`、坏 Front Matter 跳过、空 corpus not_found、路径攻击、Unicode 往返、全局预算拒绝、非法 record_kind 不落盘。
-- 当前 Memory 测试为 143 全部通过。
+- 当前 Memory 测试为 146 全部通过。
 
 P0-1 / P0-2 计划（未实施）：
 
 - P0-1：拆 `memory_compiler.py`（cache / render / targets / 入口）。
 - P0-2：拆 `server.py`（schema / dispatch / admin / main）。
-- P1-4：把 `CompilableRecord` 与 `_compact_body` 上提到独立 corpus 模块，消除 `memory_retrieval` 对 compiler 私有函数的反向依赖。
+- P1-3 已完成（v0.5.2）：`CompilableRecord` 与 `compact_body` 已上提到 `memory_corpus.py`，`memory_retrieval` 不再反向依赖 compiler 私有函数。
 - P1-5：把 Front Matter parser/dumper 抽到 `memory_frontmatter.py`，便于未来替换实现。
+
+P0-2 鲁棒性补丁（v0.5.2）：
+
+- `personal` 与 schema v2 `user_private` 统一按作者隔离：compiler `_matches_filter` 与 retrieval `_collect_records` 同步使用 `private_scopes = {"personal", "user_private"}`，并新增回归测试 `test_p3_private_scopes_isolate_authors_in_retrieval`。
+- 防御 `important_memories` / `retrieve_context` 在多租户 corpus 下越权读取私有记忆。
 
 ### 15.7 P3/P4 测试计划与当前覆盖
 
@@ -1423,6 +1523,14 @@ P4 测试：
 - 深度健壮性测试
 - 当前测试数 143
 
+`v0.5.2`：corpus 解耦与私有作用域隔离修复版
+
+- 抽出 `memory_corpus.py`（CompilableRecord / compact-body / iter）
+- `memory_retrieval` 不再依赖 compiler 私有符号
+- `personal` / `user_private` 按作者严格隔离（compiler + retrieval 双修）
+- `memory_context(operation="important_memories")` 首版上线
+- 当前测试数 146
+
 `v0.5.5`：多人联合治理版
 
 - conflict / supersede / promote / degrade
@@ -1481,10 +1589,13 @@ P4 测试：
 
 下一阶段优先级：
 
+- 最高优先级：把 `retrieve_context` 与 `important_memories` 的预算路径对齐为严格 `budget-first`、可解释、可控尺寸的输出接口（`important_memories` 已上线）。
+- 当前默认使用方式为免维护：普通用户不需要执行任何 maintenance / governance / admin 操作。
 - MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
 - P3 首版已完成：时间快照、谱系关系、importance scoring、facet、分层召回、上下文装配和 dao/fa/shu 视图已落地。
-- 当前下一步是内部拆分与 P3+ 治理增强：拆 `memory_compiler.py` / `server.py`，抽 `memory_corpus.py` / `memory_frontmatter.py`，补 promote/degrade 与 reviewer/owner/publisher 角色。
-- P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、候选草稿、快照叙事和冲突解释。
+- 当前下一步是内部拆分：拆 `memory_compiler.py` / `server.py`，抽 `memory_frontmatter.py`；`memory_corpus.py` 已在 v0.5.2 完成。
+- 插件内治理扩展降级为兼容方向：保留 validate / publish / archive 能力，但不再把自动审查和规则晋升作为主路线。
+- P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
 - P5 最后做本地 RAG / 向量补召回，且只作为 metadata / FTS 后的语义补充。
 
 ### 16.1 对当前项目的直接意义

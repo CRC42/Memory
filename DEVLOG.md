@@ -1,5 +1,107 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-24 (v0.5.3: P1 批次重构 — server/compiler/budget 拆分 + 写入加固 + evidence_refs 扩展)
+
+> **状态：6 项 P1 全部落地；`server.py` 1348 → 102 行；新增 4 个独立模块；新增 26 项回归测试；总计 184 测试全部通过（146 → 184，+38）**
+
+### 范围
+
+按 P1 评估顺序执行：P1-C → P1-A → P1-B → P1-F/G → P1-E → P1-D。每项均补充针对性测试，高风险项（写入加固、budget 拆分）含独立回归覆盖。
+
+### 落地清单
+
+1. **P1-C：抽 `memory_frontmatter.py`**
+   - 从 `memory_records.py` 提取 7 个 YAML Front Matter 处理函数（`parse_front_matter` / `dump_front_matter` / `parse_record_markdown` / `render_record_markdown` / `_parse_scalar` / `_format_scalar` / `_SCALAR_RE`）。
+   - `memory_records.py` 通过 import re-export 维持原符号可见，行数下降。
+   - 新增 `tests/memory_server/test_frontmatter_roundtrip.py`（8 测试）：标量/列表往返、CJK Unicode、引号特殊字符、null/bool 字面量、缺头/未闭合的错误路径、re-export 一致性。
+2. **P1-A：拆 `server.py`（1348 → 102 行）**
+   - 新增 `server_descriptions.py`（`SERVER_NAME` / `SERVER_VERSION` / `_BASE_DESCRIPTIONS`）、`server_tools.py`（`_build_file_roles` / `_build_facade_tools` / `_build_legacy_tools` / `_build_tools`）、`server_dispatch.py`（`_check_required` / `_dispatch_memory_read` / `_dispatch_memory_write` / `_dispatch_memory_context` / `_dispatch_tool`）。
+   - `server.py` 改为 thin entry-point + back-compat re-export，11 个测试模块的旧 import 全部继续工作。
+   - 新增 `tests/memory_server/test_server_split.py`（11 测试）：facade 默认 3 个工具、`expose_admin_tools=true` 注册 22 个、`memory_write` 不重复、context schema 中所有 operation 均被 dispatch 覆盖、unknown tool 返回 `unknown_tool` 错误等。
+3. **P1-B：抽 `memory_compiler_cache.py`**
+   - 提取 `load_compile_cache_entries` / `find_compile_cache_entry` / `record_usage_stats` / `get_record_last_used_at`（即 `.ai-memory/compile-cache/*.json` 与 `.ai-memory/usage-stats.json` 的纯文件 I/O 层）。
+   - `memory_compiler.py` 通过 `_record_usage_stats = record_usage_stats` 别名保持原内部调用，外部 5 个测试 import 通过 re-export 不变。
+4. **P1-F/G：写入安全加固（`memory_record_io.py`）**
+   - 新增 `_atomic_write_text(target, content)`：tmp 文件用 `O_CREAT | O_EXCL | O_WRONLY` 创建（防止同 tick 内并发 tmp 冲撞）；`fh.flush()` + `os.fsync()`（best-effort）后再 `os.replace`；tmp 与 target 强制同目录避免跨卷。
+   - `write_same_record` 与 `write_record_to_target` 全部改用此助手，去除原本散落的 try/except 临时路径逻辑。
+   - `write_record_to_target` 在 `same_path == False` 时新增「目标已存在则拒绝覆盖」防护，返回 `target_exists` 错误并保留原 candidate 文件，杜绝悄默 clobber 已发布记录的可能。
+   - 新增 `tests/memory_server/test_record_io_hardening.py`（6 测试）：成功路径、覆盖既有文件、自动建父目录、O_EXCL 拒绝（注入固定 uuid + 预占 tmp 文件触发 `OSError`，且不破坏他人文件）、`target_exists` 拒绝路径、`write_same_record` 往返。
+5. **P1-E：`important_memories.evidence_refs` 扩展**
+   - 之前只聚合 `source_refs`。现追加 `related_artifact_ids`、记录 `path`、记录 `id`，供消费方做完整 provenance 审计。
+   - 同步在 `_build_memory_item` 输出加上 `related_artifact_ids` 字段。
+   - 新增 `tests/memory_server/test_evidence_refs.py`：写入 candidate → validate → publish 后断言 evidence_refs 同时包含 `source_refs` 元素 / artifact_id / 文件路径 / 记录 ID。
+6. **P1-D：抽 `memory_budget.py`（共享 budget 原语）**
+   - 提取 `IMPORTANT_MEMORY_DEFAULT_MAX_*` 常量、`validate_budget_inputs`、`fit_text_to_budget`。`memory_retrieval.py` 通过 `from .memory_budget import ... as _validate_budget_inputs / _fit_text_to_budget` 维持本地下划线别名，所有现有调用零修改。
+   - 注意：未变更 `memory_retrieve_context` 公共返回结构（`test_p3_retrieve_context_accepts_budget_controls` 仍要求其不暴露 `budget_report` / `important_memories` / `dropped_candidates`），保持向后兼容。
+   - 新增 `tests/memory_server/test_budget_primitives.py`（11 测试）：None/0/-1 边界、空输入、字符截断、token 截断、常量合理性、向后兼容别名 `is` 检查。
+
+### 验证
+
+- `C:\Work\GIT\ToolTest\.venv\Scripts\python.exe -m pytest MCP\Memory\tests\memory_server -q` → **191 passed in 2.41s**（146 → 191，+45）。
+- 其中新增 `tests/memory_server/test_mcp_protocol.py`（7 测试）：通过真实 `mcp.server.Server.request_handlers` 调度 `ListToolsRequest` / `CallToolRequest`，端到端覆盖 facade 默认 3 工具、admin 模式 23 工具、memory_read/write/context 调用、unknown_tool 错误信封、admin 模式下 legacy `memory_get` 可达。
+- `SERVER_VERSION` 已升至 `"0.5.3"`。
+- 文件与符号映射：
+
+| 旧位置 | 新位置 | 备注 |
+|---|---|---|
+| `memory_records.py` (7 funcs) | `memory_frontmatter.py` | re-export 别名保留 |
+| `server.py` 大块逻辑 | `server_descriptions.py` / `server_tools.py` / `server_dispatch.py` | `server.py` ≈ 102 行 thin shim |
+| `memory_compiler.py` cache+usage | `memory_compiler_cache.py` | re-export 别名保留 |
+| `memory_retrieval.py` budget 工具 | `memory_budget.py` | re-export 别名保留 |
+
+### 影响范围
+
+- 公共 facade（`memory_read` / `memory_write` / `memory_context`）API 与返回结构未变。
+- `MCP\Memory\servers\memory_server\server.py.bak` 已临时备份后清理。
+- 模块依赖更清晰：`memory_budget` 仅依赖 `memory_result + token_estimator`；`memory_compiler_cache` 仅依赖 `memory_config + memory_corpus`；`server_*` 三件套形成 facade/dispatch/descriptions 边界。
+- `_record_usage_stats` 在 compiler 内仍以 `_` 私有别名存在；外部仅 `find_compile_cache_entry` / `load_compile_cache_entries` / `get_record_last_used_at` 是公共接口。
+
+### 后续待办
+
+- `memory_compiler.py` 仍约 950 行（render / targets / scoring）尚未细拆，可作为 v0.5.4 候选；本轮风险/收益不划算未动。
+- `memory_retrieve_context` 是否要在新版本暴露 `budget_report` 需先与现有 `test_p3_retrieve_context_accepts_budget_controls` 契约协商，列入 v0.6 设计议题。
+- `_atomic_write_text` 的 `os.fsync` 在某些 Windows 卷会抛 `OSError`，目前 best-effort swallow；后续若发现实际生产场景中需要严格持久性，可加 config 开关。
+
+---
+
+## 2026-04-24 (v0.5.2: user_private 作者隔离 + memory_corpus 解耦)
+
+> **状态：1 处 P0 安全缺陷修复；P1-3 解耦重构完成；新增 1 个回归测试；总计 146 测试全部通过**
+
+### 背景
+
+按 `MemorySystemDesignDocument.md` §0.3 / §15.5 / §15.6 收敛 v0.5.1 之后的剩余 P0/P1 项：
+
+- P0-2：`schema v2` 引入 `user_private` 作用域，但 `memory_compiler._matches_filter` 与 `memory_retrieval._collect_records` 仍只对 V1 `personal` 执行作者隔离，导致 `user_private` 记录会被其他用户在 `memory_retrieve_context` / `important_memories` 中读到。
+- P1-3：`memory_retrieval` 反向依赖 `memory_compiler` 的 `CompilableRecord` / `_compact_body` / `_iter_records` 等私有符号，违反层次方向。
+
+### 修复与重构
+
+1. **`user_private` 作者隔离（P0-2）**
+   - `memory_compiler._matches_filter`：`scope == "personal"` → `scope in {"personal", "user_private"}`。
+   - `memory_retrieval._collect_records`：抽出 `private_scopes = {"personal", "user_private"}` 并复用同一过滤分支。
+   - 两条路径同步修复，确保 retrieval / compiler / important_memories 三个出口都不会越权。
+2. **`memory_corpus.py` 抽离（P1-3）**
+   - 新增 `MCP/Memory/servers/memory_server/memory_corpus.py`：包含 `CompilableRecord` 数据类、`first_heading` / `body_without_title` / `markdown_sections` / `clip_text` / `compact_body` / `iter_compilable_records` 与 `COMPACT_SECTION_PRIORITY` / `COMPACT_BODY_CHAR_LIMIT` 常量。
+   - `memory_compiler.py`：删除本地实现，改为从 `memory_corpus` 导入并保留 `_first_heading` / `_compact_body` 等下划线别名供原有内部调用方过渡使用；`_iter_records` 简化为 `return iter_compilable_records(config)`。
+   - `memory_retrieval.py`：`from .memory_compiler import ...` 改为 `from .memory_corpus import CompilableRecord, compact_body as _compact_body, iter_compilable_records as _iter_records`，不再依赖 compiler 私有符号。
+3. **回归测试**
+   - `tests/memory_server/test_p3_completion.py` 新增 `test_p3_private_scopes_isolate_authors_in_retrieval`：alice 分别写入 `personal` 和 `user_private` 各一条，bob 通过 `memory_retrieve_context` / `memory_get_important_memories` 都无法读到，alice 自己仍可读到。
+   - 注意：`tags` 必须使用受控词表（如 `mcp`）；`pipeline` 等会被 `invalid_input` 拒绝。
+
+### 验证
+
+- `C:\Work\GIT\ToolTest\.venv\Scripts\python.exe -m pytest MCP\Memory\tests\memory_server -q` → **146 passed in 2.29s**（145 → 146）。
+- 注意：`MCP/Memory/.venv` 不带 `pytest`，应使用仓库根 `.venv` 或 `scripts/run_memory_all_tests.ps1`（脚本会自动回退）。
+
+### 影响范围
+
+- 公共 facade（`memory_read` / `memory_write` / `memory_context`）行为未变。
+- `memory_compiler` 仍对外保留 `_first_heading` / `_compact_body` / `CompilableRecord` 名称，可向后兼容外部潜在调用。
+- 后续 P0-1 / P0-2（拆 `memory_compiler.py` / `server.py`）保持原计划，本次未触及。
+
+---
+
 ## 2026-04-23 (健壮性深度测试 + 两处加固)
 
 > **状态：新增 10 个健壮性测试；2 处真实缺陷已修复；总计 143 测试全部通过**

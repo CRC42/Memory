@@ -23,6 +23,43 @@ from .memory_records import parse_record_markdown, render_record_markdown, targe
 from .memory_result import error_result, ok_result
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Atomically write ``content`` to ``target`` (UTF-8).
+
+    Hardening (P1-F/G):
+    - Tmp file is created in the *same directory* as ``target`` so
+      ``os.replace`` stays on one volume.
+    - Tmp file is created with ``O_CREAT | O_EXCL`` to refuse to clobber a
+      stale tmp from another writer in the same tick.
+    - The tmp file's contents are flushed and ``fsync``-ed before rename so a
+      crash between rename and writeback cannot leave a half-empty file.
+    - On any failure the tmp file is removed.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.parent / f".{target.name}.{uuid.uuid4().hex[:8]}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY  # Windows: avoid CR/LF translation
+    fd = os.open(str(tmp_path), flags, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content.encode("utf-8"))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                # Some filesystems / mounts do not support fsync; durability
+                # is best-effort, but we must still complete the rename.
+                pass
+        os.replace(tmp_path, target)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 @dataclass(frozen=True)
 class ParsedRecord:
     """A successfully parsed Markdown record on disk."""
@@ -119,17 +156,8 @@ def write_same_record(
 ) -> dict[str, Any]:
     """Re-render and atomically replace an existing record at the same path."""
     content = render_record_markdown(metadata, body)
-    tmp_path = abs_path.parent / f".{abs_path.name}.{uuid.uuid4().hex[:8]}.tmp"
     try:
-        tmp_path.write_text(content, encoding="utf-8")
-        try:
-            os.replace(tmp_path, abs_path)
-        except OSError:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            raise
+        _atomic_write_text(abs_path, content)
     except OSError as exc:
         return error_result("write_failed", f"failed to update record: {exc}")
 
@@ -158,6 +186,12 @@ def write_record_to_target(
     staged in a sibling temp file then atomically renamed; only after that
     succeeds is the previous file removed. This avoids "two copies" or
     "zero copies" outcomes on partial failure.
+
+    Hardening (P1-F): if the resolved target path differs from the source
+    path AND a file already exists at the target, we refuse to overwrite —
+    that situation indicates either a record-id collision or a stale
+    governance file from a partial earlier write, both of which deserve a
+    surfaced error rather than silent clobber.
     """
     record_id = str(metadata.get("id", ""))
     rel_path = target_path_for_record(
@@ -173,21 +207,18 @@ def write_record_to_target(
     except PathSecurityError as exc:
         return error_result("path_not_allowed", str(exc))
 
-    content = render_record_markdown(metadata, body)
     same_path = old_abs_path.resolve() == new_abs_path.resolve()
+    if not same_path and new_abs_path.exists():
+        return error_result(
+            "target_exists",
+            f"refusing to overwrite existing record at target: {rel_path}",
+            path=rel_path,
+            previous_path=old_rel_path,
+        )
+
+    content = render_record_markdown(metadata, body)
     try:
-        new_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_name = f".{new_abs_path.name}.{uuid.uuid4().hex[:8]}.tmp"
-        tmp_path = new_abs_path.parent / tmp_name
-        tmp_path.write_text(content, encoding="utf-8")
-        try:
-            os.replace(tmp_path, new_abs_path)
-        except OSError:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            raise
+        _atomic_write_text(new_abs_path, content)
         if not same_path:
             try:
                 old_abs_path.unlink()

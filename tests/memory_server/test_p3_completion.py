@@ -5,7 +5,7 @@ from pathlib import Path
 from servers.memory_server.memory_compiler import memory_compare_snapshots, memory_compile
 from servers.memory_server.memory_config import load_config
 from servers.memory_server.memory_records import memory_write_record
-from servers.memory_server.memory_retrieval import memory_retrieve_context
+from servers.memory_server.memory_retrieval import memory_get_important_memories, memory_retrieve_context
 from servers.memory_server.server import _dispatch_tool
 
 
@@ -208,3 +208,235 @@ def test_p3_retrieve_context_assembles_required_sections(repo: Path) -> None:
     assert direct["pipeline"]["scope_filter"] >= direct["pipeline"]["facet_filter"]
     assert compared["ok"] is True
     assert compared["stats"]["added"] == 0
+
+
+def test_p3_retrieve_context_accepts_budget_controls(repo: Path) -> None:
+    config = load_config(repo)
+    rule = memory_write_record(
+        config,
+        content_markdown=(
+            "# Budgeted Rule\n\n## Decision\n\n"
+            "Use compact context assembly when returning pipeline memory to runtime callers.\n\n"
+            "## Details\n\n- item 1\n- item 2\n- item 3\n- item 4\n"
+        ),
+        record_kind="decision",
+        scope="project_shared",
+        status="validated",
+        author="alice",
+        tags=["mcp"],
+        occurred_at="2026-04-23T09:00:00+00:00",
+        cognitive_level="fa",
+        module_names=["MemoryServer"],
+        system_area="memory",
+    )
+    evidence = memory_write_record(
+        config,
+        content_markdown=(
+            "# Budgeted Evidence\n\nObserved the compact retrieval path during smoke tests and "
+            "confirmed the result was enough to continue the task.\n"
+        ),
+        record_kind="observation",
+        scope="session",
+        status="raw",
+        author="alice",
+        tags=["mcp"],
+        occurred_at="2026-04-23T10:00:00+00:00",
+        cognitive_level="shu",
+        module_names=["MemoryServer"],
+        system_area="memory",
+    )
+
+    result = memory_retrieve_context(
+        config,
+        query="compact pipeline memory",
+        system_area="memory",
+        module_names=["MemoryServer"],
+        top_k=5,
+        max_items=1,
+        max_chars=260,
+        max_tokens=90,
+    )
+
+    assert result["ok"] is True
+    assert len(result["selected_records"]) == 1
+    assert result["selected_records"][0]["id"] in {rule["id"], evidence["id"]}
+    assert "budget_report" not in result
+    assert "important_memories" not in result
+    assert "dropped_candidates" not in result
+
+
+def test_p3_important_memories_budget_first_output(repo: Path) -> None:
+    config = load_config(repo)
+    stable = memory_write_record(
+        config,
+        content_markdown=(
+            "# Stable Pipeline Memory\n\n## Decision\n\n"
+            "Always prefer the compact important-memory output when an agent resumes a task.\n\n"
+            "## Details\n\nThis memory was reused across retrieval, compile, and runtime smoke tests.\n"
+        ),
+        record_kind="decision",
+        scope="project_shared",
+        status="published",
+        author="lead",
+        tags=["mcp"],
+        source_refs=["evt_pipeline_1", "evt_pipeline_2"],
+        occurred_at="2026-04-23T09:00:00+00:00",
+        cognitive_level="fa",
+        module_names=["MemoryServer"],
+        system_area="memory",
+    )
+    support = memory_write_record(
+        config,
+        content_markdown=(
+            "# Pipeline Evidence Pack\n\nObserved the compact output in task resumption and "
+            "confirmed the selected memory was enough to unblock the next agent turn.\n"
+        ),
+        record_kind="observation",
+        scope="session",
+        status="raw",
+        author="lead",
+        tags=["mcp"],
+        source_refs=["evt_pipeline_3"],
+        occurred_at="2026-04-23T10:00:00+00:00",
+        cognitive_level="shu",
+        module_names=["MemoryServer"],
+        system_area="memory",
+    )
+    extra = memory_write_record(
+        config,
+        content_markdown=(
+            "# Secondary Pipeline Detail\n\nExtra context that should be considered but may be "
+            "dropped when the important-memory budget is tight.\n"
+        ),
+        record_kind="procedure",
+        scope="project_shared",
+        status="validated",
+        author="lead",
+        tags=["mcp"],
+        occurred_at="2026-04-23T11:00:00+00:00",
+        cognitive_level="shu",
+        module_names=["MemoryServer"],
+        system_area="memory",
+    )
+
+    direct = memory_get_important_memories(
+        config,
+        query="pipeline agent resume",
+        system_area="memory",
+        module_names=["MemoryServer"],
+        max_items=2,
+        max_chars=420,
+        max_tokens=120,
+    )
+    facade = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "important_memories",
+            "query": "pipeline agent resume",
+            "system_area": "memory",
+            "module_names": ["MemoryServer"],
+            "max_items": 2,
+            "max_chars": 420,
+            "max_tokens": 120,
+        },
+    )
+
+    assert direct["ok"] is True
+    assert facade["ok"] is True
+    direct_ids = {item["id"] for item in direct["important_memories"]}
+    assert stable["id"] in direct_ids
+    assert direct["budget_report"]["used_items"] <= 2
+    assert direct["budget_report"]["used_chars"] <= 420
+    assert direct["budget_report"]["used_tokens_est"] <= 120
+    assert direct["evidence_refs"]
+    assert any(item["id"] == stable["id"] for item in direct["suggested_externalization"])
+    assert direct["stats"]["returned_records"] == len(direct["important_memories"])
+    assert len(direct["important_memories"]) == len(facade["important_memories"])
+    assert direct["dropped_candidates"] or len(direct["important_memories"]) < 3
+    if len(direct["important_memories"]) == 2:
+        assert support["id"] in direct_ids or extra["id"] in direct_ids
+
+
+def test_p3_private_scopes_isolate_authors_in_retrieval(repo: Path) -> None:
+    """Both legacy `personal` and schema v2 `user_private` records must be
+    invisible to other users in retrieve_context / important_memories."""
+
+    config = load_config(repo)
+    alice_personal = memory_write_record(
+        config,
+        content_markdown="# Alice Personal\n\nAlice private note about texture pipeline.\n",
+        record_kind="note",
+        scope="personal",
+        status="validated",
+        author="alice",
+        tags=["mcp"],
+        occurred_at="2026-04-23T08:00:00+00:00",
+        system_area="memory",
+    )
+    alice_private = memory_write_record(
+        config,
+        content_markdown="# Alice Private\n\nAlice schema v2 private note about texture pipeline.\n",
+        record_kind="note",
+        scope="user_private",
+        status="validated",
+        author="alice",
+        tags=["mcp"],
+        occurred_at="2026-04-23T09:00:00+00:00",
+        system_area="memory",
+    )
+    bob_shared = memory_write_record(
+        config,
+        content_markdown="# Bob Shared\n\nBob shared decision about texture pipeline.\n",
+        record_kind="decision",
+        scope="project_shared",
+        status="validated",
+        author="bob",
+        tags=["mcp"],
+        occurred_at="2026-04-23T10:00:00+00:00",
+        cognitive_level="fa",
+        system_area="memory",
+    )
+
+    bob_view = memory_retrieve_context(
+        config,
+        query="texture pipeline",
+        user="bob",
+        include_scopes=["personal", "user_private", "project_shared"],
+        include_statuses=["validated"],
+        top_k=10,
+    )
+    assert bob_view["ok"] is True
+    bob_ids = {item["id"] for item in bob_view["selected_records"]}
+    assert alice_personal["id"] not in bob_ids
+    assert alice_private["id"] not in bob_ids
+    assert bob_shared["id"] in bob_ids
+
+    bob_important = memory_get_important_memories(
+        config,
+        query="texture pipeline",
+        user="bob",
+        include_scopes=["personal", "user_private", "project_shared"],
+        include_statuses=["validated"],
+        max_items=10,
+        max_chars=4000,
+        max_tokens=1200,
+    )
+    assert bob_important["ok"] is True
+    bob_imp_ids = {item["id"] for item in bob_important["important_memories"]}
+    assert alice_personal["id"] not in bob_imp_ids
+    assert alice_private["id"] not in bob_imp_ids
+
+    alice_view = memory_retrieve_context(
+        config,
+        query="texture pipeline",
+        user="alice",
+        include_scopes=["personal", "user_private", "project_shared"],
+        include_statuses=["validated"],
+        top_k=10,
+    )
+    alice_ids = {item["id"] for item in alice_view["selected_records"]}
+    assert alice_personal["id"] in alice_ids
+    assert alice_private["id"] in alice_ids
+
+

@@ -3,11 +3,27 @@ from __future__ import annotations
 import re
 import json
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
+from .memory_corpus import (
+    COMPACT_BODY_CHAR_LIMIT,
+    COMPACT_SECTION_PRIORITY,
+    CompilableRecord,
+    body_without_title as _body_without_title,
+    clip_text as _clip_text,
+    compact_body as _compact_body,
+    first_heading as _first_heading,
+    iter_compilable_records,
+    markdown_sections as _markdown_sections,
+)
+from .memory_compiler_cache import (  # P1-B: extracted, re-exported for back-compat
+    find_compile_cache_entry,
+    get_record_last_used_at,
+    load_compile_cache_entries,
+    record_usage_stats as _record_usage_stats,
+)
 from .memory_events import append_event, get_current_user
 from .memory_paths import PathManager, PathSecurityError
 from .memory_records import parse_record_markdown, render_record_markdown
@@ -24,16 +40,6 @@ DEFAULT_BODY_MODE = "compact"
 DEFAULT_INCLUDE_SCOPES = ["shared", "personal"]
 DEFAULT_INCLUDE_STATUSES = ["validated", "published"]
 DEFAULT_CONTEXT_SCOPES = ["shared", "personal", "session", "task_or_branch", "project_shared", "org_shared"]
-COMPACT_SECTION_PRIORITY = [
-    "decision",
-    "expected behavior",
-    "acceptance checks",
-    "next step",
-    "next steps",
-    "notes",
-    "details",
-]
-COMPACT_BODY_CHAR_LIMIT = 600
 DIGEST_LEVELS = {
     "dao_digest": "dao",
     "fa_digest": "fa",
@@ -41,26 +47,17 @@ DIGEST_LEVELS = {
 }
 
 
-@dataclass(frozen=True)
-class CompilableRecord:
-    path: str
-    metadata: dict[str, Any]
-    body: str
-    title: str
+# CompilableRecord, _first_heading, _body_without_title, _markdown_sections,
+# _clip_text, _compact_body, COMPACT_SECTION_PRIORITY and COMPACT_BODY_CHAR_LIMIT
+# are now sourced from memory_corpus and re-exported above for backward
+# compatibility with any external callers (and tests) that still import them
+# from this module.
 
 
 def _slug(value: str, *, fallback: str) -> str:
     normalized = value.replace("\\", "/")
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", normalized).strip("-._")
     return slug or fallback
-
-
-def _first_heading(body: str) -> str:
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            return stripped.lstrip("#").strip()
-    return "Untitled Record"
 
 
 def _compiled_path(target: str, *, user: str | None = None, task_id: str | None = None, branch: str | None = None) -> str:
@@ -106,18 +103,8 @@ def _compiled_path(target: str, *, user: str | None = None, task_id: str | None 
 
 
 def _iter_records(config: MemoryConfig) -> tuple[list[CompilableRecord], dict[str, int]]:
-    """Project shared parsed records into CompilableRecord and pass through stats."""
-    parsed, stats = iter_parsed_records(config)
-    records = [
-        CompilableRecord(
-            path=record.rel_path,
-            metadata=record.metadata,
-            body=record.body.strip(),
-            title=_first_heading(record.body),
-        )
-        for record in parsed
-    ]
-    return records, stats
+    """Backward-compatible alias for ``memory_corpus.iter_compilable_records``."""
+    return iter_compilable_records(config)
 
 
 def _record_time(record: CompilableRecord) -> datetime | None:
@@ -163,38 +150,6 @@ def _time_window(target: str, as_of: datetime) -> tuple[datetime, datetime, str]
     raise ValueError(f"unsupported snapshot target: {target}")
 
 
-def load_compile_cache_entries(
-    config: MemoryConfig,
-    *,
-    targets: set[str] | None = None,
-) -> list[dict[str, Any]]:
-    cache_dir = config.repo_root / ".ai-memory" / "compile-cache"
-    if not cache_dir.is_dir():
-        return []
-    entries: list[dict[str, Any]] = []
-    for path in sorted(cache_dir.glob("*.json")):
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        target = str(raw.get("target", ""))
-        if targets is not None and target not in targets:
-            continue
-        raw["cache_path"] = str(path.relative_to(config.repo_root)).replace("\\", "/")
-        entries.append(raw)
-    return entries
-
-
-def find_compile_cache_entry(config: MemoryConfig, compiled_path: str) -> dict[str, Any] | None:
-    normalized = compiled_path.replace("\\", "/")
-    for entry in load_compile_cache_entries(config):
-        if str(entry.get("path", "")).replace("\\", "/") == normalized:
-            return entry
-    return None
-
-
 def _matches_filter(
     record: CompilableRecord,
     *,
@@ -217,7 +172,9 @@ def _matches_filter(
         return False
     if status not in include_statuses:
         return False
-    if scope == "personal" and user and author != user:
+    # Author isolation: both legacy `personal` and schema v2 `user_private`
+    # are private-to-author scopes; cross-user reads must be rejected.
+    if scope in {"personal", "user_private"} and user and author != user:
         return False
     if task_id and record_task_id != task_id:
         return False
@@ -242,67 +199,6 @@ def _bullet_value(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(item) for item in value) if value else "none"
     return str(value)
-
-
-def _clip_text(text: str, limit: int = COMPACT_BODY_CHAR_LIMIT) -> str:
-    normalized = text.strip()
-    if len(normalized) <= limit:
-        return normalized
-    clipped = normalized[:limit].rstrip()
-    if "\n" in clipped:
-        clipped = clipped.rsplit("\n", 1)[0].rstrip() or clipped
-    elif " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0].rstrip() or clipped
-    return clipped + "\n\n..."
-
-
-def _body_without_title(body: str, title: str) -> str:
-    lines = body.strip().splitlines()
-    if lines and lines[0].strip().startswith("#"):
-        heading = lines[0].strip().lstrip("#").strip()
-        if heading == title:
-            return "\n".join(lines[1:]).strip()
-    return body.strip()
-
-
-def _markdown_sections(body: str) -> dict[str, str]:
-    sections: dict[str, list[str]] = {}
-    current_key: str | None = None
-    current_lines: list[str] = []
-
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            if current_key is not None:
-                sections[current_key] = current_lines
-            current_key = stripped.lstrip("#").strip().lower()
-            current_lines = [stripped]
-        elif current_key is not None:
-            current_lines.append(line)
-    if current_key is not None:
-        sections[current_key] = current_lines
-
-    return {key: "\n".join(lines).strip() for key, lines in sections.items()}
-
-
-def _compact_body(record: CompilableRecord) -> str:
-    body = _body_without_title(record.body, record.title)
-    sections = _markdown_sections(body)
-    selected: list[str] = []
-
-    for heading in COMPACT_SECTION_PRIORITY:
-        if heading in sections:
-            selected.append(sections[heading])
-        if len("\n\n".join(selected)) >= COMPACT_BODY_CHAR_LIMIT:
-            break
-
-    if selected:
-        return _clip_text("\n\n".join(selected))
-
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
-    if paragraphs:
-        return _clip_text("\n\n".join(paragraphs[:2]))
-    return "_No compact content extracted._"
 
 
 def _render_record(record: CompilableRecord, *, body_mode: str) -> list[str]:
@@ -446,65 +342,6 @@ def _cache_key(
     else:
         parts.append("system")
     return "-".join(parts) + ".json"
-
-
-def _record_usage_stats(config: MemoryConfig, records: list[CompilableRecord], used_at: str, *, target: str) -> Path:
-    """Persist compile usage stats to .ai-memory/usage-stats.json.
-
-    The compiler must NOT mutate source record .md files (that would violate the
-    "compiled output is rebuildable, sources are truth" invariant and pollute Git
-    diffs / FTS index freshness). Usage stats live alongside the compile cache and
-    can be deleted/rebuilt at any time.
-    """
-    stats_path = config.repo_root / ".ai-memory" / "usage-stats.json"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, Any] = {}
-    if stats_path.is_file():
-        try:
-            data = json.loads(stats_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, ValueError):
-            data = {}
-    for record in records:
-        record_id = str(record.metadata.get("id", ""))
-        if not record_id:
-            continue
-        entry = data.get(record_id) if isinstance(data.get(record_id), dict) else {}
-        entry["last_used_at"] = used_at
-        entry["path"] = record.path
-        entry["compile_hit_count"] = int(entry.get("compile_hit_count", 0) or 0) + 1
-        compile_targets = entry.get("compile_targets")
-        if not isinstance(compile_targets, list):
-            compile_targets = []
-        normalized_targets = [str(item) for item in compile_targets if str(item).strip()]
-        if target not in normalized_targets:
-            normalized_targets.append(target)
-        entry["compile_targets"] = normalized_targets
-        data[record_id] = entry
-    try:
-        stats_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError:
-        pass
-    return stats_path
-
-
-def get_record_last_used_at(config: MemoryConfig, record_id: str) -> str | None:
-    """Return the most recent compile-time usage timestamp for a record id."""
-    stats_path = config.repo_root / ".ai-memory" / "usage-stats.json"
-    if not stats_path.is_file():
-        return None
-    try:
-        data = json.loads(stats_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    entry = data.get(record_id)
-    if isinstance(entry, dict):
-        value = entry.get("last_used_at")
-        return str(value) if value is not None else None
-    return None
 
 
 def _record_sort_with_score(record: CompilableRecord, score_data: dict[str, Any]) -> tuple[float, float, str]:

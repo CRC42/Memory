@@ -4,22 +4,25 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from .memory_compiler import CompilableRecord, _compact_body, _iter_records, load_compile_cache_entries
+from .memory_budget import (  # P1-D: shared budget primitives
+    IMPORTANT_MEMORY_DEFAULT_MAX_CHARS,
+    IMPORTANT_MEMORY_DEFAULT_MAX_ITEMS,
+    IMPORTANT_MEMORY_DEFAULT_MAX_TOKENS,
+    IMPORTANT_MEMORY_FALLBACK_BODY,
+    IMPORTANT_MEMORY_MIN_BODY_CHARS,
+    fit_text_to_budget as _fit_text_to_budget,
+    validate_budget_inputs as _validate_budget_inputs,
+)
+from .memory_compiler import load_compile_cache_entries
 from .memory_config import MemoryConfig
+from .memory_corpus import CompilableRecord, compact_body as _compact_body, iter_compilable_records as _iter_records
 from .memory_lineage import memory_list_conflicts
 from .memory_paths import PathSecurityError
 from .memory_result import error_result, ok_result
 from .memory_scoring import build_reference_counts, load_usage_stats, parse_timestamp, score_record
+from .token_estimator import estimate_tokens
 
 DEFAULT_RETRIEVAL_SCOPES = ["shared", "personal", "session", "task_or_branch", "project_shared", "org_shared"]
-FACET_FIELDS = [
-    "asset_paths",
-    "map_names",
-    "plugin_names",
-    "module_names",
-    "class_names",
-    "blueprint_paths",
-]
 
 
 def _normalize_list(value: list[str] | None) -> list[str]:
@@ -103,6 +106,300 @@ def _summary(record: CompilableRecord, score_data: dict[str, Any], *, include_bo
     return result
 
 
+def _parse_window(
+    window_start: str | None,
+    window_end: str | None,
+) -> tuple[datetime | None, datetime | None] | dict[str, Any]:
+    parsed_start = parse_timestamp(window_start) if window_start else None
+    parsed_end = parse_timestamp(window_end) if window_end else None
+    if window_start and parsed_start is None:
+        return error_result("invalid_input", f"invalid window_start: {window_start}")
+    if window_end and parsed_end is None:
+        return error_result("invalid_input", f"invalid window_end: {window_end}")
+    if parsed_start and parsed_end and parsed_start > parsed_end:
+        return error_result("invalid_input", "window_start must be <= window_end")
+    return parsed_start, parsed_end
+
+
+def _selected_text(item: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            item.get("title", ""),
+            item.get("body", ""),
+            " ".join(str(reason) for reason in item.get("reason_selected", []) if str(reason).strip()),
+        ]
+    ).strip()
+
+
+def _selection_reasons(record: CompilableRecord, score_data: dict[str, Any], match_score: float) -> list[str]:
+    metadata = record.metadata
+    reasons: list[str] = []
+    if match_score > 0:
+        reasons.append("matched_query")
+    kind = str(metadata.get("record_kind", "")).strip()
+    if kind:
+        reasons.append(f"kind:{kind}")
+    level = str(metadata.get("cognitive_level", "")).strip()
+    if level in {"dao", "fa", "shu"}:
+        reasons.append(f"level:{level}")
+    if float(score_data.get("total", 0.0)) >= 0.6:
+        reasons.append("high_importance")
+    if int(score_data.get("usage", {}).get("compile_hit_count", 0) or 0) > 0:
+        reasons.append("recently_reused")
+    return reasons[:4]
+
+
+def _build_memory_item(
+    record: CompilableRecord,
+    score_data: dict[str, Any],
+    *,
+    match_score: float,
+    body_text: str,
+    rank: int,
+    degraded: bool,
+) -> dict[str, Any]:
+    metadata = record.metadata
+    body = body_text.strip()
+    text_for_budget = "\n".join(part for part in (record.title, body) if part).strip()
+    return {
+        "id": str(metadata.get("id", "")),
+        "title": record.title,
+        "path": record.path,
+        "record_kind": metadata.get("record_kind"),
+        "scope": metadata.get("scope"),
+        "status": metadata.get("status"),
+        "cognitive_level": metadata.get("cognitive_level"),
+        "memory_tier": score_data.get("effective_memory_tier"),
+        "importance_score": score_data.get("total"),
+        "system_area": metadata.get("system_area"),
+        "body": body,
+        "reason_selected": _selection_reasons(record, score_data, match_score),
+        "source_refs": [str(item) for item in metadata.get("source_refs", []) if str(item).strip()],
+        "related_artifact_ids": [
+            str(item) for item in metadata.get("related_artifact_ids", []) if str(item).strip()
+        ],
+        "query_match_score": round(match_score, 4),
+        "rank": rank,
+        "degraded": degraded,
+        "chars": len(text_for_budget),
+        "tokens_est": estimate_tokens(text_for_budget),
+    }
+
+
+def _collect_records(
+    config: MemoryConfig,
+    *,
+    user: str | None,
+    task_id: str | None,
+    branch: str | None,
+    include_scopes: list[str] | None,
+    include_statuses: list[str] | None,
+    preferred_tags: list[str] | None,
+    window_start: str | None,
+    window_end: str | None,
+    system_area: str | None,
+    asset_paths: list[str] | None,
+    map_names: list[str] | None,
+    plugin_names: list[str] | None,
+    module_names: list[str] | None,
+    class_names: list[str] | None,
+    blueprint_paths: list[str] | None,
+) -> dict[str, Any]:
+    window = _parse_window(window_start, window_end)
+    if isinstance(window, dict):
+        return window
+    parsed_start, parsed_end = window
+
+    try:
+        records, scan_stats = _iter_records(config)
+    except (PathSecurityError, FileNotFoundError) as exc:
+        return error_result("path_error", str(exc))
+
+    scopes = set(str(item) for item in (include_scopes or DEFAULT_RETRIEVAL_SCOPES))
+    statuses = set(str(item) for item in (include_statuses or ["raw", "candidate", "validated", "published", "degraded"]))
+    tags = set(_normalize_list(preferred_tags))
+    # Author isolation: both legacy `personal` and schema v2 `user_private`
+    # are private-to-author scopes; cross-user reads must be rejected.
+    private_scopes = {"personal", "user_private"}
+    scoped = [
+        record
+        for record in records
+        if str(record.metadata.get("scope", "")) in scopes
+        and str(record.metadata.get("status", "")) in statuses
+        and (not user or str(record.metadata.get("scope", "")) not in private_scopes or str(record.metadata.get("author", "")) == user)
+        and (not task_id or record.metadata.get("task_id") in (None, task_id))
+        and (not branch or record.metadata.get("branch") in (None, branch))
+        and (not tags or tags.intersection({str(item) for item in record.metadata.get("tags", []) if str(item)}))
+    ]
+
+    time_filtered = []
+    for record in scoped:
+        timestamp = _record_time(record)
+        if parsed_start and (timestamp is None or timestamp < parsed_start):
+            continue
+        if parsed_end and (timestamp is None or timestamp > parsed_end):
+            continue
+        time_filtered.append(record)
+
+    facet_filters = {
+        "asset_paths": _normalize_list(asset_paths),
+        "map_names": _normalize_list(map_names),
+        "plugin_names": _normalize_list(plugin_names),
+        "module_names": _normalize_list(module_names),
+        "class_names": _normalize_list(class_names),
+        "blueprint_paths": _normalize_list(blueprint_paths),
+    }
+    facet_filtered = [
+        record
+        for record in time_filtered
+        if _matches_facets(record, system_area=system_area, facet_filters=facet_filters)
+    ]
+    return ok_result(
+        "records collected",
+        records=records,
+        scan_stats=scan_stats,
+        scoped=scoped,
+        time_filtered=time_filtered,
+        facet_filtered=facet_filtered,
+    )
+
+
+def _rank_records(
+    config: MemoryConfig,
+    *,
+    records: list[CompilableRecord],
+    corpus_records: list[CompilableRecord],
+    query: str | None,
+) -> list[tuple[CompilableRecord, dict[str, Any], float, float]]:
+    recall: list[tuple[CompilableRecord, float]] = []
+    for record in records:
+        match_score = _query_match_score(record, query)
+        if match_score < 0:
+            continue
+        recall.append((record, match_score))
+
+    usage_stats = load_usage_stats(config)
+    reference_counts = build_reference_counts(corpus_records)
+    now = datetime.now(timezone.utc)
+    ranked: list[tuple[CompilableRecord, dict[str, Any], float, float]] = []
+    for record, match_score in recall:
+        record_id = str(record.metadata.get("id", ""))
+        score_data = score_record(
+            record.metadata,
+            usage_entry=usage_stats.get(record_id, {}),
+            reference_count=reference_counts.get(record_id, 0),
+            now=now,
+        )
+        combined = float(score_data.get("total", 0.0)) + match_score
+        ranked.append((record, score_data, match_score, combined))
+    ranked.sort(key=lambda item: (-item[3], item[0].title.lower(), str(item[0].metadata.get("id", ""))))
+    return ranked
+
+
+def _pack_ranked_records(
+    ranked: list[tuple[CompilableRecord, dict[str, Any], float, float]],
+    *,
+    max_chars: int | None,
+    max_tokens: int | None,
+    max_items: int | None,
+    default_items: int,
+) -> tuple[
+    list[tuple[CompilableRecord, dict[str, Any]]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    effective_max_items = max_items or default_items
+    selected_pairs: list[tuple[CompilableRecord, dict[str, Any]]] = []
+    important_memories: list[dict[str, Any]] = []
+    dropped_candidates: list[dict[str, Any]] = []
+    used_chars = 0
+    used_tokens = 0
+
+    def remember_drop(record: CompilableRecord, score_data: dict[str, Any], reason: str) -> None:
+        if len(dropped_candidates) >= 10:
+            return
+        dropped_candidates.append(
+            {
+                "id": str(record.metadata.get("id", "")),
+                "title": record.title,
+                "path": record.path,
+                "importance_score": score_data.get("total"),
+                "drop_reason": reason,
+            }
+        )
+
+    for rank, (record, score_data, match_score, _combined) in enumerate(ranked, start=1):
+        if effective_max_items is not None and len(important_memories) >= effective_max_items:
+            remember_drop(record, score_data, "max_items_reached")
+            continue
+
+        remaining_chars = None if max_chars is None else max_chars - used_chars
+        remaining_tokens = None if max_tokens is None else max_tokens - used_tokens
+        if remaining_chars is not None and remaining_chars <= 0:
+            remember_drop(record, score_data, "max_chars_reached")
+            continue
+        if remaining_tokens is not None and remaining_tokens <= 0:
+            remember_drop(record, score_data, "max_tokens_reached")
+            continue
+
+        body_text = _compact_body(record)
+        fitted_body, degraded = _fit_text_to_budget(
+            body_text,
+            remaining_chars=remaining_chars,
+            remaining_tokens=remaining_tokens,
+        )
+        if not fitted_body and remaining_chars != 0 and remaining_tokens != 0:
+            fitted_body, degraded = _fit_text_to_budget(
+                IMPORTANT_MEMORY_FALLBACK_BODY,
+                remaining_chars=remaining_chars,
+                remaining_tokens=remaining_tokens,
+            )
+
+        if not fitted_body:
+            remember_drop(record, score_data, "budget_exhausted")
+            continue
+        if len(fitted_body) < IMPORTANT_MEMORY_MIN_BODY_CHARS and body_text and fitted_body != IMPORTANT_MEMORY_FALLBACK_BODY:
+            remember_drop(record, score_data, "insufficient_body_budget")
+            continue
+
+        item = _build_memory_item(
+            record,
+            score_data,
+            match_score=match_score,
+            body_text=fitted_body,
+            rank=rank,
+            degraded=degraded,
+        )
+        item_text = _selected_text(item)
+        item_chars = len(item_text)
+        item_tokens = estimate_tokens(item_text)
+        if max_chars is not None and used_chars + item_chars > max_chars:
+            remember_drop(record, score_data, "max_chars_reached")
+            continue
+        if max_tokens is not None and used_tokens + item_tokens > max_tokens:
+            remember_drop(record, score_data, "max_tokens_reached")
+            continue
+
+        item["chars"] = item_chars
+        item["tokens_est"] = item_tokens
+        important_memories.append(item)
+        selected_pairs.append((record, score_data))
+        used_chars += item_chars
+        used_tokens += item_tokens
+
+    budget_report = {
+        "max_chars": max_chars,
+        "max_tokens": max_tokens,
+        "max_items": effective_max_items,
+        "used_chars": used_chars,
+        "used_tokens_est": used_tokens,
+        "used_items": len(important_memories),
+        "dropped_candidates": len(dropped_candidates),
+    }
+    return selected_pairs, important_memories, dropped_candidates, budget_report
+
+
 def _next_steps(records: list[tuple[CompilableRecord, dict[str, Any]]]) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     for record, score_data in records:
@@ -138,6 +435,121 @@ def _recent_snapshots(config: MemoryConfig, *, limit: int = 5) -> list[dict[str,
     ]
 
 
+def memory_get_important_memories(
+    config: MemoryConfig,
+    *,
+    query: str | None = None,
+    user: str | None = None,
+    task_id: str | None = None,
+    branch: str | None = None,
+    include_scopes: list[str] | None = None,
+    include_statuses: list[str] | None = None,
+    preferred_tags: list[str] | None = None,
+    window_start: str | None = None,
+    window_end: str | None = None,
+    system_area: str | None = None,
+    asset_paths: list[str] | None = None,
+    map_names: list[str] | None = None,
+    plugin_names: list[str] | None = None,
+    module_names: list[str] | None = None,
+    class_names: list[str] | None = None,
+    blueprint_paths: list[str] | None = None,
+    top_k: int | None = None,
+    max_chars: int | None = None,
+    max_tokens: int | None = None,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    budget_error = _validate_budget_inputs(max_chars=max_chars, max_tokens=max_tokens, max_items=max_items)
+    if budget_error:
+        return budget_error
+
+    effective_max_chars = max_chars if max_chars is not None else IMPORTANT_MEMORY_DEFAULT_MAX_CHARS
+    effective_max_tokens = max_tokens if max_tokens is not None else IMPORTANT_MEMORY_DEFAULT_MAX_TOKENS
+    effective_max_items = max_items if max_items is not None else (top_k or IMPORTANT_MEMORY_DEFAULT_MAX_ITEMS)
+
+    collected = _collect_records(
+        config,
+        user=user,
+        task_id=task_id,
+        branch=branch,
+        include_scopes=include_scopes,
+        include_statuses=include_statuses,
+        preferred_tags=preferred_tags,
+        window_start=window_start,
+        window_end=window_end,
+        system_area=system_area,
+        asset_paths=asset_paths,
+        map_names=map_names,
+        plugin_names=plugin_names,
+        module_names=module_names,
+        class_names=class_names,
+        blueprint_paths=blueprint_paths,
+    )
+    if not collected.get("ok"):
+        return collected
+
+    records = collected["records"]
+    facet_filtered = collected["facet_filtered"]
+    ranked = _rank_records(config, records=facet_filtered, corpus_records=records, query=query)
+    selected_pairs, important_memories, dropped_candidates, budget_report = _pack_ranked_records(
+        ranked,
+        max_chars=effective_max_chars,
+        max_tokens=effective_max_tokens,
+        max_items=effective_max_items,
+        default_items=IMPORTANT_MEMORY_DEFAULT_MAX_ITEMS,
+    )
+
+    evidence_refs = sorted(
+        {
+            ref
+            for item in important_memories
+            for ref in (
+                # P1-E: aggregate every observable provenance signal so callers
+                # can audit the digest without re-fetching each record.
+                *(str(r).strip() for r in item.get("source_refs", [])),
+                *(str(r).strip() for r in item.get("related_artifact_ids", [])),
+                str(item.get("path") or "").strip(),
+                str(item.get("id") or "").strip(),
+            )
+            if ref
+        }
+    )
+    suggested_externalization = [
+        {
+            "id": item["id"],
+            "title": item["title"],
+            "importance_score": item["importance_score"],
+            "reason": "stable_high_value_memory",
+        }
+        for item in important_memories
+        if float(item.get("importance_score", 0.0) or 0.0) >= 0.6
+        and str(item.get("status", "")) in {"validated", "published"}
+    ]
+
+    return ok_result(
+        "important memories retrieved",
+        query=query,
+        important_memories=important_memories,
+        evidence_refs=evidence_refs,
+        suggested_externalization=suggested_externalization,
+        dropped_candidates=dropped_candidates,
+        budget_report=budget_report,
+        selected_records=[_summary(record, score_data) for record, score_data in selected_pairs],
+        pipeline={
+            "scope_filter": len(collected["scoped"]),
+            "time_window_filter": len(collected["time_filtered"]),
+            "facet_filter": len(facet_filtered),
+            "metadata_fts_recall": len(ranked),
+            "importance_rerank": len(ranked),
+            "budget_first_packing": len(important_memories),
+        },
+        stats={
+            **collected["scan_stats"],
+            "returned_records": len(important_memories),
+        },
+    )
+
+
 def memory_retrieve_context(
     config: MemoryConfig,
     *,
@@ -158,84 +570,51 @@ def memory_retrieve_context(
     class_names: list[str] | None = None,
     blueprint_paths: list[str] | None = None,
     top_k: int | None = None,
+    max_chars: int | None = None,
+    max_tokens: int | None = None,
+    max_items: int | None = None,
 ) -> dict[str, Any]:
     limit = top_k or 10
     if limit <= 0:
         return error_result("invalid_input", "top_k must be >= 1")
-    parsed_start = parse_timestamp(window_start) if window_start else None
-    parsed_end = parse_timestamp(window_end) if window_end else None
-    if window_start and parsed_start is None:
-        return error_result("invalid_input", f"invalid window_start: {window_start}")
-    if window_end and parsed_end is None:
-        return error_result("invalid_input", f"invalid window_end: {window_end}")
-    if parsed_start and parsed_end and parsed_start > parsed_end:
-        return error_result("invalid_input", "window_start must be <= window_end")
+    budget_error = _validate_budget_inputs(max_chars=max_chars, max_tokens=max_tokens, max_items=max_items)
+    if budget_error:
+        return budget_error
 
-    try:
-        records, scan_stats = _iter_records(config)
-    except (PathSecurityError, FileNotFoundError) as exc:
-        return error_result("path_error", str(exc))
+    collected = _collect_records(
+        config,
+        user=user,
+        task_id=task_id,
+        branch=branch,
+        include_scopes=include_scopes,
+        include_statuses=include_statuses,
+        preferred_tags=preferred_tags,
+        window_start=window_start,
+        window_end=window_end,
+        system_area=system_area,
+        asset_paths=asset_paths,
+        map_names=map_names,
+        plugin_names=plugin_names,
+        module_names=module_names,
+        class_names=class_names,
+        blueprint_paths=blueprint_paths,
+    )
+    if not collected.get("ok"):
+        return collected
 
-    scopes = set(str(item) for item in (include_scopes or DEFAULT_RETRIEVAL_SCOPES))
-    statuses = set(str(item) for item in (include_statuses or ["raw", "candidate", "validated", "published", "degraded"]))
-    tags = set(_normalize_list(preferred_tags))
-    scoped = [
-        record
-        for record in records
-        if str(record.metadata.get("scope", "")) in scopes
-        and str(record.metadata.get("status", "")) in statuses
-        and (not user or str(record.metadata.get("scope", "")) != "personal" or str(record.metadata.get("author", "")) == user)
-        and (not task_id or record.metadata.get("task_id") in (None, task_id))
-        and (not branch or record.metadata.get("branch") in (None, branch))
-        and (not tags or tags.intersection({str(item) for item in record.metadata.get("tags", []) if str(item)}))
-    ]
-
-    time_filtered = []
-    for record in scoped:
-        timestamp = _record_time(record)
-        if parsed_start and (timestamp is None or timestamp < parsed_start):
-            continue
-        if parsed_end and (timestamp is None or timestamp > parsed_end):
-            continue
-        time_filtered.append(record)
-
-    facet_filters = {
-        "asset_paths": _normalize_list(asset_paths),
-        "map_names": _normalize_list(map_names),
-        "plugin_names": _normalize_list(plugin_names),
-        "module_names": _normalize_list(module_names),
-        "class_names": _normalize_list(class_names),
-        "blueprint_paths": _normalize_list(blueprint_paths),
-    }
-    facet_filtered = [
-        record
-        for record in time_filtered
-        if _matches_facets(record, system_area=system_area, facet_filters=facet_filters)
-    ]
-
-    recall: list[tuple[CompilableRecord, float]] = []
-    for record in facet_filtered:
-        match_score = _query_match_score(record, query)
-        if match_score < 0:
-            continue
-        recall.append((record, match_score))
-
-    usage_stats = load_usage_stats(config)
-    reference_counts = build_reference_counts(records)
-    now = datetime.now(timezone.utc)
-    ranked: list[tuple[CompilableRecord, dict[str, Any], float]] = []
-    for record, match_score in recall:
-        record_id = str(record.metadata.get("id", ""))
-        score_data = score_record(
-            record.metadata,
-            usage_entry=usage_stats.get(record_id, {}),
-            reference_count=reference_counts.get(record_id, 0),
-            now=now,
+    records = collected["records"]
+    facet_filtered = collected["facet_filtered"]
+    ranked = _rank_records(config, records=facet_filtered, corpus_records=records, query=query)
+    if max_chars is not None or max_tokens is not None or max_items is not None:
+        selected, _important_memories, _dropped_candidates, _budget_report = _pack_ranked_records(
+            ranked,
+            max_chars=max_chars,
+            max_tokens=max_tokens,
+            max_items=max_items,
+            default_items=limit,
         )
-        combined = float(score_data.get("total", 0.0)) + match_score
-        ranked.append((record, score_data, combined))
-    ranked.sort(key=lambda item: (-item[2], item[0].title.lower(), str(item[0].metadata.get("id", ""))))
-    selected = [(record, score_data) for record, score_data, _combined in ranked[:limit]]
+    else:
+        selected = [(record, score_data) for record, score_data, _match_score, _combined in ranked[:limit]]
 
     core_constraints = [
         _summary(record, score_data, include_body=True)
@@ -276,15 +655,15 @@ def memory_retrieve_context(
         next_steps=_next_steps(selected),
         selected_records=[_summary(record, score_data) for record, score_data in selected],
         pipeline={
-            "scope_filter": len(scoped),
-            "time_window_filter": len(time_filtered),
+            "scope_filter": len(collected["scoped"]),
+            "time_window_filter": len(collected["time_filtered"]),
             "facet_filter": len(facet_filtered),
-            "metadata_fts_recall": len(recall),
+            "metadata_fts_recall": len(ranked),
             "importance_rerank": len(ranked),
             "context_assembly": len(selected),
         },
         stats={
-            **scan_stats,
+            **collected["scan_stats"],
             "returned_records": len(selected),
         },
     )
