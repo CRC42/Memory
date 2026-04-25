@@ -37,6 +37,7 @@ def multi_user_repo(tmp_path: Path) -> Path:
         "events_file": ".ai-memory/events.jsonl",
         "backups_dir": ".ai-memory/backups",
         "temp_dir": ".ai-memory/temp",
+        "mcp": {"shared_overwrite_policy": "downgrade"},
         "multi_user": {
             "enabled": True,
             "user_scoped_paths": ["memory-bank/activeContext.md"],
@@ -105,6 +106,7 @@ def test_default_multi_user_redirects_legacy_config_without_write_policy(
         json.dumps(
             {
                 "allowed_roots": [".ai-context", "memory-bank"],
+                "mcp": {"shared_overwrite_policy": "downgrade"},
                 "guard": {
                     "targets": [
                         {"path": "memory-bank/activeContext.md", "max_chars": 8000},
@@ -133,6 +135,42 @@ def test_default_multi_user_redirects_legacy_config_without_write_policy(
     assert progress_result["ok"] is True
     assert progress_result["mode"] == "append"
     assert progress_result["policy_override"] == "append_only"
+
+
+def test_guard_uses_default_multi_user_policy_for_legacy_config_without_write_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write(tmp_path / "memory-bank/activeContext.md", "# Legacy Active\n- seed\n")
+    _write(tmp_path / "memory-bank/progress.md", "# Progress\n- seed\n")
+    _write(tmp_path / ".ai-memory/events.jsonl", "")
+    _write(
+        tmp_path / ".ai-memory/config.json",
+        json.dumps(
+            {
+                "allowed_roots": [".ai-context", "memory-bank"],
+                "guard": {
+                    "total_max_chars": 1000,
+                    "targets": [
+                        {"path": "memory-bank/activeContext.md", "max_chars": 500},
+                        {"path": "memory-bank/progress.md", "max_chars": 500},
+                    ],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    _set_env_user(monkeypatch, "alice")
+    config = load_config(tmp_path)
+
+    memory_write(config, "memory-bank/activeContext.md", "# Alice\n", backup=False)
+    result = memory_guard_check(config)
+    paths = {item["path"] for item in result["targets"]}
+
+    assert result["ok"] is True
+    assert "memory-bank/activeContext/alice.md" in paths
+    assert "memory-bank/activeContext.md" not in paths
 
 
 def test_user_scoped_writes_create_independent_active_context_files(
@@ -216,7 +254,10 @@ def test_user_scoped_write_requires_known_user(
     result = memory_write(config, "memory-bank/activeContext.md", "# Nobody\n", backup=False)
 
     assert result["ok"] is False
-    assert result["error"] == "user_required"
+    # P0-1 (v0.6.0): unified to user_not_configured for both user-scoped
+    # writes and any other facade entry; carries setup_hint.
+    assert result["error"] == "user_not_configured"
+    assert "setup_hint" in result
 
 
 def test_vscode_user_setting_overrides_environment_for_user_scoped_paths(

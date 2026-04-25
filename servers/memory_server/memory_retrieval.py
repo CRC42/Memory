@@ -18,6 +18,7 @@ from .memory_config import MemoryConfig
 from .memory_corpus import CompilableRecord, compact_body as _compact_body, iter_compilable_records as _iter_records
 from .memory_lineage import memory_list_conflicts
 from .memory_paths import PathSecurityError
+from .memory_record_index import prefilter_record_paths
 from .memory_result import error_result, ok_result
 from .memory_scoring import build_reference_counts, load_usage_stats, parse_timestamp, score_record
 from .token_estimator import estimate_tokens
@@ -210,13 +211,49 @@ def _collect_records(
         return window
     parsed_start, parsed_end = window
 
+    scopes_list = [str(item) for item in (include_scopes or DEFAULT_RETRIEVAL_SCOPES)]
+    statuses_list = [str(item) for item in (include_statuses or ["raw", "candidate", "validated", "published", "degraded"])]
+    facet_filters = {
+        "asset_paths": _normalize_list(asset_paths),
+        "map_names": _normalize_list(map_names),
+        "plugin_names": _normalize_list(plugin_names),
+        "module_names": _normalize_list(module_names),
+        "class_names": _normalize_list(class_names),
+        "blueprint_paths": _normalize_list(blueprint_paths),
+    }
+
+    include_rel_paths: set[str] | None = None
+    prefilter = prefilter_record_paths(
+        config,
+        include_scopes=scopes_list,
+        include_statuses=statuses_list,
+        user=user,
+        task_id=task_id,
+        branch=branch,
+        system_area=system_area,
+        facet_filters=facet_filters,
+    )
+    if prefilter.get("ok"):
+        include_rel_paths = {str(path) for path in prefilter.get("paths", [])}
+        prefilter_stats = {
+            "enabled": True,
+            "candidate_paths": len(include_rel_paths),
+            **(prefilter.get("stats") or {}),
+        }
+    else:
+        prefilter_stats = {
+            "enabled": False,
+            "fallback_reason": prefilter.get("error"),
+            "message": prefilter.get("message"),
+        }
+
     try:
-        records, scan_stats = _iter_records(config)
+        records, scan_stats = _iter_records(config, include_rel_paths=include_rel_paths)
     except (PathSecurityError, FileNotFoundError) as exc:
         return error_result("path_error", str(exc))
 
-    scopes = set(str(item) for item in (include_scopes or DEFAULT_RETRIEVAL_SCOPES))
-    statuses = set(str(item) for item in (include_statuses or ["raw", "candidate", "validated", "published", "degraded"]))
+    scopes = set(scopes_list)
+    statuses = set(statuses_list)
     tags = set(_normalize_list(preferred_tags))
     # Author isolation: both legacy `personal` and schema v2 `user_private`
     # are private-to-author scopes; cross-user reads must be rejected.
@@ -241,14 +278,6 @@ def _collect_records(
             continue
         time_filtered.append(record)
 
-    facet_filters = {
-        "asset_paths": _normalize_list(asset_paths),
-        "map_names": _normalize_list(map_names),
-        "plugin_names": _normalize_list(plugin_names),
-        "module_names": _normalize_list(module_names),
-        "class_names": _normalize_list(class_names),
-        "blueprint_paths": _normalize_list(blueprint_paths),
-    }
     facet_filtered = [
         record
         for record in time_filtered
@@ -258,6 +287,7 @@ def _collect_records(
         "records collected",
         records=records,
         scan_stats=scan_stats,
+        prefilter_stats=prefilter_stats,
         scoped=scoped,
         time_filtered=time_filtered,
         facet_filtered=facet_filtered,
@@ -555,6 +585,7 @@ def memory_get_important_memories(
         },
         stats={
             **collected["scan_stats"],
+            "prefilter": collected["prefilter_stats"],
             "returned_records": len(important_memories),
         },
     )
@@ -643,16 +674,18 @@ def memory_retrieve_context(
         if str(record.metadata.get("record_kind", "")) in {"observation", "incident", "note", "event"}
     ][:limit]
     selected_ids = {str(record.metadata.get("id", "")) for record, _score_data in selected}
-    conflicts_result = memory_list_conflicts(config)
     open_conflicts = []
-    if conflicts_result.get("ok"):
-        for conflict in conflicts_result.get("conflicts", []):
-            ids = {
-                str(conflict.get("source", {}).get("id", "")),
-                str(conflict.get("target", {}).get("id", "")),
-            }
-            if not selected_ids or selected_ids.intersection(ids):
-                open_conflicts.append(conflict)
+    selected_have_conflicts = any(record.metadata.get("conflicts_with") for record, _score_data in selected)
+    if selected_have_conflicts:
+        conflicts_result = memory_list_conflicts(config)
+        if conflicts_result.get("ok"):
+            for conflict in conflicts_result.get("conflicts", []):
+                ids = {
+                    str(conflict.get("source", {}).get("id", "")),
+                    str(conflict.get("target", {}).get("id", "")),
+                }
+                if not selected_ids or selected_ids.intersection(ids):
+                    open_conflicts.append(conflict)
     evidence_refs = sorted(
         {
             ref
@@ -692,6 +725,7 @@ def memory_retrieve_context(
         },
         stats={
             **collected["scan_stats"],
+            "prefilter": collected["prefilter_stats"],
             "returned_records": len(context_items),
         },
     )

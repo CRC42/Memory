@@ -70,8 +70,102 @@ def memory_health_check(config: MemoryConfig) -> dict[str, Any]:
     if not search_db.exists():
         issues.append({"code": "missing_search_db", "path": ".ai-memory/search.db", "message": "search index missing"})
 
+    # P2-1: scale-baseline regression check (best-effort).
+    extras: dict[str, Any] = {}
+    try:
+        from .memory_baseline import detect_regressions
+
+        regression_report = detect_regressions(config)
+        if regression_report.get("regressions"):
+            extras["regressions"] = regression_report["regressions"]
+            for r in regression_report["regressions"]:
+                issues.append(
+                    {
+                        "code": "scale_regression",
+                        "path": ".ai-memory/baseline.json",
+                        "message": (
+                            f"metric {r['metric']} grew {r['ratio']}x vs baseline "
+                            f"(threshold={r['factor_threshold']}x)"
+                        ),
+                        **r,
+                    }
+                )
+    except Exception:  # pragma: no cover
+        pass
+
+    # P2-2: startup self-heal — clean stale .tmp orphans and lock sidecars.
+    extras.update(_self_heal(config))
+
+    # P2-3: scoring strategy drift warning.
+    try:
+        from .memory_strategy_hash import detect_strategy_drift
+
+        drift_report = detect_strategy_drift(config)
+        if drift_report.get("drift"):
+            issues.append(
+                {
+                    "code": "scoring_strategy_changed",
+                    "path": ".ai-memory/events.jsonl",
+                    "message": (
+                        f"scoring strategy hash changed: "
+                        f"previous={drift_report['previous']} current={drift_report['current']}"
+                    ),
+                    **{k: drift_report[k] for k in ("current", "previous")},
+                }
+            )
+        extras["scoring_strategy_hash"] = drift_report.get("current")
+    except Exception:  # pragma: no cover
+        pass
+
     status = "ok" if not issues else "warn"
-    return ok_result("health check completed", status=status, issues=issues, stats={"issues": len(issues)})
+    return ok_result(
+        "health check completed",
+        status=status,
+        issues=issues,
+        stats={"issues": len(issues)},
+        **extras,
+    )
+
+
+def _self_heal(config: MemoryConfig) -> dict[str, Any]:
+    """P2-2: best-effort cleanup of orphan .tmp files and stale lock sidecars.
+
+    Only acts on files older than a small grace period to avoid racing
+    with in-flight writes. Returns ``{"self_heal": {...}}``.
+    """
+    import time
+
+    grace_seconds = 60
+    now = time.time()
+    cleaned_tmp: list[str] = []
+    cleaned_locks: list[str] = []
+
+    def _maybe_cleanup(root: Path, suffixes: tuple[str, ...], bucket: list[str]) -> None:
+        if not root.exists():
+            return
+        for child in root.rglob("*"):
+            try:
+                if not child.is_file():
+                    continue
+                if not child.name.endswith(suffixes):
+                    continue
+                if (now - child.stat().st_mtime) < grace_seconds:
+                    continue
+                child.unlink()
+                bucket.append(str(child.relative_to(config.repo_root)))
+            except OSError:
+                continue
+
+    _maybe_cleanup(config.repo_root / "memory-bank", (".tmp",), cleaned_tmp)
+    _maybe_cleanup(config.repo_root / ".ai-memory", (".tmp",), cleaned_tmp)
+    _maybe_cleanup(config.repo_root / ".ai-memory" / "locks", (".lock",), cleaned_locks)
+
+    return {
+        "self_heal": {
+            "tmp_removed": cleaned_tmp,
+            "stale_locks_removed": cleaned_locks,
+        }
+    }
 
 
 def memory_migrate_records(config: MemoryConfig, *, target_schema_version: str = "1.0") -> dict[str, Any]:

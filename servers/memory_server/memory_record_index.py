@@ -512,6 +512,97 @@ def _query_index(conn: sqlite3.Connection, query: str, top_k: int) -> list[sqlit
     ).fetchall()
 
 
+def _sql_placeholders(values: list[str]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _facet_like_pattern(value: str) -> str:
+    # Facets are stored as a JSON array of scalar strings. Matching the
+    # JSON-quoted value avoids most substring false positives; retrieval still
+    # verifies field-level facets against Markdown truth after prefiltering.
+    return "%" + _escape_like(json.dumps(value, ensure_ascii=False)) + "%"
+
+
+def prefilter_record_paths(
+    config: MemoryConfig,
+    *,
+    include_scopes: list[str],
+    include_statuses: list[str],
+    user: str | None = None,
+    task_id: str | None = None,
+    branch: str | None = None,
+    system_area: str | None = None,
+    facet_filters: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """Return candidate record paths from the derived SQLite metadata index.
+
+    This is an optimization only. Callers must treat failures as a signal to
+    fall back to Markdown scanning, and must re-validate records against the
+    Markdown source of truth before returning user-visible results.
+    """
+    db_file = _db_path(config)
+    if not db_file.exists():
+        return error_result("index_missing", "record index does not exist")
+    if not _is_index_healthy(config):
+        return error_result("index_unhealthy", "record index failed integrity check")
+
+    scopes = [str(item) for item in include_scopes if str(item)]
+    statuses = [str(item) for item in include_statuses if str(item)]
+    if not scopes or not statuses:
+        return ok_result("record paths prefiltered", paths=[], stats={"prefiltered_records": 0})
+
+    where = [
+        f"scope IN ({_sql_placeholders(scopes)})",
+        f"status IN ({_sql_placeholders(statuses)})",
+    ]
+    params: list[Any] = [*scopes, *statuses]
+
+    if user:
+        where.append("(scope NOT IN ('personal', 'user_private') OR author = ?)")
+        params.append(user)
+    if task_id:
+        where.append("(task_id IS NULL OR task_id = ?)")
+        params.append(task_id)
+    if branch:
+        where.append("(branch IS NULL OR branch = ?)")
+        params.append(branch)
+    if system_area:
+        where.append("system_area = ?")
+        params.append(system_area)
+
+    for _field, expected_values in (facet_filters or {}).items():
+        values = [str(item).strip() for item in expected_values if str(item).strip()]
+        if not values:
+            continue
+        clauses = []
+        for value in values:
+            clauses.append("facets_json LIKE ? ESCAPE '\\'")
+            params.append(_facet_like_pattern(value))
+        where.append("(" + " OR ".join(clauses) + ")")
+
+    sql = "SELECT path FROM memory_records WHERE " + " AND ".join(where) + " ORDER BY path"
+    try:
+        with _connect(config) as conn:
+            _ensure_schema(conn)
+            rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error as exc:
+        return error_result("index_failed", f"failed to prefilter record paths: {exc}")
+
+    paths = [str(row[0]) for row in rows]
+    return ok_result(
+        "record paths prefiltered",
+        paths=paths,
+        stats={
+            "prefiltered_records": len(paths),
+            "db_path": db_file.relative_to(config.repo_root).as_posix(),
+        },
+    )
+
+
 def memory_search_records(config: MemoryConfig, query: str, *, top_k: int | None = None) -> dict[str, Any]:
     query_normalized = query.strip()
     if not query_normalized:

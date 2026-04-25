@@ -97,6 +97,14 @@ def main() -> int:
     )
 
     config = load_config(args.root, args.config)
+    # P0-3 (v0.6.0 OOTB): startup auto-maintenance. Best-effort, never
+    # blocks the server boot. Disable via mcp.auto_maintenance.enabled=false.
+    try:
+        from .memory_auto_maintenance import run_if_due
+
+        run_if_due(config)
+    except Exception as exc:  # pragma: no cover — must never block boot
+        logger.warning("auto-maintenance skipped: %s", exc)
     try:
         asyncio.run(_run(config))
     except KeyboardInterrupt:

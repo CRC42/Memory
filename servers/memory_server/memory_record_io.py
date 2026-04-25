@@ -218,7 +218,11 @@ def iter_record_files(config: MemoryConfig) -> list[tuple[Path, str]]:
     ]
 
 
-def iter_parsed_records(config: MemoryConfig) -> tuple[list[ParsedRecord], dict[str, int]]:
+def iter_parsed_records(
+    config: MemoryConfig,
+    *,
+    include_rel_paths: set[str] | None = None,
+) -> tuple[list[ParsedRecord], dict[str, int]]:
     """Iterate every record file and parse Markdown + Front Matter.
 
     Returns a list of ``ParsedRecord`` and a stats dict with keys
@@ -231,7 +235,22 @@ def iter_parsed_records(config: MemoryConfig) -> tuple[list[ParsedRecord], dict[
         "skipped_non_records": 0,
         "skipped_read_errors": 0,
     }
-    for abs_path, rel_path in iter_record_files(config):
+    if include_rel_paths is not None:
+        manager = PathManager(config)
+        candidate_files: list[tuple[Path, str]] = []
+        for rel_path in sorted(include_rel_paths):
+            if not rel_path.startswith("memory-bank/") or rel_path.startswith("memory-bank/compiled/"):
+                continue
+            try:
+                abs_path = manager.resolve(rel_path, must_exist=True, must_be_file=True)
+                candidate_files.append((abs_path, manager.to_repo_relative(abs_path)))
+            except (OSError, PathSecurityError):
+                stats["skipped_read_errors"] += 1
+        files = candidate_files
+    else:
+        files = iter_record_files(config)
+
+    for abs_path, rel_path in files:
         stats["scanned_files"] += 1
         try:
             metadata, body = parse_record_markdown(

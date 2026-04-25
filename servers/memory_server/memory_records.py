@@ -338,6 +338,10 @@ def memory_write_record(
         },
     )
 
+    extra: dict[str, Any] = {}
+    warnings = _build_ue_warnings(config, plugin_names, module_names)
+    if warnings:
+        extra["warnings"] = warnings
     return ok_result(
         "record written",
         id=record_id,
@@ -345,4 +349,39 @@ def memory_write_record(
         record_kind=record_kind,
         scope=scope,
         status=effective_status,
+        **extra,
     )
+
+
+def _build_ue_warnings(
+    config: MemoryConfig,
+    plugin_names: list[str] | None,
+    module_names: list[str] | None,
+) -> list[dict[str, Any]] | None:
+    """P1-2: non-blocking warning for unknown UE components.
+
+    Returns ``None`` when no facets are cached or all referenced names
+    are recognised — keeps the response payload identical to legacy.
+    """
+    try:
+        from .memory_ue_facets import known_components, load_facets
+    except Exception:  # pragma: no cover
+        return None
+    facets = load_facets(config)
+    if facets is None or not facets.is_ue_project:
+        return None
+    known = known_components(facets)
+    referenced: list[str] = []
+    referenced.extend(plugin_names or [])
+    referenced.extend(module_names or [])
+    unknown = sorted(set(referenced) - known)
+    if not unknown:
+        return None
+    return [
+        {
+            "code": "ue_unknown_components",
+            "message": f"referenced names not found in detected UE facets: {unknown}",
+            "unknown": unknown,
+            "hint": "If this is a new module/plugin, run the bootstrap rescan to refresh .ai-memory/ue_facets.json.",
+        }
+    ]

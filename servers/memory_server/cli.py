@@ -33,6 +33,8 @@ from .memory_governance import memory_archive_record, memory_publish_candidate, 
 from .memory_guard import memory_guard_check
 from .memory_maintenance import memory_delete_record, memory_health_check, memory_migrate_records
 from .memory_record_index import memory_rebuild_index
+from .memory_baseline import write_baseline as _write_baseline
+from .memory_auto_maintenance import run_if_due as _run_if_due
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -69,6 +71,14 @@ def _cmd_health(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_rebuild_index(args: argparse.Namespace) -> dict[str, Any]:
     return memory_rebuild_index(_load(args))
+
+
+def _cmd_scale_baseline(args: argparse.Namespace) -> dict[str, Any]:
+    return _write_baseline(_load(args))
+
+
+def _cmd_auto_maintenance(args: argparse.Namespace) -> dict[str, Any]:
+    return _run_if_due(_load(args))
 
 
 def _cmd_migrate(args: argparse.Namespace) -> dict[str, Any]:
@@ -177,6 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("guard", help="Run memory_guard_check.").set_defaults(func=_cmd_guard)
     sub.add_parser("health", help="Run memory_health_check.").set_defaults(func=_cmd_health)
     sub.add_parser("rebuild-index", help="Rebuild SQLite FTS index.").set_defaults(func=_cmd_rebuild_index)
+    sub.add_parser("scale-baseline", help="Capture .ai-memory/baseline.json snapshot.").set_defaults(func=_cmd_scale_baseline)
+    sub.add_parser("auto-maintenance", help="Run startup auto-maintenance if due.").set_defaults(func=_cmd_auto_maintenance)
 
     p_migrate = sub.add_parser("migrate", help="Migrate records to a target schema version.")
     p_migrate.add_argument("--target-schema", default="1.0", help="Target schema version (default: 1.0).")

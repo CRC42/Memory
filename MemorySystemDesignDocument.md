@@ -1402,9 +1402,15 @@ importance = governance + usage + impact + novelty + conflict + decay
 5. 已实现 `runtime digest`、`task handoff`、`system_digest`、`publish_queue` 和 P3 snapshot/review/rollback/dao-fa-shu 编译目标。
 6. P3 首版已完成：schema v2、时间快照、谱系关系、importance scoring、facet、回顾入口和上下文装配。
 7. 已完成多轮内部拆分与并发安全加固：`memory_compiler.py` 已拆出 cache / render / targets / scoring / writer / views，主文件已降为 ~330 行 thin orchestration router（v0.5.9），`server.py` 已拆为 `server_descriptions` / `server_tools` / `server_dispatch`（v0.5.3），`memory_frontmatter.py` / `memory_budget.py` / `memory_corpus.py` / `memory_locks.py` / `memory_request_id.py` 已拆出；`retrieve_context` 已升级为严格 budget-first（v0.5.8）；管理 skill `memory-admin` / `memory-snapshot-review` 首版上线（v0.5.9）。
-8. 治理相关能力保留为兼容层：validate / publish / archive / promote / degrade 不再作为主路线扩张。
-9. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
-10. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
+8. **v0.5.11 非 UE 稳健性收尾（已完成）**
+   - 已修复旧 `.ai-memory/config.json` 覆盖 `guard.targets` 且缺少 `write_policy` 时的 guard 兜底不一致：`memory_guard_check` / `check_total_budget` 像 `memory_write` 一样参考默认 `multi_user.user_scoped_paths` 与 `shared_paths_policy`。
+   - 已给 `retrieve_context` / `important_memories` 增加 SQLite metadata/facet 预筛能力：当索引存在且健康时，先从 `memory_records` 表按 scope/status/user/task/branch/system_area/facet 缩小候选集，再回到 Markdown 真源做确定性排序与预算打包；索引缺失或异常时无损回退到全量 Markdown 扫描。
+   - 已建立非领域绑定的规模性能基线：`run_memory_scale_smoke.py --records 5000` 覆盖 5k 结构化记录的 rebuild、FTS search、metadata/facet 预筛 retrieval，避免后续退化成不可见的 O(N) 热路径。
+   - 已补齐恢复演练文档：损坏索引、超预算、审计日志轮转、误发布/误删除的 CLI 恢复步骤可从 README / admin skill 执行。
+   - 已修正文档时间线，确保 DEVLOG 与设计文档中的版本日期不晚于实际记录日期。
+9. 治理相关能力保留为兼容层：validate / publish / archive / promote / degrade 不再作为主路线扩张。
+10. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
+11. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
 
 ### 15.6 P3 模块落地状态
 
@@ -1609,9 +1615,80 @@ P4 测试：
 - 默认 JSON 输出（`--pretty` 缩进）；exit code 0/1 与 `ok=true/false` 一致，便于 CI / shell 脚本消费
 - skill `memory-admin` / `memory-snapshot-review` 同步改为 CLI 调用范式，admin 能力不再依赖 `mcp.expose_admin_tools=true`
 - 新增 `tests/memory_server/test_cli.py`：9 项 CLI 行为回归（health / guard / backup / rebuild-index / compile / snapshot-rebuild / pretty / 错误码）
-- 当前测试数 227
+- 当前测试数 230
 
-`v0.6.0`：LLM 软增强版（规划中）
+`v0.5.11`：非 UE 稳健性收尾版（已上线）
+
+- guard 旧配置兜底一致性：旧配置没有 `write_policy` 时，guard 与 total budget 同样按默认多人策略处理 user-scoped 与 append-only 共享文件。
+- retrieval 规模基线与预筛：新增 SQLite metadata/facet 候选预筛，优先使用可重建索引减少 Markdown 全量解析压力，失败时回退全量扫描。
+- 管理文档补强：README / admin skill 补恢复演练与性能基线入口，DEVLOG 修正时间线并记录本轮结果。
+- 新增旧配置 guard 回归、索引预筛正确性/回退回归、5k 记录级性能冒烟脚本；全量测试 230 通过。
+
+### 15.9 v0.6.0 开箱即用稳健性版（规划，最高优先级）
+
+#### 15.9.1 总目标
+
+普通使用者唯一需要显式做的事 = 在 `.vscode/settings.json` 设置 `memory-mcp.userName`。其余团队约定（共享文件 append-only、周期性维护、UE facet 词典、规模基线等）必须由插件自动兜底；缺省状态下不允许"默默落到 `unknown.md`"或"无声 overwrite 共享文件"等隐性数据风险。
+
+#### 15.9.2 P0 — 健壮性 / 数据安全（必须 TDD）
+
+| 编号 | 项目 | 行为 | 测试位置 |
+|---|---|---|---|
+| P0-1 | user id 强校验 | `memory_users.is_placeholder_user(name)` 纯函数：当 `name` 落入 hard-reject 集合（`""` / 仅空白 / `unknown` / `Unknown` / `UNKNOWN`）或包含路径注入字符（`/` `\` `:` `\n` `\r` `\0`）时返回 `True`。`memory_users.validate_effective_user(config)` 在每次 facade 调用前运行：hard-reject 时返回结构化 `error="user_not_configured"` + `setup_hint`（含 PowerShell 一行命令）阻断写路径；常见模糊用户名（`Administrator` / `User` / `admin` / `root` / `guest` / `default`）不阻断但通过 `events.jsonl` 写一次 `user_ambiguous` warning。`mcp.allow_unknown_user=true` 显式覆盖（不推荐）。 | `tests/memory_server/test_user_validation.py` |
+| P0-2 | shared overwrite 强制拒绝 | `memory_write`：当目标命中 `shared_paths_policy=append_only`（含旧/新/缺省三种配置来源）且 `mode="overwrite"`，立即返回 `error="shared_overwrite_forbidden"` + `suggested_operation="record"` + `target_user_scoped_path`（如适用）；不写盘、不备份、不锁。 | `tests/memory_server/test_shared_overwrite_rejected.py` |
+| P0-3 | 启动期 auto-maintenance | `memory_auto_maintenance.run_if_due(config)`：检查 `.ai-memory/last_maintenance.json`，超过任一阈值（默认 `min_interval_hours=168`、`events_max_bytes=50MB`、`index_stale_seconds=600`、`shared_append_max_lines=2000`）则按需触发 `health_check` / `rebuild_index` / `compact_memory`；所有子动作幂等，单项失败记录到 `events.jsonl` 但不阻塞主链路；写新的 `last_maintenance.json`。配置 `mcp.auto_maintenance.enabled=false` 可关闭。 | `tests/memory_server/test_auto_maintenance.py` |
+
+#### 15.9.3 P1 — 易用性自动化
+
+| 编号 | 项目 | 关键行为 |
+|---|---|---|
+| P1-1 | `bootstrap.ps1` | 单脚本：venv → 装依赖 → 询问 user id（仅一次，幂等）→ 写 `.vscode/mcp.json` + `.vscode/settings.json` → 跑一次 health_check 输出绿灯。 |
+| P1-2 | UE facet 自动推断 | 检测根目录 `*.uproject` 时扫描 `Source/**/*.Build.cs` + `Plugins/*/*.uplugin`，写 `.ai-memory/ue_facets.json`：`{module_names, plugin_names, system_areas}`。`memory_write_record` 在传入 facet 不在词典时给 warning 不阻塞。 |
+| P1-3 | shared append auto-compact | 共享 append 文件超过阈值时自动 fold：保留近 N 周，旧条目移到 `memory-bank/archive/<basename>-YYYYWW.md`，并在原文件头部写 `<!-- archived <range> -> <archive_path> -->`。 |
+| P1-4 | 配置完全可选 + diagnose | 缺失 `.ai-memory/config.json` 时全部走默认；`memory_context.config_diagnose` 返回每条策略的来源 (`default` / `file` / `env`)。 |
+| P1-5 | `link_artifact` 路径归一化 | UE `/Game/X` ↔ 物理 `Content/X.uasset` 双向解析；附 `git_sha`（如可获取）。无 git 时 graceful。 |
+
+#### 15.9.4 P2 — 稳健性观测
+
+| 编号 | 项目 | 关键行为 |
+|---|---|---|
+| P2-1 | `cli scale-baseline` | 跑 5k/20k/50k 规模 smoke 写 `.ai-memory/baseline.json`；health_check 对比当前与基线，回归 50% 报 `warning="perf_regression"`。 |
+| P2-2 | health 启动自愈 | 异常时尝试 `rebuild_index` / 清孤儿 `.tmp` / 清过期 lock sidecar 后再上报；自愈过程写 `events.jsonl`。 |
+| P2-3 | 策略哈希一致性提示 | 策略 schema 哈希写 `events.jsonl`；server 启动时如发现近 N 条事件来自不同策略哈希，警告（不阻塞）。 |
+
+#### 15.9.5 测试与发布纪律
+
+- **TDD 强制**：每个 P0/P1/P2 项目必须先提交失败测试，再提交最小实现，再回归全量。
+- **不破坏 facade**：所有新行为通过现有 3 facade 工具表达；admin / CLI 是兼容入口。
+- **不依赖 LLM / 网络**：所有自动化在离线环境必须可运行。
+- **错误返回结构化**：`{ok: false, error: "...", request_id: "...", hint: "..."}`，禁止 raise 到 MCP 边界。
+- **每完成一项**：DEVLOG 加条目（含测试增量），README 更新版本号与测试数。
+
+`v0.6.0`：开箱即用稳健性版（**当前最高优先级，进行中**）
+
+> **目标：使用者唯一显式配置 = 自己的 user id；其余团队约定全部由插件自动兜底。** 详见 §15.9。
+
+P0（健壮性 / 数据安全，必须 TDD）：
+
+- P0-1 user id 强校验：`load_config` 在解析后强制校验 effective user，落入占位集合（`""` / `unknown` / `Administrator` / `User` / 含空白 / 含 `\` `/` 等路径分隔符）时返回结构化 `error="user_not_configured"` + `setup_hint`，禁止默默写入 `unknown.md`。
+- P0-2 shared 文件 overwrite 强制拒绝：`shared_paths_policy=append_only` 命中文件且 `mode="overwrite"` 必须返回 `error="shared_overwrite_forbidden"`，给出 `record` 操作引导；新增/旧/缺省配置必须三种全部生效。
+- P0-3 启动期 auto-maintenance：MCP server 启动时检测 `.ai-memory/last_maintenance.json`，超阈值（默认 7 天 / events.jsonl > 50MB / index 落后 mtime）自动触发 `health_check` + `rebuild_index` + 共享 append 文件 auto-compact；所有动作幂等，结果落 `events.jsonl`，失败不阻塞主链路。
+
+P1（易用性自动化）：
+
+- P1-1 `bootstrap.ps1` 单一部署入口：合并 deploy + setup_mcp + user id 询问 + 一次 health 验证。
+- P1-2 UE facet 自动推断：检测到根目录 `*.uproject` 时扫描 `Source/**/*.Build.cs` + `Plugins/*/*.uplugin`，写 `.ai-memory/ue_facets.json`，作为 `memory_write_record` 的 facet 推断词典；未知 module 给 warning 不阻塞。
+- P1-3 共享 append 文件 auto-compact：超过 `auto_compact_threshold_lines`（默认 2000）自动 fold 旧条目到 `memory-bank/archive/<file>-YYYYWW.md`。
+- P1-4 配置完全可选 + `memory_context.config_diagnose`：报告当前生效策略来源（默认 vs 文件覆盖）。
+- P1-5 `link_artifact` 自动归一化：UE `/Game/...` ↔ 物理 `Content/...` 路径双向解析 + 附 git sha。
+
+P2（稳健性观测）：
+
+- P2-1 `cli scale-baseline`：一键跑 5k/20k/50k 规模 smoke，结果写 `.ai-memory/baseline.json`；后续 health_check 与基线对比，慢 50% 告警。
+- P2-2 health 启动自愈：异常时尝试 `rebuild-index`、清理孤儿 `.tmp`、清理过期 lock sidecar 后再上报。
+- P2-3 多 server 实例策略哈希一致性提示：策略 schema 哈希写入 `events.jsonl`，不一致时启动期警告。
+
+`v0.7.0`：LLM 软增强版（规划中）
 
 - query rewrite
 - tag / facet 推荐
@@ -1619,7 +1696,7 @@ P4 测试：
 - conflict explanation
 - candidate draft
 
-`v0.6.5`：向量补召回版
+`v0.7.5`：向量补召回版
 
 - 本地向量索引
 - FTS 失败时语义补召回
@@ -1666,7 +1743,7 @@ P4 测试：
 - 当前默认使用方式为免维护：普通用户不需要执行任何 maintenance / governance / admin 操作。
 - MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
 - P3 首版已完成：时间快照、谱系关系、importance scoring、facet、分层召回、上下文装配和 dao/fa/shu 视图已落地。
-- 当前下一步是管理 skill 与 `memory_compiler.py` 长尾拆分：继续拆 snapshot / review / rollback 逻辑、补齐管理 skill；`memory_corpus.py` 已在 v0.5.2 完成，`memory_frontmatter.py` / `memory_budget.py` / `server_*` 拆分已在 v0.5.3 完成，render / targets / scoring 已在 v0.5.8 完成，并叠加 v0.5.4–20.5.6 的并发 / 崩溃安全加固（块跨进程 sidecar 文件锁、SQLite WAL、乐观锁 if_match、fsync_strict、disk_full 结构化错误、PathManager 长路径归一化）。
+- 当前下一步是 P4 LLM 软增强；`memory_corpus.py` 已在 v0.5.2 完成，`memory_frontmatter.py` / `memory_budget.py` / `server_*` 拆分已在 v0.5.3 完成，render / targets / scoring 已在 v0.5.8 完成，并叠加 v0.5.4-v0.5.6 的并发 / 崩溃安全加固（跨进程 sidecar 文件锁、SQLite WAL、乐观锁 if_match、fsync_strict、disk_full 结构化错误、PathManager 长路径归一化），以及 v0.5.11 的 guard 旧配置兜底与 retrieval 预筛。
 - 插件内治理扩展降级为兼容方向：保留 validate / publish / archive 能力，但不再把自动审查和规则晋升作为主路线。
 - P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
 - P5 最后做本地 RAG / 向量补召回，且只作为 metadata / FTS 后的语义补充。

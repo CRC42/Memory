@@ -18,6 +18,10 @@ from .memory_records import (
     V2_LIST_FIELDS,
     memory_write_record,
 )
+from .memory_artifact_paths import (
+    attach_git_sha,
+    normalize_asset_paths as _normalize_asset_paths,
+)
 from .memory_result import error_result, ok_result
 
 ARTIFACT_FIELDS = [
@@ -142,12 +146,12 @@ def memory_link_artifact(
 
     updates = {
         "related_artifact_ids": _normalize_string_list(related_artifact_ids),
-        "asset_paths": _normalize_string_list(asset_paths),
+        "asset_paths": _normalize_asset_paths(asset_paths),
         "map_names": _normalize_string_list(map_names),
         "plugin_names": _normalize_string_list(plugin_names),
         "module_names": _normalize_string_list(module_names),
         "class_names": _normalize_string_list(class_names),
-        "blueprint_paths": _normalize_string_list(blueprint_paths),
+        "blueprint_paths": _normalize_asset_paths(blueprint_paths),
     }
     if not any(updates.values()) and not system_area:
         return error_result("invalid_input", "at least one artifact facet or system_area must be provided")
@@ -164,18 +168,22 @@ def memory_link_artifact(
 
     result = _write_same_record(config, abs_path=abs_path, rel_path=rel_path, metadata=metadata, body=body)
     if result.get("ok"):
+        event_payload: dict[str, Any] = {
+            "id": record_id,
+            "path": rel_path,
+            "artifact_fields": {key: values for key, values in updates.items() if values},
+            "system_area": system_area,
+        }
+        attach_git_sha(config.repo_root, event_payload)
         append_event(
             config,
             "memory_link_artifact",
-            {
-                "id": record_id,
-                "path": rel_path,
-                "artifact_fields": {key: values for key, values in updates.items() if values},
-                "system_area": system_area,
-            },
+            event_payload,
         )
         result["linked_fields"] = {key: metadata.get(key, []) for key in ARTIFACT_FIELDS}
         result["system_area"] = metadata.get("system_area")
+        if "git_sha" in event_payload:
+            result["git_sha"] = event_payload["git_sha"]
     return result
 
 

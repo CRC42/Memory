@@ -23,6 +23,7 @@ from .memory_paths import PathManager, PathSecurityError, resolve_user_path
 from .memory_record_io import DiskFullError, _atomic_write_text
 from .memory_request_id import content_sha, new_request_id
 from .memory_result import error_result, ok_result
+from .memory_users import validate_effective_user
 from .token_estimator import estimate_tokens
 
 
@@ -105,6 +106,11 @@ def memory_write(
         next call's ``if_match``).
     """
     rid = request_id or new_request_id()
+    # P0-1: refuse to write when effective user id is a placeholder.
+    # This prevents silent collisions on shared / unconfigured machines.
+    user_err = validate_effective_user(config)
+    if user_err is not None and user_err.get("ok") is False:
+        return {**user_err, "request_id": rid}
     # Validate mode
     if mode not in ("overwrite", "append"):
         return error_result("invalid_input", "mode must be 'overwrite' or 'append'")
@@ -118,6 +124,26 @@ def memory_write(
     effective_path = path
     _write_policy = _lookup_write_policy(config, path)
     if _write_policy == "append_only" and mode == "overwrite":
+        # P0-2 (v0.6.0 OOTB): default behavior is strict reject so the
+        # AI client cannot silently turn an "overwrite" intent into an
+        # append (which would duplicate / corrupt shared knowledge).
+        # Legacy silent downgrade is opt-in via
+        # mcp.shared_overwrite_policy="downgrade".
+        if getattr(config, "mcp_shared_overwrite_policy", "reject") == "reject":
+            return {
+                "ok": False,
+                "error": "shared_overwrite_forbidden",
+                "message": (
+                    "Target is a shared append-only file; overwrite would "
+                    "destroy other users' contributions. Use mode='append' "
+                    "or memory_write(operation='record', ...) instead."
+                ),
+                "path": path,
+                "policy": "append_only",
+                "suggested_operation": "record",
+                "suggested_mode": "append",
+                "request_id": rid,
+            }
         effective_mode = "append"
         policy_override = "append_only"
     elif _write_policy == "user_scoped":

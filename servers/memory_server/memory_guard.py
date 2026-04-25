@@ -36,6 +36,30 @@ def _scan_user_scoped_dir(config: MemoryConfig, target_path: str) -> list[tuple[
     return results
 
 
+def _target_write_policy(config: MemoryConfig, target_path: str, explicit_policy: str | None) -> str | None:
+    """Return the effective write policy for guard/budget checks.
+
+    Mirrors memory_writer's multi-user fallback without importing it
+    (memory_writer imports check_total_budget, so importing back would
+    create a cycle). This keeps old configs that override guard.targets but
+    omit write_policy consistent across read/write/guard behavior.
+    """
+    if explicit_policy:
+        return explicit_policy
+
+    normalized = target_path.replace("\\", "/").strip("/")
+    if config.multi_user and config.multi_user.enabled:
+        for scoped in config.multi_user.user_scoped_paths or []:
+            scoped_norm = scoped.replace("\\", "/").strip("/")
+            if scoped_norm == normalized or normalized.endswith(scoped_norm):
+                return "user_scoped"
+        for shared_path, policy in (config.multi_user.shared_paths_policy or {}).items():
+            shared_norm = shared_path.replace("\\", "/").strip("/")
+            if shared_norm == normalized or normalized.endswith(shared_norm):
+                return policy
+    return None
+
+
 def check_total_budget(config: MemoryConfig, *, extra_chars: int = 0) -> dict[str, Any] | None:
     """Check if adding *extra_chars* would exceed the global memory budget.
 
@@ -51,8 +75,9 @@ def check_total_budget(config: MemoryConfig, *, extra_chars: int = 0) -> dict[st
     total_chars = 0
     total_tokens = 0
     for target in config.guard_targets:
+        write_policy = _target_write_policy(config, target.path, target.write_policy)
         # user_scoped target：扫描目录下所有用户文件
-        if target.write_policy == "user_scoped":
+        if write_policy == "user_scoped":
             for _rel, text in _scan_user_scoped_dir(config, target.path):
                 total_chars += len(text)
                 total_tokens += estimate_tokens(text)
@@ -122,9 +147,10 @@ def memory_guard_check(config: MemoryConfig) -> dict:
         stats["total"] += 1
         max_chars = target.max_chars if target.max_chars is not None else config.guard_default_max_chars
         max_tokens = target.max_tokens if target.max_tokens is not None else config.guard_default_max_tokens
+        write_policy = _target_write_policy(config, target.path, target.write_policy)
 
         # user_scoped target：扫描目录下所有用户文件，每个文件独立报告
-        if target.write_policy == "user_scoped":
+        if write_policy == "user_scoped":
             user_files = _scan_user_scoped_dir(config, target.path)
             if not user_files:
                 # 目录不存在或为空，同时检查旧单文件是否存在

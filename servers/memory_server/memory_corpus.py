@@ -118,9 +118,11 @@ def compact_body(record: CompilableRecord) -> str:
 
 def iter_compilable_records(
     config: MemoryConfig,
+    *,
+    include_rel_paths: set[str] | None = None,
 ) -> tuple[list[CompilableRecord], dict[str, int]]:
     """Project every parsed record into ``CompilableRecord`` form."""
-    parsed, stats = iter_parsed_records(config)
+    parsed, stats = iter_parsed_records(config, include_rel_paths=include_rel_paths)
     records = [
         CompilableRecord(
             path=record.rel_path,

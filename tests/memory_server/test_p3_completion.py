@@ -4,6 +4,7 @@ from pathlib import Path
 
 from servers.memory_server.memory_compiler import memory_compare_snapshots, memory_compile
 from servers.memory_server.memory_config import load_config
+from servers.memory_server.memory_record_index import memory_rebuild_index
 from servers.memory_server.memory_records import memory_write_record
 from servers.memory_server.memory_retrieval import memory_get_important_memories, memory_retrieve_context
 from servers.memory_server.server import _dispatch_tool
@@ -447,3 +448,81 @@ def test_p3_private_scopes_isolate_authors_in_retrieval(repo: Path) -> None:
     assert alice_personal["id"] in alice_ids
     assert alice_private["id"] in alice_ids
 
+
+def test_retrieve_context_uses_record_index_prefilter_for_metadata_and_facets(repo: Path) -> None:
+    config = load_config(repo)
+    target = memory_write_record(
+        config,
+        content_markdown="# Target Procedure\n\nIndexed retrieval prefilter should keep this procedure.\n",
+        record_kind="procedure",
+        scope="project_shared",
+        status="validated",
+        author="alice",
+        tags=["workflow"],
+        system_area="memory",
+        module_names=["MemoryServer"],
+    )
+    assert target["ok"] is True
+    for idx in range(12):
+        other = memory_write_record(
+            config,
+            content_markdown=f"# Other {idx}\n\nIndexed retrieval prefilter should skip this unrelated note.\n",
+            record_kind="note",
+            scope="project_shared",
+            status="validated",
+            author="alice",
+            tags=["workflow"],
+            system_area="other",
+            module_names=[f"OtherModule{idx}"],
+        )
+        assert other["ok"] is True
+
+    rebuild = memory_rebuild_index(config)
+    assert rebuild["ok"] is True
+
+    result = memory_retrieve_context(
+        config,
+        query="prefilter procedure",
+        include_scopes=["project_shared"],
+        include_statuses=["validated"],
+        system_area="memory",
+        module_names=["MemoryServer"],
+        max_items=5,
+    )
+
+    assert result["ok"] is True
+    assert result["stats"]["prefilter"]["enabled"] is True
+    assert result["stats"]["prefilter"]["candidate_paths"] == 1
+    assert result["stats"]["scanned_files"] == 1
+    assert [item["id"] for item in result["selected_records"]] == [target["id"]]
+
+
+def test_retrieve_context_falls_back_when_record_index_is_missing(repo: Path) -> None:
+    config = load_config(repo)
+    target = memory_write_record(
+        config,
+        content_markdown="# Fallback Procedure\n\nMarkdown fallback should still find this procedure.\n",
+        record_kind="procedure",
+        scope="project_shared",
+        status="validated",
+        author="alice",
+        tags=["workflow"],
+        system_area="memory",
+        module_names=["FallbackModule"],
+    )
+    assert target["ok"] is True
+
+    result = memory_retrieve_context(
+        config,
+        query="fallback procedure",
+        include_scopes=["project_shared"],
+        include_statuses=["validated"],
+        system_area="memory",
+        module_names=["FallbackModule"],
+        max_items=5,
+    )
+
+    assert result["ok"] is True
+    assert result["stats"]["prefilter"]["enabled"] is False
+    assert result["stats"]["prefilter"]["fallback_reason"] == "index_missing"
+    assert target["id"] in {item["id"] for item in result["selected_records"]}

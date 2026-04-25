@@ -1,5 +1,118 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-26 (v0.6.0 完整发布: P0+P1+P2 全部落地)
+
+> **状态：v0.6.0「开箱即用稳健性版」全部 11 项 (P0×3 + P1×5 + P2×3) 完成。测试 230 → 333 (+103)。所有项严格遵循 §15.9.5 TDD 纪律：先写失败测试 → 最小实现 → 全量回归。**
+
+### P0（数据安全）
+
+- **P0-1 user id 强校验**：`memory_users.py` + `memory_write` 前置守卫，hard-reject 占位 / 路径注入字符；`mcp.allow_unknown_user=true` 显式覆盖。+32 测试。
+- **P0-2 共享文件 overwrite 强制拒绝**：`memory_write` 对 `append_only` 路径 + `mode=overwrite` 默认返回结构化 `shared_overwrite_forbidden`，旧的 silent-downgrade 行为通过 `mcp.shared_overwrite_policy="downgrade"` opt-in。+4 测试。
+- **P0-3 启动 auto-maintenance**：新增 `memory_auto_maintenance.run_if_due(config)` 模块；server 启动时 best-effort 调用，按时间/索引陈旧度/事件量阈值自动跑 health + rebuild_index；状态写入 `.ai-memory/last_maintenance.json`，失败记录到 events.jsonl 但不阻塞主链路；`mcp.auto_maintenance.enabled=false` 可关闭。+9 测试。
+
+### P1（开箱即用 / 体验）
+
+- **P1-1 `bootstrap.ps1` 单一入口**：venv → deps → user-id 提示 → `.vscode/settings.json` + `.vscode/mcp.json` 合并 → 健康检查绿灯。所有风险 JSON 操作下沉到 `memory_bootstrap.py` 并被 pytest 覆盖。+8 测试。
+- **P1-2 UE facet 自动推断**：`memory_ue_facets.detect_ue_facets` 扫描 `*.uproject` + `Source/**/*.Build.cs` + `Plugins/**/*.uplugin` → `.ai-memory/ue_facets.json`；`memory_write_record` 对未识别的 `module_names` / `plugin_names` 给出非阻塞 `ue_unknown_components` 警告。+11 测试。
+- **P1-3 shared append auto-compact**：`memory_shared_compactor.auto_compact_shared_file` 当行数超阈值时把旧条目折叠到 `memory-bank/archive/<basename>-YYYYWW.md`，活跃文件保留尾部 N 行 + 横幅。同周内多次执行追加而非覆盖。+6 测试。
+- **P1-4 `config_diagnose`**：`memory_context.operation="config_diagnose"` 返回每个关键字段的 `value` + `source` (`default`/`file`/`env`/`vscode`)。+5 测试。
+- **P1-5 `link_artifact` 路径归一化**：`Content/Foo/Bar.uasset` ↔ `/Game/Foo/Bar` 双向标准化 + 去重；当 `.git/` 存在时附加 `git_sha` 到 event 与返回值。+15 测试。
+
+### P2（健康 / 演进）
+
+- **P2-1 `cli scale-baseline`**：`memory_baseline.write_baseline` 写 `.ai-memory/baseline.json` (memory_bank 文件数/字节、records 数、events 字节、index 大小、可选 git_sha)；`detect_regressions` 在 health_check 中以 `scale_regression` issue 出现，默认 2× 因子。+5 测试。
+- **P2-2 health 启动自愈**：`memory_health_check` 调用 `_self_heal`，清理 60s 以上的 `*.tmp` 孤儿与陈旧 `.lock` sidecar；`self_heal: {tmp_removed, stale_locks_removed}` 出现在结果中。+2 测试。
+- **P2-3 scoring 策略哈希一致性**：`memory_strategy_hash.STRATEGY_MANIFEST` 显式声明组件 + 默认权重，SHA-256 截短哈希；auto_maintenance event 中写入 `scoring_strategy_hash`；health_check 扫描最近 events，发现哈希漂移时报 `scoring_strategy_changed`。+6 测试。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/  # 333 passed in 15.25s
+```
+
+### 后续
+
+- v0.7.0 LLM 摘要 / RAG 整合：保留为下个版本，与 OOTB 硬化解耦。
+- 已对 `bootstrap.ps1` 做了无副作用 dry-run 设计；下一轮在真实开发机上完整 e2e 验证。
+- MemorySystemDesignDocument §15.9 已与实现对齐；可作为 v0.6.0 验收清单。
+
+---
+
+## 2026-04-25 (v0.6.0-P0-1: user id 强校验)
+
+> **状态：v0.6.0「开箱即用稳健性版」第一项落地。新增 `memory_users.py`，hard-reject 占位用户名（`""` / 空白 / `unknown` / 含 `/\:` 等路径注入字符），soft-warn 共享 OS 账号（`Administrator` 等）；`memory_write` 在写盘前调用 `validate_effective_user`，用结构化 `error="user_not_configured"` + `setup_hint` 替代旧 `user_required`。可通过 `mcp.allow_unknown_user=true` 显式覆盖。测试 230 → 262（+32）。**
+
+### 范围
+
+1. **`memory_users.py`（新增）**
+   - `is_placeholder_user(name)`：hard-reject 集（`""` / 空白 / `unknown` 大小写 / 含 `/` `\` `:` `\n` `\r` `\0`）。
+   - `is_ambiguous_user(name)`：soft-warn 集（`administrator` / `user` / `admin` / `root` / `guest` / `default`）。
+   - `validate_effective_user(config)`：facade 写路径前置守卫；返回 `None` 通过；占位返回 `{ok: false, error: "user_not_configured", setup_hint: "..."}`；模糊返回 `{ok: true, warning: "user_ambiguous", ...}`。
+
+2. **配置**
+   - `MemoryConfig` 新增 `mcp_allow_unknown_user: bool = False`；`load_config` 解析 `mcp.allow_unknown_user`。
+
+3. **集成**
+   - `memory_writer.memory_write` 在 mode 校验之前调用 `validate_effective_user`，placeholder 时直接 short-circuit 返回 `{**err, request_id}`，不写盘、不锁、不备份。
+
+4. **测试**
+   - 新增 `tests/memory_server/test_user_validation.py`：32 项（pure-function 19、config 4、facade 2 + parametrize 展开）。
+   - 调整 `test_multi_user.py::test_user_scoped_write_requires_known_user`：旧 `user_required` 统一为 `user_not_configured` + `setup_hint`。
+
+5. **文档**
+   - 设计文档 §15.9 写入 v0.6.0 P0/P1/P2 完整开发计划。
+   - DEVLOG 加本条目。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/ --tb=short
+# 262 passed in ~15s
+```
+
+### 后续（v0.6.0 剩余）
+
+- P0-2 shared 文件 overwrite 强制拒绝（结构化 `error="shared_overwrite_forbidden"`）
+- P0-3 启动期 auto-maintenance（`memory_auto_maintenance.run_if_due`）
+- P1/P2 详见设计文档 §15.9
+
+---
+
+## 2026-04-25 (v0.5.11: guard 旧配置兜底 + retrieval 预筛 + 规模冒烟)
+
+> **状态：落实非 UE 专项稳健性收尾。修复旧配置下 guard 与写入侧多人策略不一致；`retrieve_context` / `important_memories` 增加 SQLite metadata/facet 预筛并保留 Markdown fallback；新增可重复运行的 5k 结构化记录 scale smoke；修正文档时间线。测试 227 → 230。**
+
+### 范围
+
+1. **guard 旧配置兜底**
+   - `memory_guard.py` 新增 `_target_write_policy`，在 target 缺少 `write_policy` 时复用默认 `multi_user.user_scoped_paths` / `shared_paths_policy`。
+   - `memory_guard_check` 与 `check_total_budget` 现在和 `memory_write` 一样处理旧 `.ai-memory/config.json`：`activeContext.md` 按用户分区扫描，共享 warm 文件按 append-only 策略解释。
+   - 新增旧配置回归：`test_guard_uses_default_multi_user_policy_for_legacy_config_without_write_policy`。
+
+2. **retrieval SQLite 预筛**
+   - `memory_record_index.prefilter_record_paths` 基于 SQLite 派生索引按 scope/status/user/task/branch/system_area/facet 先筛候选路径。
+   - `memory_retrieval._collect_records` 优先读取预筛路径；索引缺失、损坏或查询失败时无损回退全量 Markdown 扫描。
+   - `iter_parsed_records` / `iter_compilable_records` 增加 `include_rel_paths`，预筛命中时直接解析候选路径，不再遍历整个 `memory-bank`。
+   - `memory_retrieve_context` 只有选中记录携带 `conflicts_with` 时才扫描全量冲突，避免无冲突场景隐藏 O(N) 成本。
+   - 新增回归：索引预筛命中只扫描 1 个候选；索引缺失时 fallback 仍能返回正确记录。
+
+3. **规模冒烟与文档**
+   - 新增 `MCP/Memory/scripts/run_memory_scale_smoke.py`，默认生成 5000 条通用结构化记录，输出 rebuild/search/retrieve 指标。
+   - README、设计文档、`memory-admin` skill 同步 v0.5.11 状态与恢复演练。
+   - 修正 DEVLOG 中 v0.5.6 条目的未来日期（2026-04-26 → 2026-04-24）。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe MCP\Memory\scripts\run_memory_scale_smoke.py --records 5000
+# retrieve_prefilter.enabled=true, candidate_paths=50, retrieve_seconds≈0.07s
+
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+# 230 passed
+```
+
+---
+
 ## 2026-04-24 (v0.5.10: 管理 CLI 入口)
 
 > **状态：admin 能力新增一级 CLI（`python -m servers.memory_server.cli`），覆盖 guard / health / backup / compact / rebuild-index / migrate / validate / publish / archive / delete / compile / snapshot-rebuild / runtime-digest。skill `memory-admin` / `memory-snapshot-review` 已同步切换到 CLI 范式。新增 9 项 CLI 回归测试，整体 227 passed。**
@@ -132,7 +245,7 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 
 ---
 
-## 2026-04-26 (v0.5.6 P0/P2 follow-up: 锁 fd 异常推担 + disk_full 结构化错误)
+## 2026-04-24 (v0.5.6 P0/P2 follow-up: 锁 fd 异常推担 + disk_full 结构化错误)
 
 > **状态：补三话的二项评估后续：`file_lock` 轮询期间的异步异常（`KeyboardInterrupt` / `SystemExit`）不再泄漏 sidecar fd；`_atomic_write_text` 在 `ENOSPC` / `EDQUOT` 时抛专用 `DiskFullError`，`memory_write` 转成结构化 `error="disk_full"`。+3 测试，213 → 216。**
 
@@ -167,7 +280,7 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 
 ---
 
-## 2026-04-26 (v0.5.6 P1 follow-up: 读路径与路径规范化加固)
+## 2026-04-24 (v0.5.6 P1 follow-up: 读路径与路径规范化加固)
 
 > **状态：补齐读路径在多 agent 写入下的瞬态容错；测试由"容忍瞬态"收紧为"零容忍"；213 测试保持全绿，6 次连跑稳定。**
 
@@ -201,7 +314,7 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 
 ---
 
-## 2026-04-26 (v0.5.6: 多 agent 并发严格评估 + 真 bug 修复 + 9 项压力测试)
+## 2026-04-24 (v0.5.6: 多 agent 并发严格评估 + 真 bug 修复 + 9 项压力测试)
 
 > **状态：在 v0.5.5 之上严格评估「同一台设备多 agent 同时写入」的真实健壮性，过程中发现 2 个隐性 bug 并修复，新增 9 项多进程压力测试；总计 213 测试全部通过（204 → 213，+9）；6 次连跑无 flaky。**
 

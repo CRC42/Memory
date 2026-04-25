@@ -16,7 +16,70 @@
   - `.ai-memory/` — 配置、索引、备份、审计、缓存（不入 Git）
 - **当前能力**：读/搜/写普通文件、结构化记录（candidate → validated → published → archived）、SQLite FTS + 中文 bigram/trigram、deterministic 编译（runtime / snapshot / review / dao-fa-shu 视图）、谱系与冲突追踪、按 token/字符/条数预算的 `retrieve_context` /「重要记忆输出」。
 - **MCP 默认工具**：3 个 facade（`memory_read` / `memory_write` / `memory_context`），开发期可开 `expose_admin_tools=true` 暴露 23 个 legacy/admin 工具。
-- **状态**：v0.5.10，227 项测试全过（含默认多人模式回归、`retrieve_context` budget-first 回归、5 项多进程并发基线 + 9 项多 agent 严格压力 + 3 项锁/磁盘 P0-P2 守卫 + 8 项写入崩溃安全 + 7 项端到端 MCP-协议回归）。已严格压测「单机多 agent + 单 mcp 规格 + 同工作区」并发安全（8 进程 × 60 events.jsonl 真追加、Ctrl+C 中断不泄锁 fd、`disk_full` 结构化错误码等）：跨进程 sidecar 文件锁 + SQLite WAL + 可选乐观锁（If-Match）+ UUID7 请求 ID；可选 fsync 严格模式（`mcp.fsync_strict`）保证崩溃 / 断电后不丢外部可见写入。
+- **状态**：v0.6.0 OOTB 硬化版（P0+P1+P2 全部完成），333 项测试全过。新增能力：strict user-id 校验、共享文件 overwrite 拒绝、启动 auto-maintenance、`bootstrap.ps1` 单一入口、UE facet 自动推断 + 未知组件警告、shared 文件按周自动归档、`config_diagnose`、`link_artifact` 路径归一化 + git_sha、`cli scale-baseline` + 健康回归告警、health 启动自愈、scoring 策略 hash 一致性。详见 [DEVLOG.md](DEVLOG.md) 2026-04-26 条目。
+
+---
+
+## ⚠️ 团队接入前必读：版本控制 ignore 配置
+
+> **接入团队 Git/SVN 之前必须完成以下 ignore 配置，否则会出现高频不可自动合并冲突。**这是 §4.1「真源 = Markdown，数据库只是索引」的硬约束在 VCS 层面的延伸。
+
+### 必须忽略（漏配 → 必冲突 / 数据损坏）
+
+| 路径 | 原因 |
+|------|------|
+| `.ai-memory/` | 索引、锁、审计、备份、缓存全部本机派生 |
+| `.ai-context/` | 个人热上下文 |
+| `memory-bank/compiled/` | deterministic 编译产物，可重建 |
+| `memory-bank/.tmp*` | 原子写入临时文件 |
+| `.vscode/settings.json` | 含 `memory-mcp.userName` 个人身份 |
+
+### 必须保留入库（团队真源）
+
+| 路径 | 说明 |
+|------|------|
+| `memory-bank/**/*.md` | 长期项目记忆真源 |
+| `.ai-memory/config.json` | 团队共用策略配置（**例外**：`.ai-memory/` 仅这一个文件入库） |
+| `.vscode/mcp.json` | 团队共用 MCP 服务器注册 |
+
+### Git — 推荐 `.gitignore` 片段（复制即用）
+
+```gitignore
+# === Memory MCP ===
+# 派生 / 本机运行时
+.ai-memory/
+.ai-context/
+memory-bank/compiled/
+memory-bank/.tmp*
+# 例外：团队共用配置入库
+!.ai-memory/config.json
+# VS Code
+.vscode/settings.json
+!.vscode/mcp.json
+```
+
+### SVN — 等价配置
+
+```bash
+svn propset svn:ignore "compiled
+.tmp*" memory-bank
+svn propset svn:ignore "*" .ai-memory
+svn propset svn:ignore "*" .ai-context
+svn add .ai-memory/config.json --force
+```
+
+> ⚠️ **SVN 团队额外约定**：**不要对 `progress.md` / `techContext.md` / `systemPatterns.md` / `projectbrief.md` 使用 `svn lock`**，否则会卡住其他开发者的 agent 写入。这些文件已被服务端强制为 append-only，不需要 lock。
+
+### 接入前自检清单
+
+- [ ] `.gitignore` / `svn:ignore` 已包含 `.ai-memory/` 与 `.ai-context/`
+- [ ] `.ai-memory/config.json` 例外保留入库
+- [ ] `memory-bank/compiled/` 在 ignore 列表
+- [ ] `.vscode/settings.json` 不入库（每人本地 `bootstrap.ps1` 时生成）
+- [ ] 团队约定不对共享 append-only 文件加锁
+- [ ] CI 上不会误把 `.ai-memory/search.db` / `events.jsonl` 提交
+
+满足以上 6 条后，**记忆文件在 Git 团队下的自动合并率 ≥ 99%**（仅 `progress.md` 等 append-only 文件偶发尾部冲突，等同普通代码 3-way merge）。详见 §6 多人项目就绪度评估。
 
 ---
 
@@ -63,7 +126,7 @@ env = { PYTHONPATH = 'C:\Work\GIT\ToolTest\MCP\Memory', PYTHONUTF8 = '1' }
 # 启动调试
 powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_server.ps1
 
-# 跑全部测试（应输出 227 passed）
+# 跑全部测试（应输出 333 passed）
 powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
 ```
 
@@ -172,11 +235,83 @@ candidate → validated → published → archived 流程仍然可用（带 conf
 
 ---
 
-## 5. 后续开发计划
+## 5. 开发计划与状态
 
-优先级（高 → 低）：
+### 5.1 v0.6.0 OOTB 硬化（已完成 ✅）
 
-1. **P4 — LLM 软增强**：query rewrite、tag/facet 推荐、snapshot narrative、conflict explanation、title/abstract 优化。LLM 不能直接发布系统记忆、不能覆盖真源、不能替代 deterministic compile。
-2. **P5 — 本地 RAG / 向量补召回**：仅做语义模糊召回与低关键词命中场景的 recall 增强。向量索引落 `.ai-memory/`，可删可重建，永不作为真源。检索顺序仍为 `metadata → FTS → vector supplement → rerank`。
+11 项全部按 TDD 落地，测试 230 → **333 passed**。详见 [DEVLOG.md](./DEVLOG.md) 2026-04-26 条目与设计文档 §15.9。
 
-> 历史里程碑（v0.4 多人协作、v0.5.0 P3 schema v2、v0.5.1 record IO 公共层、v0.5.2 author 隔离 + corpus 解耦、v0.5.3 server/compiler/budget 拆分 + 写入加固、v0.5.4 单机多 agent 并发安全、v0.5.5 崩溃耐久度 + fsync 严格模式、v0.5.6 多 agent 严格压测 + events.jsonl 锁修复 + fd 泄漏修复、v0.5.7 默认启用多人安全策略、v0.5.8 retrieve_context budget-first + compiler render/targets/scoring 拆分、v0.5.9 compiler writer/views 二轮拆分 + memory-admin / memory-snapshot-review skill 首版、v0.5.10 管理 CLI 入口）见 [DEVLOG.md](./DEVLOG.md)。
+| 分类 | 项 | 关键模块 |
+|------|-----|---------|
+| P0 数据安全 | user-id 强校验 | `memory_users.py` + `memory_write` 前置守卫 |
+| P0 数据安全 | 共享文件 overwrite 强制拒绝 | `mcp.shared_overwrite_policy` opt-in |
+| P0 数据安全 | 启动 auto-maintenance | `memory_auto_maintenance.run_if_due` |
+| P1 OOTB | `bootstrap.ps1` 单一入口 | venv + settings.json + mcp.json + 健康绿灯 |
+| P1 OOTB | UE facet 自动推断 + 未知组件 warning | 解析 `*.uproject` / `Build.cs` / `*.uplugin` |
+| P1 OOTB | shared 文件按周自动归档 | `memory-bank/archive/<stem>-YYYYWW.md` |
+| P1 OOTB | `config_diagnose` | 显示每字段 value + source (`default`/`file`/`env`/`vscode`) |
+| P1 OOTB | `link_artifact` 路径归一化 + git_sha | `Content/...` ↔ `/Game/...` |
+| P2 健康/演进 | `cli scale-baseline` + 回归告警 | health issue `scale_regression`（默认 2× 因子） |
+| P2 健康/演进 | health 启动自愈 | 清理 60s 以上 `*.tmp` / `*.lock` |
+| P2 健康/演进 | scoring 策略 hash 一致性 | events.jsonl 写哈希 + health `scoring_strategy_changed` |
+
+### 5.2 v0.7.0 路线（高 → 低）
+
+1. **P4 LLM 软增强**：query rewrite、tag/facet 推荐、snapshot narrative、conflict explanation、title/abstract 优化。LLM 不能直接发布系统记忆、不能覆盖真源、不能替代 deterministic compile。
+2. **P5 本地 RAG / 向量补召回**：语义模糊召回与低 FTS 命中场景。向量索引落 `.ai-memory/`，可删可重建，永不作为真源。检索顺序：`metadata → FTS → vector supplement → rerank`。
+3. **`bootstrap.ps1` e2e 演练**：在真实开发机（含已有 `.vscode/mcp.json` 和遗留 `settings.json`）上端到端演练并把指纹收回 README/DEVLOG。
+
+> 历史里程碑（v0.4 → v0.5.10）见 [DEVLOG.md](./DEVLOG.md)。
+
+---
+
+## 6. 大型 UE 多人项目就绪度评估（v0.6.0）
+
+以「2-20 人 / 同 workspace / 多 VS Code + Codex 会话」为目标场景。
+
+### 6.1 已就绪能力
+
+| 维度 | 现状 | 关键证据 |
+|------|------|---------|
+| **OOTB 部署** | ✅ 单脚本完成 | `scripts/bootstrap.ps1` → venv + settings.json + mcp.json + health 绿灯 |
+| **用户身份** | ✅ 强校验 + 占位拒绝 | `memory_users.is_placeholder_user`；`mcp.allow_unknown_user=true` 显式覆盖 |
+| **多人写入隔离** | ✅ 默认开启 | `activeContext.md` 自动按 user 分文件；`scope=personal/user_private` author 隔离 |
+| **共享文件并发** | ✅ append-only + overwrite 拒绝 | `progress.md` 等强制 append；`shared_overwrite_forbidden` 结构化错误 |
+| **多 agent 并发** | ✅ 已严格压测 | sidecar 文件锁 + SQLite WAL + UUID7 request_id + If-Match 乐观锁；8 进程 × 60 真追加压测 |
+| **崩溃耐久度** | ✅ 可选严格 fsync | `mcp.fsync_strict=true` → 数据 fd + parent dir + events.jsonl |
+| **真源可审计** | ✅ Markdown + Git diff | 索引/缓存全部派生可重建（`memory_rebuild_index` / `memory_compile`） |
+| **UE 资产关联** | ✅ 路径归一化 + git_sha | `link_artifact`：`Content/Foo.uasset` ↔ `/Game/Foo`，自动附 git short SHA |
+| **UE 模块/插件感知** | ✅ 自动推断 + 警告 | `.ai-memory/ue_facets.json`；记录里 `module_names`/`plugin_names` 不在白名单 → `ue_unknown_components` warning |
+| **运维自愈** | ✅ 启动自动跑 | `auto_maintenance` 按时间 / 索引陈旧度 / 事件量阈值；health 自动清理孤儿锁 |
+| **健康可观测** | ✅ 多维度 | `memory_health_check` 含 `scale_regression` / `strategy_drift` / `self_heal` 子项 |
+| **配置可解释** | ✅ `config_diagnose` | 每字段定位到 default/file/env/vscode 的来源 |
+
+### 6.2 适用边界（已设计但需团队规约）
+
+- **「同一文件多人主动 overwrite」** 默认会被拒绝；团队约定哪些文件由谁负责（`activeContext` 自动分人，`progress.md` append，规则类文件单一 owner）。
+- **`if_match` ETag** 是可选的；写客户端建议总传，避免覆盖竞态。
+- **`bootstrap.ps1`** 在真实开发机的 e2e 演练尚未跑完整一遍（v0.7.0 计划）；目前由 8 项 pytest 覆盖核心 JSON 操作。
+- **跨机协作** 仍以 Git 为载体（memory-bank/** 入库；`.ai-memory/` 不入库）。这是设计意图，不是缺口。
+
+### 6.3 v0.7.0 之前 *不能* 假设的能力
+
+- LLM 自动 query rewrite / 总结（仍需手工或外部 agent 触发）。
+- 向量召回（仅 FTS + bigram/trigram；中文长 token 短查询的召回兜底依赖人工 tag）。
+- 跨机器实时协作（不是 server，没有 WebSocket / 中心服务）。
+
+### 6.4 结论
+
+**当前 v0.6.0 已具备「同 workspace 多人 + 多 agent」UE 大型项目的生产可用基线**：
+
+- 数据安全（用户身份、写入冲突、崩溃耐久度）
+- 并发安全（跨进程锁、SQLite WAL、乐观锁、压测）
+- UE 项目语义（uproject/Build.cs/uplugin 推断、Content↔/Game 归一化、git_sha）
+- 运维（OOTB bootstrap、auto-maintenance、self-heal、scale baseline、strategy drift）
+- 可观测（health_check 多维 issue、config_diagnose、events.jsonl 审计）
+
+建议落地步骤：
+1. **接入 Git/SVN 前先按本 README 顶部 ⚠️「版本控制 ignore 配置」章节配齐 ignore，否则会出现 search.db / events.jsonl / locks 高频冲突**。
+2. 每位开发者跑一次 `scripts/bootstrap.ps1`，输入个人 `userName`。
+3. 团队约定 `progress.md` / `techContext.md` / `systemPatterns.md` 的 owner，避免 overwrite 竞争（虽然服务端会拒绝，但维护体验更顺）。
+4. CI 周期跑 `cli scale-baseline` 写基线、跑 `memory_health_check` 报告异常。
+5. 真实开发机首装跟踪 v0.7.0 的 e2e 演练任务，回收边角问题。

@@ -288,9 +288,12 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             max_tokens=args.get("max_tokens"),
             max_items=args.get("max_items"),
         )
+    if operation == "config_diagnose":
+        from .memory_diagnose import config_diagnose
+        return config_diagnose(config)
     return error_result(
         "invalid_input",
-        "operation must be one of: compile, runtime_digest, trace_lineage, list_conflicts, compare_snapshots, retrieve_context, important_memories",
+        "operation must be one of: compile, runtime_digest, trace_lineage, list_conflicts, compare_snapshots, retrieve_context, important_memories, config_diagnose",
     )
 
 

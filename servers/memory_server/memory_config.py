@@ -131,6 +131,9 @@ class MemoryConfig:
     tag_schema_version: str = "v1"
     mcp_expose_admin_tools: bool = False
     mcp_fsync_strict: bool = False
+    mcp_allow_unknown_user: bool = False
+    mcp_shared_overwrite_policy: str = "reject"  # "reject" | "downgrade"
+    mcp_auto_maintenance: dict[str, Any] | None = None
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -309,4 +312,13 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         tag_schema_version=str(tag_schema_cfg.get("version", "v1")),
         mcp_expose_admin_tools=bool(mcp_cfg.get("expose_admin_tools", False)),
         mcp_fsync_strict=bool(mcp_cfg.get("fsync_strict", False)),
+        mcp_allow_unknown_user=bool(mcp_cfg.get("allow_unknown_user", False)),
+        mcp_shared_overwrite_policy=(
+            str(mcp_cfg.get("shared_overwrite_policy", "reject")).strip().lower()
+            if mcp_cfg.get("shared_overwrite_policy") in ("reject", "downgrade")
+            else "reject"
+        ),
+        mcp_auto_maintenance=(
+            dict(mcp_cfg.get("auto_maintenance")) if isinstance(mcp_cfg.get("auto_maintenance"), dict) else None
+        ),
     )
