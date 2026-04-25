@@ -17,6 +17,8 @@ from typing import Any
 
 from .memory_config import MemoryConfig
 from .memory_corpus import CompilableRecord
+from .memory_locks import file_lock
+from .memory_record_io import _atomic_write_text
 
 
 def load_compile_cache_entries(
@@ -74,34 +76,41 @@ def record_usage_stats(
     """
     stats_path = config.repo_root / ".ai-memory" / "usage-stats.json"
     stats_path.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, Any] = {}
-    if stats_path.is_file():
-        try:
-            data = json.loads(stats_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
+    # Cross-process serialization: the read-modify-write below would lose
+    # increments if two MCP server processes raced on the same record.
+    with file_lock(config.repo_root, stats_path):
+        data: dict[str, Any] = {}
+        if stats_path.is_file():
+            try:
+                data = json.loads(stats_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, ValueError):
                 data = {}
-        except (OSError, ValueError):
-            data = {}
-    for record in records:
-        record_id = str(record.metadata.get("id", ""))
-        if not record_id:
-            continue
-        entry = data.get(record_id) if isinstance(data.get(record_id), dict) else {}
-        entry["last_used_at"] = used_at
-        entry["path"] = record.path
-        entry["compile_hit_count"] = int(entry.get("compile_hit_count", 0) or 0) + 1
-        compile_targets = entry.get("compile_targets")
-        if not isinstance(compile_targets, list):
-            compile_targets = []
-        normalized_targets = [str(item) for item in compile_targets if str(item).strip()]
-        if target not in normalized_targets:
-            normalized_targets.append(target)
-        entry["compile_targets"] = normalized_targets
-        data[record_id] = entry
-    try:
-        stats_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError:
-        pass
+        for record in records:
+            record_id = str(record.metadata.get("id", ""))
+            if not record_id:
+                continue
+            entry = data.get(record_id) if isinstance(data.get(record_id), dict) else {}
+            entry["last_used_at"] = used_at
+            entry["path"] = record.path
+            entry["compile_hit_count"] = int(entry.get("compile_hit_count", 0) or 0) + 1
+            compile_targets = entry.get("compile_targets")
+            if not isinstance(compile_targets, list):
+                compile_targets = []
+            normalized_targets = [str(item) for item in compile_targets if str(item).strip()]
+            if target not in normalized_targets:
+                normalized_targets.append(target)
+            entry["compile_targets"] = normalized_targets
+            data[record_id] = entry
+        try:
+            _atomic_write_text(
+                stats_path,
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                fsync_strict=config.mcp_fsync_strict,
+            )
+        except OSError:
+            pass
     return stats_path
 
 

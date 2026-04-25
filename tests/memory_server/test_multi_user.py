@@ -83,6 +83,58 @@ def _set_env_user(monkeypatch: pytest.MonkeyPatch, user: str) -> None:
     monkeypatch.delenv("USER", raising=False)
 
 
+def test_multi_user_is_enabled_by_default_for_generated_config(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+
+    assert config.multi_user is not None
+    assert config.multi_user.enabled is True
+    assert config.multi_user.user_scoped_paths == ["memory-bank/activeContext.md"]
+    assert config.multi_user.shared_paths_policy
+    assert config.multi_user.shared_paths_policy["memory-bank/progress.md"] == "append_only"
+
+
+def test_default_multi_user_redirects_legacy_config_without_write_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write(tmp_path / "memory-bank/activeContext.md", "# Legacy Active\n- seed\n")
+    _write(tmp_path / "memory-bank/progress.md", "# Progress\n- seed\n")
+    _write(tmp_path / ".ai-memory/events.jsonl", "")
+    _write(
+        tmp_path / ".ai-memory/config.json",
+        json.dumps(
+            {
+                "allowed_roots": [".ai-context", "memory-bank"],
+                "guard": {
+                    "targets": [
+                        {"path": "memory-bank/activeContext.md", "max_chars": 8000},
+                        {"path": "memory-bank/progress.md", "max_chars": 12000},
+                    ]
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    _set_env_user(monkeypatch, "alice")
+    config = load_config(tmp_path)
+
+    active_result = memory_write(config, "memory-bank/activeContext.md", "# Alice\n", backup=False)
+    progress_result = memory_write(
+        config,
+        "memory-bank/progress.md",
+        "- alice progress\n",
+        mode="overwrite",
+        backup=False,
+    )
+
+    assert active_result["ok"] is True
+    assert active_result["path"] == "memory-bank/activeContext/alice.md"
+    assert progress_result["ok"] is True
+    assert progress_result["mode"] == "append"
+    assert progress_result["policy_override"] == "append_only"
+
+
 def test_user_scoped_writes_create_independent_active_context_files(
     multi_user_repo: Path,
     monkeypatch: pytest.MonkeyPatch,

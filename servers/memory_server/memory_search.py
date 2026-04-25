@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .memory_config import MemoryConfig
 from .memory_paths import PathManager, PathSecurityError
+from .memory_record_io import safe_read_text
 from .memory_result import error_result, ok_result
 
 _BINARY_EXTENSIONS = {
@@ -100,7 +101,7 @@ def memory_search(
                 continue
 
             try:
-                text = abs_path.read_text(encoding="utf-8", errors="replace")
+                text = safe_read_text(abs_path, errors="replace")
             except OSError:
                 stats["skipped_read_errors"] += 1
                 continue

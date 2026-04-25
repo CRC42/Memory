@@ -198,12 +198,17 @@ def test_p3_retrieve_context_assembles_required_sections(repo: Path) -> None:
     assert direct["ok"] is True
     assert facade["ok"] is True
     selected_ids = {item["id"] for item in direct["selected_records"]}
+    context_ids = {item["id"] for item in direct["context_items"]}
     assert rule["id"] in selected_ids
     assert evidence["id"] in selected_ids
+    assert rule["id"] in context_ids
+    assert evidence["id"] in context_ids
     assert other["id"] not in selected_ids
     assert direct["core_constraints"]
     assert direct["relevant_rules"]
     assert direct["key_evidence"]
+    assert direct["budget_report"]["used_items"] == len(direct["context_items"])
+    assert direct["pipeline"]["budget_first_packing"] == len(direct["context_items"])
     assert direct["recent_snapshots"][0]["snapshot_id"] == "daily_snapshot:2026-04-23"
     assert direct["pipeline"]["scope_filter"] >= direct["pipeline"]["facet_filter"]
     assert compared["ok"] is True
@@ -260,9 +265,12 @@ def test_p3_retrieve_context_accepts_budget_controls(repo: Path) -> None:
     assert result["ok"] is True
     assert len(result["selected_records"]) == 1
     assert result["selected_records"][0]["id"] in {rule["id"], evidence["id"]}
-    assert "budget_report" not in result
+    assert len(result["context_items"]) == 1
+    assert result["budget_report"]["used_items"] <= 1
+    assert result["budget_report"]["used_chars"] <= 260
+    assert result["budget_report"]["used_tokens_est"] <= 90
+    assert result["dropped_candidates"] or len({rule["id"], evidence["id"]}) == 1
     assert "important_memories" not in result
-    assert "dropped_candidates" not in result
 
 
 def test_p3_important_memories_budget_first_output(repo: Path) -> None:
@@ -438,5 +446,4 @@ def test_p3_private_scopes_isolate_authors_in_retrieval(repo: Path) -> None:
     alice_ids = {item["id"] for item in alice_view["selected_records"]}
     assert alice_personal["id"] in alice_ids
     assert alice_private["id"] in alice_ids
-
 

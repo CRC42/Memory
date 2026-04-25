@@ -12,28 +12,125 @@ projections in ``memory_compiler``).
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
+from .memory_locks import file_lock
 from .memory_paths import PathManager, PathSecurityError
 from .memory_records import parse_record_markdown, render_record_markdown, target_path_for_record
 from .memory_result import error_result, ok_result
 
 
-def _atomic_write_text(target: Path, content: str) -> None:
+# errno values that mean "the underlying volume can no longer accept writes".
+# We surface these as a structured ``disk_full`` error so callers can
+# distinguish operational disk pressure from generic I/O failure (which
+# might be a permission issue, a corrupted FS, antivirus interference,
+# etc.). ``EDQUOT`` (122 on Linux) is missing from ``errno`` on some
+# platforms — fall back to ``None`` and skip the comparison.
+_DISK_FULL_ERRNOS = {
+    getattr(__import__("errno"), name, None)
+    for name in ("ENOSPC", "EDQUOT", "EFBIG")
+} - {None}
+
+
+class DiskFullError(OSError):
+    """Raised by ``_atomic_write_text`` when the volume is out of space.
+
+    Subclass of ``OSError`` so existing ``except OSError`` catch sites
+    keep working; new code can branch on this specific type to surface
+    a ``disk_full`` error code.
+    """
+
+
+def _is_disk_full(exc: OSError) -> bool:
+    return exc.errno is not None and exc.errno in _DISK_FULL_ERRNOS
+
+
+def safe_read_text(
+    path: Path,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+    max_attempts: int = 20,
+    delay_seconds: float = 0.005,
+) -> str:
+    """Read ``path`` tolerating brief writer-replace contention.
+
+    On Windows, when a writer is in the middle of ``os.replace`` of an
+    atomic-write tmp file onto ``path``, a concurrent reader can observe:
+
+    * ``PermissionError`` -- the writer holds the destination handle without
+      ``FILE_SHARE_DELETE`` for the duration of the replace syscall.
+    * ``FileNotFoundError`` -- the source tmp was renamed but, in rare
+      cases (junctions, antivirus filters), the destination momentarily
+      lacks a directory entry.
+
+    Both windows are tiny (sub-millisecond on a healthy filesystem). This
+    helper bounded-retries the read so callers never spuriously see
+    "file vanished" / "access denied" in normal multi-agent operation.
+    Other ``OSError`` subclasses propagate unchanged.
+    """
+    last_exc: OSError | None = None
+    for _ in range(max(1, max_attempts)):
+        try:
+            return path.read_text(encoding=encoding, errors=errors)
+        except (PermissionError, FileNotFoundError) as exc:
+            last_exc = exc
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _fsync_parent_dir(target: Path) -> None:
+    """Fsync the directory containing ``target`` so the rename is durable.
+
+    Best-effort: silently swallow errors. POSIX-only — ``os.open`` on a
+    directory is not portable on Windows, where directory entries are
+    flushed implicitly by ``os.replace``.
+    """
+    if os.name == "nt":
+        return
+    try:
+        dir_fd = os.open(str(target.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def _atomic_write_text(target: Path, content: str, *, fsync_strict: bool = False) -> None:
     """Atomically write ``content`` to ``target`` (UTF-8).
 
-    Hardening (P1-F/G):
+    Hardening (P1-F/G + v0.5.5):
     - Tmp file is created in the *same directory* as ``target`` so
       ``os.replace`` stays on one volume.
     - Tmp file is created with ``O_CREAT | O_EXCL`` to refuse to clobber a
       stale tmp from another writer in the same tick.
     - The tmp file's contents are flushed and ``fsync``-ed before rename so a
       crash between rename and writeback cannot leave a half-empty file.
+    - After the rename, the parent directory is fsync-ed (POSIX) so the
+      rename itself is durable across crash.
     - On any failure the tmp file is removed.
+
+    Args:
+        target: final destination path.
+        content: UTF-8 text to write.
+        fsync_strict: when True, ``fsync`` failures (file or parent dir on
+            POSIX) propagate as ``OSError`` so the caller can surface the
+            error. When False (default), ``fsync`` is best-effort and only
+            the rename / write itself can fail.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.parent / f".{target.name}.{uuid.uuid4().hex[:8]}.tmp"
@@ -48,15 +145,54 @@ def _atomic_write_text(target: Path, content: str) -> None:
             try:
                 os.fsync(fh.fileno())
             except OSError:
-                # Some filesystems / mounts do not support fsync; durability
-                # is best-effort, but we must still complete the rename.
-                pass
-        os.replace(tmp_path, target)
-    except OSError:
+                if fsync_strict:
+                    raise
+                # Otherwise: some filesystems / mounts do not support fsync;
+                # durability is best-effort, but we must still complete the
+                # rename.
+        # On Windows, ``os.replace`` may briefly fail with PermissionError
+        # if another process has the target file open for read with the
+        # default share mode (no FILE_SHARE_DELETE). This is common when
+        # a reader (e.g. ``memory_search``) scans files concurrently with
+        # writers protected only by the per-target ``file_lock`` (readers
+        # are intentionally not behind that lock). The window is tiny —
+        # the reader closes its handle as soon as ``read_text`` finishes
+        # — so a small bounded retry recovers transparently. Without this
+        # retry, real multi-agent workloads on Windows would surface
+        # spurious ``write_failed`` errors under load.
+        replace_attempts = 0
+        max_replace_attempts = 20
+        while True:
+            try:
+                os.replace(tmp_path, target)
+                break
+            except PermissionError:
+                replace_attempts += 1
+                if replace_attempts >= max_replace_attempts:
+                    raise
+                time.sleep(0.01)
+        if fsync_strict:
+            # Strict mode: parent-dir fsync errors propagate so the caller
+            # learns the rename may not be durable across crash.
+            if os.name != "nt":
+                dir_fd = os.open(str(target.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        else:
+            _fsync_parent_dir(target)
+    except OSError as exc:
         try:
             tmp_path.unlink()
         except OSError:
             pass
+        # Promote disk-full / quota-exhausted / file-too-large to a
+        # dedicated exception type so callers can return a structured
+        # ``disk_full`` error code instead of a generic write_failed.
+        # Operators can then alert / failover on the specific signal.
+        if isinstance(exc, OSError) and _is_disk_full(exc):
+            raise DiskFullError(exc.errno, str(exc)) from exc
         raise
 
 
@@ -157,7 +293,8 @@ def write_same_record(
     """Re-render and atomically replace an existing record at the same path."""
     content = render_record_markdown(metadata, body)
     try:
-        _atomic_write_text(abs_path, content)
+        with file_lock(config.repo_root, abs_path):
+            _atomic_write_text(abs_path, content, fsync_strict=config.mcp_fsync_strict)
     except OSError as exc:
         return error_result("write_failed", f"failed to update record: {exc}")
 
@@ -218,12 +355,30 @@ def write_record_to_target(
 
     content = render_record_markdown(metadata, body)
     try:
-        _atomic_write_text(new_abs_path, content)
-        if not same_path:
-            try:
-                old_abs_path.unlink()
-            except FileNotFoundError:
-                pass
+        # Lock both old and new target paths so concurrent transitions
+        # (e.g. two agents both publishing the same candidate, or one
+        # archiving while another publishes) cannot interleave the
+        # rename + unlink pair below.
+        with file_lock(config.repo_root, new_abs_path):
+            if same_path:
+                _atomic_write_text(new_abs_path, content, fsync_strict=config.mcp_fsync_strict)
+            else:
+                with file_lock(config.repo_root, old_abs_path):
+                    # Re-check target existence under the lock to close
+                    # the TOCTOU window between the check above and the
+                    # write below.
+                    if new_abs_path.exists():
+                        return error_result(
+                            "target_exists",
+                            f"refusing to overwrite existing record at target: {rel_path}",
+                            path=rel_path,
+                            previous_path=old_rel_path,
+                        )
+                    _atomic_write_text(new_abs_path, content, fsync_strict=config.mcp_fsync_strict)
+                    try:
+                        old_abs_path.unlink()
+                    except FileNotFoundError:
+                        pass
     except OSError as exc:
         return error_result("write_failed", f"failed to update record: {exc}")
 

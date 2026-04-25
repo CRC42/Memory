@@ -359,7 +359,11 @@ def _pack_ranked_records(
         if not fitted_body:
             remember_drop(record, score_data, "budget_exhausted")
             continue
-        if len(fitted_body) < IMPORTANT_MEMORY_MIN_BODY_CHARS and body_text and fitted_body != IMPORTANT_MEMORY_FALLBACK_BODY:
+        if (
+            len(fitted_body) < IMPORTANT_MEMORY_MIN_BODY_CHARS
+            and len(body_text.strip()) >= IMPORTANT_MEMORY_MIN_BODY_CHARS
+            and fitted_body != IMPORTANT_MEMORY_FALLBACK_BODY
+        ):
             remember_drop(record, score_data, "insufficient_body_budget")
             continue
 
@@ -433,6 +437,12 @@ def _recent_snapshots(config: MemoryConfig, *, limit: int = 5) -> list[dict[str,
         }
         for entry in entries[:limit]
     ]
+
+
+def _section_summary(record: CompilableRecord, score_data: dict[str, Any]) -> dict[str, Any]:
+    result = _summary(record, score_data, include_body=False)
+    result["context_item_id"] = str(record.metadata.get("id", ""))
+    return result
 
 
 def memory_get_important_memories(
@@ -605,30 +615,30 @@ def memory_retrieve_context(
     records = collected["records"]
     facet_filtered = collected["facet_filtered"]
     ranked = _rank_records(config, records=facet_filtered, corpus_records=records, query=query)
-    if max_chars is not None or max_tokens is not None or max_items is not None:
-        selected, _important_memories, _dropped_candidates, _budget_report = _pack_ranked_records(
-            ranked,
-            max_chars=max_chars,
-            max_tokens=max_tokens,
-            max_items=max_items,
-            default_items=limit,
-        )
-    else:
-        selected = [(record, score_data) for record, score_data, _match_score, _combined in ranked[:limit]]
+    effective_max_chars = max_chars if max_chars is not None else IMPORTANT_MEMORY_DEFAULT_MAX_CHARS
+    effective_max_tokens = max_tokens if max_tokens is not None else IMPORTANT_MEMORY_DEFAULT_MAX_TOKENS
+    effective_max_items = max_items if max_items is not None else limit
+    selected, context_items, dropped_candidates, budget_report = _pack_ranked_records(
+        ranked,
+        max_chars=effective_max_chars,
+        max_tokens=effective_max_tokens,
+        max_items=effective_max_items,
+        default_items=limit,
+    )
 
     core_constraints = [
-        _summary(record, score_data, include_body=True)
+        _section_summary(record, score_data)
         for record, score_data in selected
         if str(record.metadata.get("cognitive_level", "")) in {"dao", "fa"}
         or str(record.metadata.get("record_kind", "")) in {"decision", "system_rule"}
     ][:limit]
     relevant_rules = [
-        _summary(record, score_data, include_body=True)
+        _section_summary(record, score_data)
         for record, score_data in selected
         if str(record.metadata.get("record_kind", "")) in {"decision", "procedure", "system_rule"}
     ][:limit]
     key_evidence = [
-        _summary(record, score_data, include_body=True)
+        _section_summary(record, score_data)
         for record, score_data in selected
         if str(record.metadata.get("record_kind", "")) in {"observation", "incident", "note", "event"}
     ][:limit]
@@ -643,16 +653,33 @@ def memory_retrieve_context(
             }
             if not selected_ids or selected_ids.intersection(ids):
                 open_conflicts.append(conflict)
+    evidence_refs = sorted(
+        {
+            ref
+            for item in context_items
+            for ref in (
+                *(str(r).strip() for r in item.get("source_refs", [])),
+                *(str(r).strip() for r in item.get("related_artifact_ids", [])),
+                str(item.get("path") or "").strip(),
+                str(item.get("id") or "").strip(),
+            )
+            if ref
+        }
+    )
 
     return ok_result(
         "context retrieved",
         query=query,
+        context_items=context_items,
         core_constraints=core_constraints,
         relevant_rules=relevant_rules,
         recent_snapshots=_recent_snapshots(config),
         key_evidence=key_evidence,
         open_conflicts=open_conflicts[:limit],
         next_steps=_next_steps(selected),
+        evidence_refs=evidence_refs,
+        dropped_candidates=dropped_candidates,
+        budget_report=budget_report,
         selected_records=[_summary(record, score_data) for record, score_data in selected],
         pipeline={
             "scope_filter": len(collected["scoped"]),
@@ -660,10 +687,11 @@ def memory_retrieve_context(
             "facet_filter": len(facet_filtered),
             "metadata_fts_recall": len(ranked),
             "importance_rerank": len(ranked),
+            "budget_first_packing": len(context_items),
             "context_assembly": len(selected),
         },
         stats={
             **collected["scan_stats"],
-            "returned_records": len(selected),
+            "returned_records": len(context_items),
         },
     )

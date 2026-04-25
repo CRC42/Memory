@@ -109,6 +109,8 @@ def _dispatch_memory_write(config: MemoryConfig, args: dict[str, Any]) -> dict[s
             create_if_missing=bool(args.get("create_if_missing", True)),
             reason=args.get("reason"),
             inject_user_tag=args.get("inject_user_tag"),
+            if_match=args.get("if_match"),
+            request_id=args.get("request_id"),
         )
     if operation == "record":
         err = _check_required(args, "content_markdown")

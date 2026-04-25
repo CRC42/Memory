@@ -38,12 +38,12 @@
 
 ### 0.3 当前能力边界
 
-当前版本已经解决了“多人协作下的高频写入冲突”“基础读写、检索、压缩、预算保护”“结构化记录治理”“P3 证据驱动上下文装配”和“深度健壮性边界”问题，但仍存在以下演进空间：
+当前版本已经解决了“默认开启多人协作安全策略”“多人协作下的高频写入冲突”“基础读写、检索、压缩、预算保护”“结构化记录治理”“P3 证据驱动上下文装配”和“深度健壮性边界”问题，但仍存在以下演进空间：
 
-- 内部实现仍有大文件：`memory_compiler.py`、`server.py` 需要继续拆分
+- 内部实现仍有大文件：`memory_compiler.py` 已完成 render / targets / scoring 首轮拆分，但 snapshot / review / rollback 编译逻辑仍可继续拆；`server.py` 也可继续拆分
 - `memory_retrieval` 已切到 `memory_corpus.CompilableRecord` / `compact_body`，不再依赖 compiler 私有符号；后续可继续把 corpus 与 compiler 之间的接口稳定化
 - Front Matter parser/dumper 仍在 `memory_records.py`，后续应抽 `memory_frontmatter.py`
-- `memory_retrieval` 仍是 `top_k` 驱动，尚未升级为严格 `budget-first` 的小上下文输出（`important_memories` 已 budget-first）
+- `memory_retrieval` 已升级为严格 `budget-first`：`retrieve_context` 与 `important_memories` 共用预算打包原语，并返回 `context_items` / `budget_report` / `dropped_candidates` / `evidence_refs`
 - `memory_context(operation="important_memories")` 已上线，提供小预算重要记忆输出，外部规则沉淀流程可直接消费
 - 当前文档仍把联合治理扩展写成主线，但新的产品方向应是“动态记忆供给”，而不是“插件内自动审查”
 - CLI / 管理 skill 需要承接 guard、backup、compact、index、governance、snapshot review 等低频管理动作
@@ -759,8 +759,11 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 - 编译时写入 `.ai-memory/compile-cache/` manifest
 - 编译参数执行显式类型校验，`include_scopes` / `include_statuses` / `preferred_tags` 必须为 `list[str]`
 - 配置化 tag schema 通过显式参数传递，避免多配置或多人场景下的隐式全局状态串扰
+- 多人模式默认启用：缺省配置下 `memory-bank/activeContext.md` 读写重定向到 `memory-bank/activeContext/{user}.md`；`progress.md` / `techContext.md` / `systemPatterns.md` / `projectbrief.md` 默认 append-only。旧配置即便覆盖了 `guard.targets` 且未写 `write_policy`，也会通过 `multi_user.user_scoped_paths` / `shared_paths_policy` 兜底执行。
 
-### 10.5 安全与原子性保证（v0.4.1 加固）
+### 10.5 安全与原子性保证（v0.4.1 起、v0.5.4–0.5.6 进一步加固）
+
+> 本节概述加固思路；v0.5.x 逐版本落地明细见 §15.8 以及 DEVLOG。
 
 - 记录写入：`memory_write_record` 用 `os.open(..., O_CREAT | O_EXCL | O_WRONLY)` 创建文件，关闭 already-exists 检查与写入之间的 TOCTOU 窗口；并发同 id 写入由 OS 仲裁，败者收到 `already_exists`。
 - 状态迁移：`memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record` 全部走 "临时文件 → `os.replace` → 删除旧路径" 顺序，任意一步失败都不会出现两份或丢失记录。
@@ -1254,7 +1257,7 @@ importance = governance + usage + impact + novelty + conflict + decay
 - 已实现 `memory_trace_lineage`
 - 已实现 `memory_context(operation="list_conflicts")`，用于列出 `conflicts_with` 冲突边、缺失目标和 resolved 状态
 - 已实现 `memory_context(operation="compare_snapshots")`，基于 compile cache 对比两个 snapshot 的 added / removed / persisted record ids
-- 已实现 `memory_context(operation="retrieve_context")`，按固定 pipeline 输出上下文装配结构
+- 已实现 `memory_context(operation="retrieve_context")`，按固定 pipeline 输出 budget-first 上下文装配结构
 
 `memory_retrieve_context` 固定顺序：
 
@@ -1263,13 +1266,14 @@ importance = governance + usage + impact + novelty + conflict + decay
 3. facet filter
 4. metadata / FTS recall
 5. importance rerank
-6. context assembly
+6. budget-first packing
+7. context assembly
 
-当前局限：
+当前输出策略：
 
-- 仍以 `top_k` 为主，而不是严格预算优先
-- `core_constraints` / `relevant_rules` / `key_evidence` 可能重复展开同一条记录
-- 返回结构更像“上下文草图”，还不是稳定的小预算“重要记忆输出”
+- `context_items` 是唯一正文展开层，受 `max_chars` / `max_tokens` / `max_items` 严格约束。
+- `core_constraints` / `relevant_rules` / `key_evidence` 保留为分类索引，只返回元数据和 `context_item_id`，避免同一条记录正文重复占预算。
+- 返回 `budget_report`、`dropped_candidates`、`evidence_refs`，与 `important_memories` 共用预算打包原语。
 
 输出结构：
 
@@ -1383,10 +1387,10 @@ importance = governance + usage + impact + novelty + conflict + decay
 
 结合 `ToolTest/MCP/Memory` 当前已落地的 P3 首版与 hardening 结果，建议按以下顺序推进：
 
-0. **最高优先级：把 `retrieve_context` 升级为严格 budget-first**
-   - `memory_context(operation="important_memories")` 已上线（v0.5.2），返回体受 `max_tokens` / `max_chars` / `max_items` 约束，输出最重要记忆、证据引用、丢弃原因和预算报告。
-   - 待做：把 `retrieve_context` 的预算路径与 `important_memories` 对齐，不再以 `top_k` 为主；并扩展 `evidence_refs` 来源（不仅 `source_refs`）。
-   - `retrieve_context` 保持简洁；详细结果通过 `important_memories` 提供。
+0. **已完成：`retrieve_context` 升级为严格 budget-first**
+   - `memory_context(operation="important_memories")` 已上线，返回体受 `max_tokens` / `max_chars` / `max_items` 约束，输出最重要记忆、证据引用、丢弃原因和预算报告。
+   - `memory_context(operation="retrieve_context")` 已对齐同一套预算路径，不再以 `top_k` 作为主控制；`top_k` 仅作为未显式传 `max_items` 时的条数上限。
+   - `retrieve_context` 保持简洁：正文集中在 `context_items`，分类段落只做索引；详细外部沉淀信号仍通过 `important_memories` 提供。
 1. **MCP 对外接口收敛**（首版已完成）
    - 默认 MCP 只暴露 `memory_read`、`memory_write`、`memory_context` 三个 facade tools。
    - legacy/admin 兼容工具降为内部函数或显式配置暴露。
@@ -1397,7 +1401,7 @@ importance = governance + usage + impact + novelty + conflict + decay
 4. 已补齐 `Front Matter` 解析、记录落盘规则、SQLite FTS 派生索引、schema v2 字段。
 5. 已实现 `runtime digest`、`task handoff`、`system_digest`、`publish_queue` 和 P3 snapshot/review/rollback/dao-fa-shu 编译目标。
 6. P3 首版已完成：schema v2、时间快照、谱系关系、importance scoring、facet、回顾入口和上下文装配。
-7. 下一步优先做内部拆分与重要记忆供给增强：拆 `memory_compiler.py` / `server.py`，抽 `memory_frontmatter.py`，把 `retrieve_context` 升级为严格 budget-first（`memory_corpus.py` 抽离已完成 v0.5.2）。
+7. 已完成多轮内部拆分与并发安全加固：`memory_compiler.py` 已拆出 cache / render / targets / scoring / writer / views，主文件已降为 ~330 行 thin orchestration router（v0.5.9），`server.py` 已拆为 `server_descriptions` / `server_tools` / `server_dispatch`（v0.5.3），`memory_frontmatter.py` / `memory_budget.py` / `memory_corpus.py` / `memory_locks.py` / `memory_request_id.py` 已拆出；`retrieve_context` 已升级为严格 budget-first（v0.5.8）；管理 skill `memory-admin` / `memory-snapshot-review` 首版上线（v0.5.9）。
 8. 治理相关能力保留为兼容层：validate / publish / archive / promote / degrade 不再作为主路线扩张。
 9. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
 10. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
@@ -1408,7 +1412,7 @@ importance = governance + usage + impact + novelty + conflict + decay
 
 - `memory_records.py`：已扩 schema v2，支持 snapshot、lineage、tier、cognitive_level、facet。
 - `memory_record_index.py`：已索引 schema v2 metadata / facets，并支持损坏 SQLite 索引自愈。
-- `memory_compiler.py`：已扩成 runtime / snapshot / review / rollback / dao-fa-shu compiler。
+- `memory_compiler.py`：保留 compile 主入口与 snapshot / review / rollback / dao-fa-shu 编译流程；render / targets / scoring 已拆出独立模块。
 - `memory_governance.py`：已保留 validate / publish / archive 治理；promote / degrade 进入 P3+。
 - `memory_maintenance.py`：已支持 health / migrate / tombstone delete。
 - `memory_events.py`：继续作为审计日志底层。
@@ -1419,6 +1423,18 @@ importance = governance + usage + impact + novelty + conflict + decay
 - `memory_lineage.py`
 - `memory_retrieval.py`
 - `memory_record_io.py`
+- `memory_corpus.py`（v0.5.2：CompilableRecord / compact_body / iter）
+- `memory_frontmatter.py`（v0.5.3：Front Matter parser/dumper）
+- `memory_budget.py`（v0.5.3：budget 原语，retrieve_context / important_memories 共享）
+- `memory_compiler_cache.py`（v0.5.3：compile cache + usage stats IO）
+- `memory_compile_targets.py`（v0.5.8： target 常量 / slug / compiled path）
+- `memory_compile_render.py`（v0.5.8：runtime / task / system / publish render）
+- `memory_compile_scoring.py`（v0.5.8：record time / sort key / scored records）
+- `memory_compile_writer.py`（v0.5.9：cache_key + write_compiled_view 纯 IO 层）
+- `memory_compile_views.py`（v0.5.9：snapshot/level/review/rollback compile 视图 + memory_compare_snapshots）
+- `memory_locks.py`（v0.5.4：跨进程 sidecar 文件锁，POSIX fcntl / Windows msvcrt + sha1 路径 + 同线程引用计数可重入）
+- `memory_request_id.py`（v0.5.4：UUID7 + content_sha 供乐观锁）
+- `server_descriptions.py` / `server_tools.py` / `server_dispatch.py`（v0.5.3：`server.py` 拆分）
 
 暂不新增独立 `memory_snapshots.py` / `memory_facets.py`，snapshot 逻辑先收在 `memory_compiler.py`，facet 逻辑先由 record schema / index / retrieval 共同承载。后续内部拆分时再按复杂度拆出。
 
@@ -1441,12 +1457,12 @@ P0-4 已完成（2026-04-23）：
 - 覆盖并发 overwrite、残留 `.tmp`、坏 Front Matter 跳过、空 corpus not_found、路径攻击、Unicode 往返、全局预算拒绝、非法 record_kind 不落盘。
 - 当前 Memory 测试为 146 全部通过。
 
-P0-1 / P0-2 计划（未实施）：
+P0-1 / P0-2 进度：
 
-- P0-1：拆 `memory_compiler.py`（cache / render / targets / 入口）。
-- P0-2：拆 `server.py`（schema / dispatch / admin / main）。
+- P0-1 已完成（v0.5.3 / v0.5.8 / v0.5.9）：`memory_compiler.py` 已拆出 cache / render / targets / scoring / writer / views；snapshot / level / review / rollback 全部出栈，主文件由 ~774 行降到 ~330 行的 thin orchestration router。
+- P0-2 已完成（v0.5.3）：`server.py` 从 1348 行降到 ~102 行 thin entry-point；拆出 `server_descriptions.py`（常量 / 描述）、`server_tools.py`（facade / legacy schema）、`server_dispatch.py`（参数校验 / 路由）；back-compat re-exports 保证 11 个测试模块旧 import 继续生效。
 - P1-3 已完成（v0.5.2）：`CompilableRecord` 与 `compact_body` 已上提到 `memory_corpus.py`，`memory_retrieval` 不再反向依赖 compiler 私有函数。
-- P1-5：把 Front Matter parser/dumper 抽到 `memory_frontmatter.py`，便于未来替换实现。
+- P1-5 已完成（v0.5.3）：Front Matter parser/dumper 已抽到 `memory_frontmatter.py`，`memory_records.py` 通过 re-export 保持符号兑现。
 
 P0-2 鲁棒性补丁（v0.5.2）：
 
@@ -1531,14 +1547,71 @@ P4 测试：
 - `memory_context(operation="important_memories")` 首版上线
 - 当前测试数 146
 
-`v0.5.5`：多人联合治理版
+`v0.5.3`：单进程并发与索引去重整理版（已上线）
 
-- conflict / supersede / promote / degrade
-- reviewer / owner / publisher 角色
-- dao 层晋升约束强化
-- snapshot review / governance 管理 skill
+- 内部模块继续解耦：`memory_compiler_cache` / `memory_record_index` / `memory_writer` 边界澄清
+- 索引重建去重 + 并发写场景的同进程线程互斥
+- 当前测试数 191
 
-`v0.6.0`：LLM 软增强版
+`v0.5.4`：单机多 agent + 单 mcp 规格并发安全版（已上线）
+
+- 跨进程 sidecar 文件锁 `memory_locks.file_lock`（POSIX fcntl / Windows msvcrt，sha1 路径 → `.ai-memory/locks/`）
+- SQLite WAL + busy_timeout=30000ms
+- 乐观锁 `if_match=<sha256>` + `error="conflict"` 回退
+- `request_id = str(uuid.uuid7())`（Python 3.14 原生）
+- audit event 强制写入 request_id / new_sha / if_match
+- 当前测试数 196
+
+`v0.5.5`：写入崩溃安全 + fsync 严格模式版（已上线）
+
+- `_atomic_write_text`：同目录 tmp + `O_CREAT|O_EXCL|O_WRONLY`（+`O_BINARY`）+ 数据 fsync + `os.replace` + 父目录 fsync（POSIX）
+- 配置开关 `mcp.fsync_strict`：true 时 fsync OSError 直接传播，保证崩溃 / 断电后无外部可见破损写入
+- `memory_writer` / `memory_compiler_cache.usage_stats` / `memory_maintenance.tombstones` / `memory_events` 全部走统一 atomic 路径
+- 当前测试数 204
+
+`v0.5.6`：多 agent 严格压力 + 锁/磁盘 P0-P2 守卫版（已上线）
+
+- 9 项多 agent 压力测试（spawn 多进程、events.jsonl 真追加、if_match 重试、混合负载、长路径）
+- bug 修复：`file_lock` 在 yield 异常路径上 fd 泄漏（重写为嵌套 try/finally）
+- bug 修复：`memory_events` 原 `msvcrt.locking` 1 字节锁锁的是各自当前位置 → 多进程不互斥；改用统一 `file_lock`
+- Windows `os.replace` 在读者持有无 `FILE_SHARE_DELETE` 句柄时短暂 PermissionError → 20×10ms 重试
+- `PathManager` 长路径 `\\?\` / `\\?\UNC\` 前缀规范化；`safe_read_text` 有界重试覆盖 Windows rename 短窗口
+- P0/P2 follow-up：`_acquire_os_lock` 改 `except BaseException`，`KeyboardInterrupt` / `SystemExit` 不再泄漏 sidecar fd；新增 `DiskFullError(OSError)` + `_DISK_FULL_ERRNOS = {ENOSPC, EDQUOT, EFBIG}`，`memory_write` 返回结构化 `error="disk_full"` + `errno`
+- 当前测试数 216
+
+`v0.5.7`：默认多人安全策略版（已上线）
+
+- `multi_user.enabled` 默认改为 `true`，新工作区不需要额外配置即可按用户分流 `activeContext.md`
+- `memory_write` 的策略判断增加 `multi_user.user_scoped_paths` 兜底，兼容旧 `.ai-memory/config.json` 覆盖 `guard.targets` 但没有 `write_policy` 的情况
+- 共享 warm 文件继续通过默认 `shared_paths_policy` 强制 overwrite → append 降级
+- 新增 2 项默认多人模式回归测试
+- 当前测试数 218
+
+`v0.5.8`：retrieve_context budget-first + compiler 首轮拆分版（已上线）
+
+- `memory_retrieve_context` 始终先按预算打包 `context_items`，默认预算复用 important-memory 原语；`top_k` 仅作为默认 `max_items`
+- `retrieve_context` 返回 `budget_report` / `dropped_candidates` / `evidence_refs`，分类段落不再重复展开正文
+- 新增 `memory_compile_targets.py`、`memory_compile_render.py`、`memory_compile_scoring.py`
+- `memory_compiler.py` 主入口由约 929 行降到约 724 行；对外 compile / digest / snapshot 行为不变
+- 当前测试数 218
+
+`v0.5.9`：compiler 二轮拆分 + 管理 skill 首版（已上线）
+
+- `memory_compiler.py` 二轮拆分：拆出 `memory_compile_writer`（cache_key + write_compiled_view 纯 IO 层）与 `memory_compile_views`（snapshot/level/review/rollback compile 视图 + memory_compare_snapshots）
+- 主文件由 ~774 行降到 ~330 行的 thin orchestration router（13→3 函数：`_matches_filter` / `memory_compile` / `memory_get_runtime_digest`）；通过 `__all__` re-export 保持 `memory_compare_snapshots` / `find_compile_cache_entry` / `get_record_last_used_at` / `load_compile_cache_entries` 对 server_dispatch 与测试的兼容
+- 死代码清理：`memory_events.py` 移除遗留的 `_lock_file` / `_unlock_file` / 未用 `import sys`
+- 新增管理 skill：`.github/skills/memory-admin/SKILL.md`（guard / backup / compact / health / index / governance / snapshot 维护流程）与 `.github/skills/memory-snapshot-review/SKILL.md`（review_queue 走查 + 历史快照重放）
+- 当前测试数 218（无回归）
+
+`v0.5.10`：管理 CLI 入口版（已上线）
+
+- 新增 `servers/memory_server/cli.py`：argparse 一级入口，覆盖 `guard` / `health` / `backup` / `compact` / `rebuild-index` / `migrate` / `validate` / `publish` / `archive` / `delete` / `compile` / `snapshot-rebuild` / `runtime-digest`
+- 默认 JSON 输出（`--pretty` 缩进）；exit code 0/1 与 `ok=true/false` 一致，便于 CI / shell 脚本消费
+- skill `memory-admin` / `memory-snapshot-review` 同步改为 CLI 调用范式，admin 能力不再依赖 `mcp.expose_admin_tools=true`
+- 新增 `tests/memory_server/test_cli.py`：9 项 CLI 行为回归（health / guard / backup / rebuild-index / compile / snapshot-rebuild / pretty / 错误码）
+- 当前测试数 227
+
+`v0.6.0`：LLM 软增强版（规划中）
 
 - query rewrite
 - tag / facet 推荐
@@ -1589,11 +1662,11 @@ P4 测试：
 
 下一阶段优先级：
 
-- 最高优先级：把 `retrieve_context` 与 `important_memories` 的预算路径对齐为严格 `budget-first`、可解释、可控尺寸的输出接口（`important_memories` 已上线）。
+- 已完成：`retrieve_context` 与 `important_memories` 的预算路径对齐为严格 `budget-first`、可解释、可控尺寸的输出接口。
 - 当前默认使用方式为免维护：普通用户不需要执行任何 maintenance / governance / admin 操作。
 - MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
 - P3 首版已完成：时间快照、谱系关系、importance scoring、facet、分层召回、上下文装配和 dao/fa/shu 视图已落地。
-- 当前下一步是内部拆分：拆 `memory_compiler.py` / `server.py`，抽 `memory_frontmatter.py`；`memory_corpus.py` 已在 v0.5.2 完成。
+- 当前下一步是管理 skill 与 `memory_compiler.py` 长尾拆分：继续拆 snapshot / review / rollback 逻辑、补齐管理 skill；`memory_corpus.py` 已在 v0.5.2 完成，`memory_frontmatter.py` / `memory_budget.py` / `server_*` 拆分已在 v0.5.3 完成，render / targets / scoring 已在 v0.5.8 完成，并叠加 v0.5.4–20.5.6 的并发 / 崩溃安全加固（块跨进程 sidecar 文件锁、SQLite WAL、乐观锁 if_match、fsync_strict、disk_full 结构化错误、PathManager 长路径归一化）。
 - 插件内治理扩展降级为兼容方向：保留 validate / publish / archive 能力，但不再把自动审查和规则晋升作为主路线。
 - P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
 - P5 最后做本地 RAG / 向量补召回，且只作为 metadata / FTS 后的语义补充。

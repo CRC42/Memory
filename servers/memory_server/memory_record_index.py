@@ -8,6 +8,7 @@ from typing import Any
 
 from .memory_config import MemoryConfig
 from .memory_paths import PathManager, PathSecurityError
+from .memory_record_io import safe_read_text
 from .memory_records import parse_record_markdown
 from .memory_result import error_result, ok_result
 
@@ -76,9 +77,29 @@ def build_search_text(
 
 
 def _connect(config: MemoryConfig) -> sqlite3.Connection:
+    """Open the FTS database with WAL + busy-timeout for multi-process safety.
+
+    WAL (Write-Ahead Logging) lets readers continue while a writer holds
+    the write lock, which is exactly the pattern when multiple MCP
+    server processes (one per VS Code window) hit the same workspace
+    index. ``busy_timeout`` then gives concurrent writers a bounded
+    grace period before SQLite raises ``database is locked``.
+
+    Both PRAGMAs are idempotent and cheap; they do not require schema
+    changes and are safe to apply on every connect.
+    """
     path = _db_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.DatabaseError:
+        # Read-only filesystems / corrupted db: callers will detect via
+        # _is_index_healthy and rebuild from scratch.
+        pass
+    return conn
 
 
 def _is_index_healthy(config: MemoryConfig) -> bool:
@@ -236,7 +257,7 @@ def _iter_record_files(config: MemoryConfig) -> tuple[list[tuple[str, dict[str, 
     for abs_path, rel_path in manager.iter_files(scopes=["memory-bank"], include_paths=["memory-bank/**/*.md"]):
         stats["scanned_files"] += 1
         try:
-            text = abs_path.read_text(encoding="utf-8", errors="replace")
+            text = safe_read_text(abs_path, errors="replace")
             metadata, body = parse_record_markdown(text)
         except (OSError, ValueError):
             stats["skipped_non_records"] += 1
@@ -405,7 +426,7 @@ def memory_update_index(config: MemoryConfig, *, paths: list[str]) -> dict[str, 
         for path in paths:
             abs_path = manager.resolve(path, must_exist=True, must_be_file=True)
             rel_path = manager.to_repo_relative(abs_path)
-            text = abs_path.read_text(encoding="utf-8", errors="replace")
+            text = safe_read_text(abs_path, errors="replace")
             metadata, body = parse_record_markdown(text)
             if not metadata.get("id") or not metadata.get("record_kind"):
                 skipped += 1

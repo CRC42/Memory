@@ -36,7 +36,7 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
     "backups_dir": ".ai-memory/backups",
     "temp_dir": ".ai-memory/temp",
     "multi_user": {
-        "enabled": False,
+        "enabled": True,
         "user_scoped_paths": [
             "memory-bank/activeContext.md",
         ],
@@ -79,6 +79,7 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
     },
     "mcp": {
         "expose_admin_tools": False,
+        "fsync_strict": False,
     },
 }
 
@@ -129,6 +130,7 @@ class MemoryConfig:
     tag_allowed_tags: list[str] | None = None
     tag_schema_version: str = "v1"
     mcp_expose_admin_tools: bool = False
+    mcp_fsync_strict: bool = False
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -306,4 +308,5 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         tag_allowed_tags=_string_list(tag_schema_cfg.get("allowed_tags")),
         tag_schema_version=str(tag_schema_cfg.get("version", "v1")),
         mcp_expose_admin_tools=bool(mcp_cfg.get("expose_admin_tools", False)),
+        mcp_fsync_strict=bool(mcp_cfg.get("fsync_strict", False)),
     )

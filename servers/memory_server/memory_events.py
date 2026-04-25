@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
+from .memory_locks import file_lock
 
 # 缓存：避免每次调用都读文件
 _vscode_user_cache: dict[str, str | None] = {}
@@ -55,29 +55,6 @@ def get_current_user(repo_root: Path | None = None) -> str:
     return os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
 
 
-def _lock_file(handle) -> None:  # type: ignore[no-untyped-def]
-    """Acquire an exclusive lock on the file handle (platform-aware)."""
-    if sys.platform == "win32":
-        import msvcrt
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-    else:
-        import fcntl
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(handle) -> None:  # type: ignore[no-untyped-def]
-    """Release the exclusive lock on the file handle (platform-aware)."""
-    if sys.platform == "win32":
-        import msvcrt
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass  # lock already released
-    else:
-        import fcntl
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def append_event(config: MemoryConfig, event_type: str, payload: dict[str, Any], status: str = "ok") -> None:
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -88,14 +65,28 @@ def append_event(config: MemoryConfig, event_type: str, payload: dict[str, Any],
     }
     line = json.dumps(record, ensure_ascii=False) + "\n"
     config.events_file.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_events_if_needed(config)
-    with config.events_file.open("a", encoding="utf-8") as handle:
-        _lock_file(handle)
-        try:
+    # Cross-process exclusive lock for the whole rotate-then-append
+    # critical section. Without this, two processes can race in
+    # ``_rotate_events_if_needed`` (one renames the active file while
+    # the other is mid-write into a now-orphaned handle), losing
+    # events. The Windows ``msvcrt.locking(fd, LK_LOCK, 1)`` approach
+    # locks 1 byte at the *current* file position; with two processes
+    # opening the file in append mode at different EOF offsets, the
+    # byte ranges do not overlap and the lock provides no exclusion.
+    with file_lock(config.repo_root, config.events_file):
+        _rotate_events_if_needed(config)
+        with config.events_file.open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
-        finally:
-            _unlock_file(handle)
+            # Durability: ensure the audit line reaches disk before the
+            # caller observes "ok". Best-effort by default; in
+            # ``mcp.fsync_strict`` mode an OSError propagates so
+            # callers can surface it.
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                if getattr(config, "mcp_fsync_strict", False):
+                    raise
 
 
 # Default rotation thresholds; can be overridden by env var for emergencies.

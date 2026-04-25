@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -12,9 +13,41 @@ class PathSecurityError(ValueError):
     pass
 
 
+# Windows extended-length path prefix. ``Path.resolve()`` may produce paths
+# with this prefix when the original string is long enough or when certain
+# tmp / junction structures are involved (notably under pytest's tmp_path on
+# some Windows configurations). Mixing prefixed and non-prefixed paths in
+# the same comparison breaks ``Path.relative_to`` with ``ValueError``.
+_WIN_LONG_PREFIX = "\\\\?\\"
+_WIN_LONG_UNC_PREFIX = "\\\\?\\UNC\\"
+
+
+def _strip_long_path_prefix(value: str) -> str:
+    """Return ``value`` with any Windows ``\\\\?\\`` prefix stripped."""
+    if sys.platform != "win32":
+        return value
+    if value.startswith(_WIN_LONG_UNC_PREFIX):
+        # \\?\UNC\server\share\... → \\server\share\...
+        return "\\\\" + value[len(_WIN_LONG_UNC_PREFIX):]
+    if value.startswith(_WIN_LONG_PREFIX):
+        return value[len(_WIN_LONG_PREFIX):]
+    return value
+
+
+def _normalize_path(path: Path) -> Path:
+    """Resolve ``path`` and strip any ``\\\\?\\`` extended-length prefix.
+
+    Used at every PathManager boundary so two paths that refer to the same
+    on-disk file always compare equal regardless of which API produced
+    them.
+    """
+    resolved_str = str(path.resolve())
+    return Path(_strip_long_path_prefix(resolved_str))
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
-        path.relative_to(root)
+        _normalize_path(path).relative_to(_normalize_path(root))
         return True
     except ValueError:
         return False
@@ -37,9 +70,9 @@ class PathManager:
             raise PathSecurityError(f"path contains illegal character: {path_value!r}")
         candidate = Path(path_value)
         if candidate.is_absolute():
-            resolved = candidate.resolve()
+            resolved = _normalize_path(candidate)
         else:
-            resolved = (self.config.repo_root / candidate).resolve()
+            resolved = _normalize_path(self.config.repo_root / candidate)
 
         if not any(_is_within(resolved, root) for root in self.config.allowed_roots):
             raise PathSecurityError(f"path is outside allowed_roots: {path_value}")
@@ -50,7 +83,9 @@ class PathManager:
         return resolved
 
     def to_repo_relative(self, path: Path) -> str:
-        return path.resolve().relative_to(self.config.repo_root).as_posix()
+        normalized = _normalize_path(path)
+        repo_root = _normalize_path(self.config.repo_root)
+        return normalized.relative_to(repo_root).as_posix()
 
     def _is_excluded(self, repo_rel_path: str) -> bool:
         normalized = repo_rel_path.replace("\\", "/").strip("/")
@@ -98,15 +133,25 @@ class PathManager:
                 current = Path(current_dir)
                 kept_dirs: list[str] = []
                 for dir_name in dirs:
-                    candidate_dir = (current / dir_name).resolve()
-                    rel_dir = self.to_repo_relative(candidate_dir)
+                    candidate_dir = _normalize_path(current / dir_name)
+                    try:
+                        rel_dir = self.to_repo_relative(candidate_dir)
+                    except ValueError:
+                        # Path leaked out of repo_root after normalization
+                        # (symlink to elsewhere, or a stale ``\\?\`` mismatch
+                        # we couldn't reconcile). Treat as excluded so the
+                        # iteration never blows up downstream callers.
+                        continue
                     if not self._is_excluded(rel_dir):
                         kept_dirs.append(dir_name)
                 dirs[:] = kept_dirs
 
                 for file_name in files:
-                    abs_path = (current / file_name).resolve()
-                    rel_path = self.to_repo_relative(abs_path)
+                    abs_path = _normalize_path(current / file_name)
+                    try:
+                        rel_path = self.to_repo_relative(abs_path)
+                    except ValueError:
+                        continue
                     if self._is_excluded(rel_path):
                         continue
                     if not self._matches_patterns(rel_path, include_paths):

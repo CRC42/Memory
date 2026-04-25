@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from .memory_config import MemoryConfig
 from .memory_events import get_current_user
 from .memory_paths import PathManager, PathSecurityError, resolve_user_path
+from .memory_record_io import safe_read_text
 from .memory_result import error_result, ok_result
 
 
@@ -45,7 +46,7 @@ def memory_get(
     except IsADirectoryError as exc:
         return error_result("invalid_path", str(exc))
 
-    text = resolved.read_text(encoding="utf-8", errors="replace")
+    text = safe_read_text(resolved, errors="replace")
     lines = text.splitlines(keepends=True)
     total_lines = len(lines)
 

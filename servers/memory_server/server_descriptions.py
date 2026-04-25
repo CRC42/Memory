@@ -6,7 +6,7 @@ Extracted from `server.py` (P1-A). Pure data; no runtime side effects.
 from __future__ import annotations
 
 SERVER_NAME = "generic-memory-mcp"
-SERVER_VERSION = "0.5.3"
+SERVER_VERSION = "0.5.8"
 
 # ── Static base descriptions (functional semantics only) ────────────────
 
@@ -17,8 +17,8 @@ _BASE_DESCRIPTIONS: dict[str, str] = {
     ),
     "memory_get": (
         "Read memory file content with optional line range and truncation. "
-        "When multi_user is enabled, user_scoped paths (e.g. activeContext.md) "
-        "are automatically redirected to the per-user file (activeContext/{user}.md)."
+        "Multi-user is enabled by default: user_scoped paths (e.g. activeContext.md) "
+        "automatically redirect to the per-user file (activeContext/{user}.md)."
     ),
     "memory_search": (
         "Run keyword search across memory files with heading-weighted scoring and context windows."
@@ -51,7 +51,7 @@ _BASE_DESCRIPTIONS: dict[str, str] = {
         "Write content to a memory file with safety controls. "
         "Supports overwrite and append modes. Auto-backup, atomic write, "
         "per-file guard + global budget check. Rejects write if total budget exceeded. "
-        "Multi-user: user_scoped paths auto-redirect to per-user files; "
+        "Multi-user defaults on: user_scoped paths auto-redirect to per-user files; "
         "append_only paths force overwrite→append downgrade; "
         "all writes include user identity tags for traceability."
     ),

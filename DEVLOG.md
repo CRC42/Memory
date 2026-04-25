@@ -1,5 +1,375 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-24 (v0.5.10: 管理 CLI 入口)
+
+> **状态：admin 能力新增一级 CLI（`python -m servers.memory_server.cli`），覆盖 guard / health / backup / compact / rebuild-index / migrate / validate / publish / archive / delete / compile / snapshot-rebuild / runtime-digest。skill `memory-admin` / `memory-snapshot-review` 已同步切换到 CLI 范式。新增 9 项 CLI 回归测试，整体 227 passed。**
+
+### 范围
+
+1. **CLI 入口（`servers/memory_server/cli.py`）**
+   - argparse 子命令；默认输出 JSON，`--pretty` 切到缩进；exit code 与 `ok` 字段一致（`ok=true → 0`，否则 `1`）。
+   - 复用现有 in-process 函数：`memory_guard_check` / `memory_health_check` / `backup_files` / `compact_memory` / `memory_rebuild_index` / `memory_migrate_records` / `memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record` / `memory_delete_record` / `memory_compile` / `memory_get_runtime_digest`，无重复实现。
+   - 不再要求 `mcp.expose_admin_tools=true`；为 CI / shell 自动化提供稳定入口。
+
+2. **skill 同步**
+   - `.github/skills/memory-admin/SKILL.md`：工具矩阵改为 CLI 命令 + in-process 等价；标准维护流程改写为 PowerShell 直跑；rollback 配方改用 CLI。
+   - `.github/skills/memory-snapshot-review/SKILL.md`：review 循环、历史快照重放、verification 全部切到 CLI。
+
+3. **测试**
+   - 新增 `tests/memory_server/test_cli.py`：9 项行为回归（health / guard / backup / rebuild-index / compile / snapshot-rebuild / pretty / 错误码）。
+   - 整体 218 → 227 passed，无回归。
+
+4. **文档**
+   - 设计文档 §15.8 加入 v0.5.10。
+   - README §1 状态行升 v0.5.10、§5 后续计划移除已完成的 CLI 入口项。
+
+### 验证
+
+```powershell
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+```
+
+结果：227 passed in ~15s。
+
+---
+
+## 2026-04-24 (v0.5.9: compiler 二轮拆分 + 管理 skill 首版)
+
+> **状态：在 v0.5.8 基础上完成 compiler 二轮拆分与一致性 review。`memory_compiler.py` 由约 774 行降到约 330 行 thin orchestration router；新增 `memory_compile_writer` / `memory_compile_views` 两个模块；`memory_events.py` 清理遗留死代码；新增两份 `.github/skills/memory-*` 管理 skill。测试保持 218 passed，无回归。**
+
+### 范围
+
+1. **`memory_compiler.py` 二轮拆分**
+   - 新增 `memory_compile_writer.py`：cache_key + write_compiled_view 纯 IO 层。
+   - 新增 `memory_compile_views.py`：snapshot / level digest / review queue / rollback context 四个 compile 视图 + `memory_compare_snapshots`。
+   - `memory_compiler.py` 现在只剩 `_matches_filter` / `memory_compile`（router）/ `memory_get_runtime_digest` 三个核心函数。
+   - 通过 `__all__` re-export `memory_compare_snapshots` / `find_compile_cache_entry` / `get_record_last_used_at` / `load_compile_cache_entries`，保证 `server_dispatch.py`、`memory_retrieval.py` 与所有现存测试模块的旧 import 继续生效。
+
+2. **死代码清理**
+   - `memory_events.py` 移除遗留的 `_lock_file` / `_unlock_file` 与未使用的 `import sys`（v0.5.6 起所有事件追加都已统一走 `memory_locks.file_lock`）。
+
+3. **管理 skill 首版**
+   - 新增 `.github/skills/memory-admin/SKILL.md`：guard / backup / compact / health / index / migrate / governance 的工具矩阵、标准维护流程、故障码解读、回滚配方。
+   - 新增 `.github/skills/memory-snapshot-review/SKILL.md`：review_queue 编译 → 候选走查 → validate/publish/archive → 重新编译 digest → 快照对比的固定循环；含历史快照可重放说明。
+
+4. **文档同步**
+   - 设计文档 §15.6 / §15.6.1 / §15.8 加入 v0.5.9 条目，§15.5 更新为「下一步：LLM 软增强 / 向量补召回」。
+
+### 验证
+
+```powershell
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+```
+
+结果：218 passed in ~15s（与 v0.5.8 同基线，无回归）。
+
+### 风险与后续
+
+- compiler router 的对外 surface 完全保持兼容；唯一行为差异是 `memory_compare_snapshots` 现在从 `memory_compile_views` 实现，但通过 re-export 保持原 import path 可用。
+- 管理 skill 文档以「先用现有 admin tool / Python REPL」为今天的可执行路径；正式 CLI 入口仍是后续任务（计划 v0.6.x）。
+
+---
+
+## 2026-04-24 (v0.5.8: retrieve_context budget-first + compiler 首轮拆分)
+
+> **状态：完成 README 后续计划 1/2。`retrieve_context` 与 `important_memories` 共用预算打包路径；`memory_compiler.py` 拆出 targets / render / scoring 三个模块。测试保持 218 passed。**
+
+### 范围
+
+1. **`retrieve_context` 严格 budget-first**
+   - `memory_retrieve_context` 现在始终先通过 `_pack_ranked_records` 打包 canonical `context_items`。
+   - 默认预算复用 important-memory 原语；`top_k` 只作为未显式传 `max_items` 时的条数上限。
+   - 返回体新增 `context_items`、`budget_report`、`dropped_candidates`、`evidence_refs`。
+   - `core_constraints` / `relevant_rules` / `key_evidence` 保留为分类索引，但不再重复展开正文，避免同一记录正文多处占用上下文预算。
+   - 修正短正文记录被 `IMPORTANT_MEMORY_MIN_BODY_CHARS` 误丢弃的问题：只有原正文足够长但预算裁剪过短时才判为 `insufficient_body_budget`。
+
+2. **`memory_compiler.py` 首轮拆分**
+   - 新增 `memory_compile_targets.py`：compile target 常量、slug、compiled path 规则。
+   - 新增 `memory_compile_render.py`：runtime/task/system/publish Markdown render 与 legacy memory section。
+   - 新增 `memory_compile_scoring.py`：record time、sort key、scored records、score summary。
+   - `memory_compiler.py` 继续保留对外入口和 snapshot / review / rollback / dao-fa-shu 编译流程，主文件从约 929 行降到约 724 行。
+
+3. **测试与文档**
+   - 更新 `test_p3_retrieve_context_accepts_budget_controls`：预算输出现在是正式契约。
+   - README 后续计划移除已完成的 1/2，把下一步改为管理 skill 与 compiler 长尾拆分。
+   - 设计文档同步 v0.5.8 状态。
+
+### 验证
+
+```powershell
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+# 218 passed in 15.35s
+```
+
+---
+
+## 2026-04-24 (v0.5.7: 默认启用多人安全策略)
+
+> **状态：`multi_user.enabled` 默认改为 true；旧配置缺 `write_policy` 时也会根据默认多人策略执行 activeContext 用户分流与共享文件 append-only。测试 216 → 218。**
+
+### 范围
+
+1. **默认多人模式**
+   - `DEFAULT_CONFIG_CONTENT.multi_user.enabled` 改为 `true`。
+   - 新工作区无需手动配置，即可把 `memory-bank/activeContext.md` 读写重定向到 `memory-bank/activeContext/{user}.md`。
+
+2. **旧配置兼容**
+   - `memory_writer._lookup_write_policy` 增加 `multi_user.user_scoped_paths` 兜底。
+   - 即使旧 `.ai-memory/config.json` 覆盖了 `guard.targets` 且没有 `write_policy: "user_scoped"`，也会对 `activeContext.md` 执行用户分流。
+   - 共享 warm 文件继续通过默认 `multi_user.shared_paths_policy` 强制 overwrite → append 降级。
+
+3. **测试与文档**
+   - 新增默认配置启用多人模式测试。
+   - 新增旧配置缺 `write_policy` 的 activeContext 分流 / progress append-only 回归测试。
+   - README 与设计文档同步为“多人默认启用，不需要配置”口径。
+
+### 验证
+
+```powershell
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+# 218 passed
+```
+
+---
+
+## 2026-04-26 (v0.5.6 P0/P2 follow-up: 锁 fd 异常推担 + disk_full 结构化错误)
+
+> **状态：补三话的二项评估后续：`file_lock` 轮询期间的异步异常（`KeyboardInterrupt` / `SystemExit`）不再泄漏 sidecar fd；`_atomic_write_text` 在 `ENOSPC` / `EDQUOT` 时抛专用 `DiskFullError`，`memory_write` 转成结构化 `error="disk_full"`。+3 测试，213 → 216。**
+
+### 范围
+
+1. **`memory_locks.file_lock` BaseException 守卫**（[memory_locks.py](servers/memory_server/memory_locks.py)）
+   - `_acquire_os_lock(fd, timeout)` 原本只 catch `LockTimeoutError` 退出分支 close fd。`KeyboardInterrupt` / `SystemExit` / 其他异步注入异常会跳过清理路径 → fd 泄漏（POSIX 上还会连带 OS 锁未释放，后续获锁者永久阻塞）。
+   - 改为 `except BaseException` 守卫，所有退出路径都先 close fd 再重抛。
+   - 测试：`test_file_lock_keyboard_interrupt_during_polling_does_not_leak_fd`。Holder 线程我0.8s 锁；waiter 线程 `timeout=5.0` 轮询；中间通过 `ctypes.pythonapi.PyThreadState_SetAsyncExc` 注入 `KeyboardInterrupt`；holder 释放后主线程以 `timeout=1.0` 重新获锁必须 < 0.5s。
+
+2. **`DiskFullError` + `disk_full` 错误码**（[memory_record_io.py](servers/memory_server/memory_record_io.py) + [memory_writer.py](servers/memory_server/memory_writer.py)）
+   - 新增 `DiskFullError(OSError)` 与 `_DISK_FULL_ERRNOS = {ENOSPC, EDQUOT, EFBIG}`。
+   - `_atomic_write_text` 的 `except OSError` 处理路径：清理 tmp 后，若 errno 在磁盘压力集合，提升为 `DiskFullError`。
+   - `memory_writer.memory_write` 额外 catch `DiskFullError`，返回 `error_result("disk_full", ..., errno=...)`。原文件不动、tmp 不泄漏。
+   - 测试：注入 `os.replace` 抛 `OSError(ENOSPC, ...)`。`_atomic_write_text` 抛 `DiskFullError`、`memory_write` 返回 `error="disk_full"` + `errno=ENOSPC`、原文件字节比特不变、`.tmp` 零泄漏。
+   - 注：最初试图 `patch("os.write")` 未生效——Python C-level `FileIO.write` 不走 Python 级 `os.write`。改用生产路径上真实会被 `ENOSPC` 击中的 `os.replace` 作为注入点。
+
+### 影响
+
+- **取消调试/中断导致的锁永久携带**：之前用户在锁超时期间 Ctrl+C 会造成 sidecar fd 泄漏（同一进程内后续重试锁类似路径可能遭遇难以诊断的垃圾状态）。现在这条路安全。
+- **运维可观测**：磁盘几乎被占满的环境调用方能从 `result["error"]` 明确区分「磁盘压力」与「未知 I/O 故障」，授权上层调度压缩 / 告警 / 切换。
+- **向后兼容**：`DiskFullError` 是 `OSError` 子类，现有 `except OSError` 代码不需修改。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest MCP\Memory\tests -q
+# 216 passed in ~15s
+```
+
+3 次 soak 跡多进程压力套件 + 本补丁新测试（8 进程压测 + 4 补丁测试）全部 12/12 稳定。
+
+---
+
+## 2026-04-26 (v0.5.6 P1 follow-up: 读路径与路径规范化加固)
+
+> **状态：补齐读路径在多 agent 写入下的瞬态容错；测试由"容忍瞬态"收紧为"零容忍"；213 测试保持全绿，6 次连跑稳定。**
+
+### 范围
+
+落实 v0.5.6 评估遗留的 P1 两项：
+
+1. **`PathManager` 长路径前缀规范化**（[memory_paths.py](servers/memory_server/memory_paths.py)）
+   - 新增 `_strip_long_path_prefix(value)` / `_normalize_path(path)`：在 Windows 上把 `\\?\C:\...` / `\\?\UNC\server\share\...` 还原为常规形式后再做 `relative_to` 比较。
+   - `_is_within` / `resolve` / `to_repo_relative` 全部改走 `_normalize_path`，避免 `Path.resolve()` 自动加前缀后导致下游 `relative_to(repo_root)` 抛 `ValueError`。
+   - `iter_files` 在 `to_repo_relative` 抛 `ValueError`（极端情形：符号链接出仓 / 前缀仍无法对齐）时跳过该条目而非崩溃。
+
+2. **`safe_read_text` 读路径瞬态重试**（[memory_record_io.py](servers/memory_server/memory_record_io.py)）
+   - 新增 `safe_read_text(path, *, encoding, errors, max_attempts=20, delay_seconds=0.005)`：bounded retry on `PermissionError` / `FileNotFoundError`，覆盖 Windows writer `os.replace` 短窗口（默认 ≤100ms）。其他 OSError 立即抛出。
+   - 接入位置：`memory_search.memory_search`、`memory_reader.memory_get`、`memory_record_index._index_record_rows` 全套（建索引扫描 + 显式索引指定路径分支）。
+   - 写路径不需要——它们本来就在 `file_lock` 内，不存在 reader-vs-writer 短窗口。
+
+### 影响
+
+- **生产读 API 不再被并发写击穿**。此前在 Windows 高并发场景下 `memory_search` / `memory_get` 偶发 `PermissionError` 反映为外部错误；现在透明重试，调用方无感。
+- **`PathManager` 不再因 `\\?\` 漏出**抛 `ValueError`。pytest tmp 路径较长场景下尤其常见。
+- **测试收紧**：`test_mixed_workload_no_db_lock_no_corruption` 的 reader worker 之前用 `transient_path_errors` 计数容忍 `ValueError`，现已改为零容忍——任何异常即测试失败。6 次连跑稳定通过。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest MCP\Memory\tests -q
+# 213 passed in ~14s
+# soak 6×: test_multi_agent_stress.py 全绿
+```
+
+---
+
+## 2026-04-26 (v0.5.6: 多 agent 并发严格评估 + 真 bug 修复 + 9 项压力测试)
+
+> **状态：在 v0.5.5 之上严格评估「同一台设备多 agent 同时写入」的真实健壮性，过程中发现 2 个隐性 bug 并修复，新增 9 项多进程压力测试；总计 213 测试全部通过（204 → 213，+9）；6 次连跑无 flaky。**
+
+### 评估结论
+
+**结论：v0.5.4/0.5.5 的并发设计在 9 项严苛真多进程压力下整体成立，但有 2 处隐性缺陷在常规 5 进程基线测试中被掩盖，已修复。**
+
+具体性质：
+
+- **正确性已成立**：高竞争同文件覆写（10 进程 × 20 写）零损坏、append 模式 8 × 25 全部 200 行原样保留、`target_exists` 发布竞争双进程恰好 1 赢、`if_match` 乐观锁 6 × 8 增量零丢失、`LockTimeoutError` 在真实争用下及时返回结构化错误、可重入锁同进程不死锁、混合负载（writer+record_writer+reader 各 3）连续 1.5s 无 DB 锁错误、锁文件 sidecar 复用不泄露。
+- **修复 bug A — fd 泄漏**（`memory_locks.py`）：原 `file_lock` 上下文中 `yield` 抛异常时 `else: os.close(fd)` 不执行，仅 `finally` 释放 OS 锁；POSIX 下 `flock` 仍正确释放，但 fd 会泄漏。重写 `try/finally` 嵌套，无条件 close fd。
+- **修复 bug B — events.jsonl 多进程丢事件**（`memory_events.py`）：`append_event` 之前用 `msvcrt.locking(fd, LK_LOCK, 1)` 在「`a` 模式打开后的当前位置」锁 1 字节。两个进程 append 时各自的 EOF 偏移不同，锁的字节范围不重叠，**互不阻塞**。压测复现：8 进程 × 60 写入实际只落盘 478/480（丢 2 条，无 torn）。改用统一的 sidecar `file_lock` 包住「rotate + append + flush + fsync」整个临界区。
+- **改进 — `os.replace` Windows 共享读重试**（`memory_record_io.py`）：Windows 上 reader（`memory_search` / `read_text`）持有 read 句柄时，writer 的 `os.replace` 会以 `PermissionError` 失败，反映为 `write_failed`。加最多 20×10ms 重试覆盖此短窗口；非 Windows 路径不受影响。
+
+### 落地清单
+
+1. **`memory_locks.py`**：重写 `file_lock` 释放路径。OS lock 获取失败立即 close fd，正常路径 `try: yield ... finally: 释放 reentrance state + OS lock + close fd`，三者均无条件执行。任何异常路径不再泄漏文件描述符。
+2. **`memory_events.py`**：导入 `file_lock`；`append_event` 用 `with file_lock(config.repo_root, config.events_file):` 保护「rotate→open(a)→write→flush→fsync」。`_lock_file` / `_unlock_file` 留作向后兼容（带说明 docstring），调用方不再使用。
+3. **`memory_record_io.py`**：`_atomic_write_text` 的 `os.replace` 加 PermissionError 短窗口重试（20 次 × 10ms = 200ms 上限），仅命中 Windows reader 共享句柄场景；其他异常立即抛出。新增 `import time`。
+4. **`tests/memory_server/test_multi_agent_stress.py`**（**新文件**，9 项测试，全部 `multiprocessing.spawn`）：
+   1. `test_high_contention_overwrite_no_corruption` — 10 × 20 同文件覆写：200 次全成功、200 个唯一 request_id、最终文件恰好 1 个完整 worker 签名、payload 64 字节未截断。
+   2. `test_concurrent_append_no_torn_lines_no_lost_lines` — 8 × 25 append：200 行 (worker, round) 配对完整保留、无 torn line（每行恰好 1 个匹配）。
+   3. `test_publish_target_race_exactly_one_winner` — 2 进程同 record-id 发布：恰好 1 ok、1 `target_exists`，验证 v0.5.4 的锁内 TOCTOU 重检。
+   4. `test_lock_timeout_returns_structured_error` — holder 持锁 1.5s，waiter `timeout=0.2s` 在 < 1s 内拿到 `LockTimeoutError`。
+   5. `test_reentrance_same_thread_no_deadlock` — 同线程嵌套 `file_lock` + 另一线程等待，事件顺序严格 outer→inner→inner_release→outer_release→waiter。
+   6. `test_if_match_optimistic_retry_no_lost_updates` — 6 × 8 增量 RMW + retry-on-conflict：最终计数 = 48，至少 1 次 conflict 证实真争用，处理了 Windows 读取竞态。
+   7. `test_events_jsonl_multi_proc_no_torn_lines` — 8 × 60 `append_event`：480 行全部合法 JSON，所有 (worker, round) 配对存在。**这条测试在修复 bug B 前会丢 2 条。**
+   8. `test_mixed_workload_no_db_lock_no_corruption` — 3 writer + 3 record_writer + 3 reader 并行 1.5s：零失败（reader 容忍已知 Windows 长路径瞬态 ValueError）、notes.md 非空。
+   9. `test_lock_files_are_reused_not_orphaned` — 6 × 5 突发后，`.ai-memory/locks/` ≤ 5 个 sidecar、每个 ≤ 16 字节，证实 sha-keyed 锁路径稳定不累积。
+5. **版本号**：`server_descriptions.SERVER_VERSION` → `0.5.6`。
+
+### 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest MCP\Memory\tests -q
+# 213 passed in ~13s
+```
+
+并连跑 6 次新压力套件 + 既有并发/健壮性套件（共 22 测试）全部 22/22 稳定。
+
+---
+
+## 2026-04-25 (v0.5.5: 写入健壮性收尾 — fsync 严格模式 + events.jsonl 落盘 + 写路径统一)
+
+> **状态：4 处写入路径加固完成；新增 8 项 robustness 回归；总计 204 测试全部通过（196 → 204，+8）**
+
+### 范围
+
+承接 v0.5.4 的并发安全工作，把「磁盘故障 / 进程崩溃」维度补齐。所有改动遵守现有契约（默认 best-effort，不破坏既有调用方）。
+
+### 落地清单
+
+1. **新增 config 开关 `mcp.fsync_strict`**（[memory_config.py](servers/memory_server/memory_config.py)）
+   - `MemoryConfig.mcp_fsync_strict: bool = False`，默认关。
+   - 关：`os.fsync` 失败被吞掉（兼容老行为，应对 tmpfs / WSL bind mount 等不支持 fsync 的卷）。
+   - 开：`os.fsync` 失败抛 `OSError`，调用方收到 `error="write_failed"`，磁盘真有问题时不会假装写成功。
+2. **`_atomic_write_text` 加固**（[memory_record_io.py](servers/memory_server/memory_record_io.py)）
+   - 新签名：`_atomic_write_text(target, content, *, fsync_strict=False)`。
+   - rename 之后**追加** `_fsync_parent_dir(target)`：POSIX 上 `os.open(parent, O_RDONLY) + os.fsync + close`，Windows 跳过（rename 元数据由 NTFS 在 `os.replace` 内部刷盘）。原本只 fsync 数据 fd，rename 自身不持久化，crash 后可能整个文件凭空消失。
+   - strict 模式同时让 data fd 与 parent dir 的 fsync 错误穿透。
+   - 测试覆盖：data fsync 调用次数、parent dir 在 POSIX 被 fsync、strict 模式 OSError 穿透 + tmp 文件清理 + 原文件保留、default 模式 OSError 被吞但 rename 已完成。
+3. **`memory_writer.memory_write` 写路径统一**（[memory_writer.py](servers/memory_server/memory_writer.py)）
+   - 删除原本的「`config.temp_dir` 内 tmp + `os.replace`」分支（曾有跨卷 `EXDEV` 风险、无 fsync、无 O_EXCL）。
+   - 改为直接调用 `_atomic_write_text(resolved, final_content, fsync_strict=config.mcp_fsync_strict)`，与记录写路径共用同一原子助手。
+   - 顺手清掉不再使用的 `import os` / `import uuid` / `from pathlib import Path`。
+   - 测试覆盖：tmp 文件确实是 `resolved` 的同目录兄弟（不再落 `config.temp_dir`）；strict + 注入 fsync 失败 → 返回 `write_failed` 且原文件零损伤。
+4. **`memory_events.append_event` 落盘**（[memory_events.py](servers/memory_server/memory_events.py)）
+   - 持锁、写入、flush 之后追加 `os.fsync(handle.fileno())`（best-effort）。
+   - 尊重 `mcp.fsync_strict`：开启时 fsync 失败穿透到调用方。原来只 flush，crash 后审计行可能丢失。
+   - 测试覆盖：fsync 被调用；strict 模式 OSError 穿透。
+5. **`record_usage_stats` 改用原子助手**（[memory_compiler_cache.py](servers/memory_server/memory_compiler_cache.py)）
+   - JSON dump 改为 `_atomic_write_text(stats_path, ..., fsync_strict=config.mcp_fsync_strict)`。
+   - 既保留了 v0.5.4 加的文件锁（防止丢增量），又获得「strict 模式下 fsync 失败 → 旧 JSON 完整保留」的语义。
+   - 测试：种子先写一个 `mem_keep` 计数；strict + 注入 fsync 失败 → 旧 JSON 一字不差留在原地。
+6. **`memory_maintenance.tombstones.jsonl` 落盘**（[memory_maintenance.py](servers/memory_server/memory_maintenance.py)）
+   - 写入 + flush 后追加 `os.fsync`，strict 模式穿透。
+
+### 测试
+
+新增 [tests/memory_server/test_write_robustness.py](tests/memory_server/test_write_robustness.py)（8 测试）：
+
+```
+.\.venv\Scripts\python.exe -m pytest MCP\Memory\tests -q
+204 passed in 5.58s
+```
+
+（v0.5.4 基线 196 + 8 = 204，无回归。）
+
+### 不变量 / 边界
+
+- 默认 `fsync_strict=False`，与 v0.5.4 行为完全兼容；不需要的部署不必改 config。
+- Windows 不做 parent-dir fsync（API 不通用），`os.replace` 元数据由 NTFS 内部处理，与 POSIX 默认行为一致。
+- tmp 文件统一落目标同目录，跨卷 `EXDEV` 不再可能。
+- `config.temp_dir` 现在仅供备份等其它子系统使用，主写路径已不依赖。
+
+### 已知后续
+
+- v0.5.4 §5 计划剩余项（retrieve_context budget-first / memory_compiler 进一步拆分 / 管理 skill 配套 / P4 LLM / P5 RAG）维持原优先级，本轮不动。
+- 若发现 SQLite WAL 与 strict fsync 在某些极端场景（断电 + WAL 还没 checkpoint）的耐久性边界，可再加一道 `PRAGMA wal_checkpoint(FULL)` 的显式触发开关；当前默认 `synchronous=NORMAL` 已足够大多数场景。
+
+---
+
+## 2026-04-25 (v0.5.4: 单机多 agent 单 mcp 服务并发安全 — 跨进程文件锁 + WAL + 乐观锁 + UUID7 请求 ID)
+
+> **状态：6 处写入路径加固完成；新增 5 项多进程并发回归测试；总计 196 测试全部通过（191 → 196，+5）**
+
+### 背景
+
+`setup_mcp.ps1` 把 memory MCP 注册为 `python -m servers.memory_server --root <workspace>` 的 stdio 命令，每个 VS Code 窗口 / Codex 会话都启动**独立**的 Python 进程。多个进程指向同一 `--root` 是真实部署形态，因此「多 agent + 单 mcp 规格 + 同工作区」必须做**跨进程**串行化，纯线程锁不够。
+
+### 落地清单
+
+1. **`memory_locks.py`（新）：跨进程可重入文件锁**
+   - 锁文件：`.ai-memory/locks/<sha1(rel_target)>.lock`，sha1 哈希避免 Windows MAX_PATH 与目录分隔符问题；按目标文件粒度，不同文件零争用。
+   - POSIX 用 `fcntl.flock(LOCK_EX|LOCK_NB)`，Windows 用 `msvcrt.locking(LK_NBLCK,1)`，均按 50ms 间隔轮询，默认 30s 超时，超时抛 `LockTimeoutError`。
+   - 进程内按线程做引用计数：同一线程嵌套 `with file_lock(...)` 不死锁（关键，因为 `memory_write` 内部会调 `backup_files` 再次拿锁）。
+2. **`memory_request_id.py`（新）：UUID7 + content_sha**
+   - `new_request_id()` 直接调 Python 3.14 的 `uuid.uuid7()`（RFC 9562 时间排序）。
+   - `content_sha(text)` = SHA-256 hex，作为乐观锁 ETag。
+3. **SQLite WAL（`memory_record_index.py`）**
+   - `_connect()` 改为 `connect(path, timeout=30, isolation_level=None)` + `journal_mode=WAL` / `synchronous=NORMAL` / `busy_timeout=30000`。读不阻塞写；多进程写者按 30s 等待自然排队，不再 `database is locked`。
+4. **写入路径全面加锁**
+   - `memory_writer.memory_write`：`resolved` 解析后整段（read → if_match → budget → backup → 原子写 → 审计 → guard）落入 `with file_lock(config.repo_root, resolved):`；`LockTimeoutError` 转 `error_result("lock_timeout", ...)`。
+   - `memory_record_io.write_same_record`：`_atomic_write_text` 调用包入文件锁。
+   - `memory_record_io.write_record_to_target`：发布/迁移记录的 `target_exists` 检查 + 原子写 + 旧文件 unlink **整体**锁住 new + old 两侧路径，关闭原本 check-then-write 的 TOCTOU 窗口。
+   - `memory_compiler_cache.record_usage_stats`：`usage-stats.json` 的 read-modify-write 进锁，杜绝 `compile_hit_count` 增量丢失。
+   - `memory_maintenance.memory_delete_record`：`tombstones.jsonl` append 进锁 + `flush()`，防止多进程同删导致行撕裂。
+   - `memory_events`（事件审计）此前已用 `fcntl.flock` / `msvcrt.locking`，本次未改，与新锁体系正交共存。
+5. **乐观锁（If-Match / ETag）**
+   - `memory_write` 新增可选 `if_match: str | None`：客户端传入读到的 `content_sha`；服务端在锁内重读、比对，不一致则返回 `error="conflict"` + `current_sha` + `expected_sha` + `request_id`。客户端可重读、合并后用新 sha 重试。
+   - `if_match=""` 表示「期望文件不存在」（保守创建语义）。
+6. **审计 / 返回值新增字段**
+   - `memory_write` 返回值与 `memory_write` 审计事件均带 `request_id`（UUID7）+ `new_sha`（写入后 SHA-256），便于多进程链路追踪与下次乐观锁。
+   - `request_id` 也可由调用方传入做幂等重试。
+
+### 测试
+
+新增 `tests/memory_server/test_concurrent_writes.py`（5 测试，全部走 `multiprocessing.spawn` 真实多进程）：
+
+- `test_concurrent_overwrites_same_file_serialize_cleanly`：5 进程同写 `notes.md`，最终内容必须是某一个 worker 的完整 banner（不撕裂、`request_id` 全部唯一）。
+- `test_concurrent_distinct_records_all_survive`：5 进程各自创建一条独立记录，全部成功且文件落盘（不同 target 不互相阻塞）。
+- `test_concurrent_usage_stats_no_lost_increments`：8 进程同记一条记录的 usage，最终 `compile_hit_count == 8`、`compile_targets` 8 项不丢。
+- `test_if_match_rejects_stale_precondition`：错误 sha → conflict；正确 sha → ok 且返回新 `new_sha`；用旧 sha 再写 → 再次 conflict。
+- `test_request_id_uniqueness_under_contention`：4 进程 × 200 = 800 个 UUID7 全部唯一且单进程内基本时间排序。
+
+### 测试矩阵
+
+```
+.\.venv\Scripts\python.exe -m pytest MCP\Memory\tests -q
+196 passed in 4.20s
+```
+
+（基线 191 + 5 = 196，无回归。）
+
+### 不变量 / 边界
+
+- 锁是「sidecar」文件，不会对目标文件持有独占句柄，因此外部编辑器/工具仍可正常读取目标文件。
+- 锁默认 30s 超时；正常 IDE 节奏远低于此。超时返回 `lock_timeout` 而不是死等，调用方可决定是否重试。
+- `memory_events` 自有锁与新文件锁互相独立；并发写者的事件追加仍然原子。
+- 乐观锁是**可选**契约：不传 `if_match` 时维持原 last-write-wins 语义，向后兼容。
+
+### 已知后续
+
+- 后续若引入 retrieve_context budget-first 重排（计划 §5 项 1）/ compiler 进一步拆分（项 2）/ fsync 严格模式（项 3a），可在此基础上叠加。
+- 跨机协作（CRDT 合并、远端 sync）暂不在范围。
+
+---
+
 ## 2026-04-24 (v0.5.3: P1 批次重构 — server/compiler/budget 拆分 + 写入加固 + evidence_refs 扩展)
 
 > **状态：6 项 P1 全部落地；`server.py` 1348 → 102 行；新增 4 个独立模块；新增 26 项回归测试；总计 184 测试全部通过（146 → 184，+38）**

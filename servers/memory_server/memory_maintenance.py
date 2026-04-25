@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
 from .memory_events import append_event
+from .memory_locks import file_lock
 from .memory_paths import PathSecurityError
 from .memory_record_io import (
     find_record_by_id as _find_record,
@@ -118,8 +120,20 @@ def memory_delete_record(config: MemoryConfig, record_id: str, *, reason: str | 
         abs_path.unlink()
         tombstone_path = config.repo_root / ".ai-memory" / "tombstones.jsonl"
         tombstone_path.parent.mkdir(parents=True, exist_ok=True)
-        with tombstone_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(tombstone, ensure_ascii=False) + "\n")
+        # Cross-process serialization: tombstones is the audit trail for
+        # deletions; concurrent appends from multiple MCP server
+        # processes must not produce torn lines.
+        with file_lock(config.repo_root, tombstone_path):
+            with tombstone_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(tombstone, ensure_ascii=False) + "\n")
+                handle.flush()
+                # Durability: ensure tombstone reaches disk under
+                # mcp.fsync_strict; best-effort otherwise.
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    if config.mcp_fsync_strict:
+                        raise
     except OSError as exc:
         return error_result("delete_failed", f"failed to delete record: {exc}")
 
