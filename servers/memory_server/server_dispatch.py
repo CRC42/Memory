@@ -34,6 +34,137 @@ from .memory_writer import memory_write as memory_write_file
 logger = logging.getLogger(__name__)
 
 
+def _build_llm_client(plugin_root=None):
+    """Lazily build an LLMClient. Returns (client, error_dict).
+
+    Returns ``(None, error_dict)`` if config is unavailable so callers can
+    surface ``llm_unavailable`` without crashing the primary write/read
+    path. Importing here keeps `memory_llm` optional at module load time.
+    """
+    try:
+        from .memory_llm import LLMClient, LLMConfigError  # local import: optional dep
+    except Exception as exc:  # pragma: no cover — defensive
+        return None, error_result("llm_unavailable", f"memory_llm import failed: {exc}")
+    try:
+        return LLMClient(plugin_root=plugin_root), None
+    except LLMConfigError as exc:
+        return None, error_result("llm_unavailable", str(exc))
+    except Exception as exc:  # pragma: no cover — defensive
+        return None, error_result("llm_unavailable", f"failed to build LLMClient: {exc}")
+
+
+def _run_distill_for_write(
+    config: MemoryConfig,
+    args: dict[str, Any],
+    write_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Distill the just-written record and persist the summary as a 2nd record.
+
+    Failure modes are reported in-band (``{ok: False, error, message}``)
+    so the primary write result is never lost. Always opt-in via
+    ``distill=True``.
+    """
+    from datetime import datetime, timezone
+
+    raw_id = str(write_result.get("id") or "").strip()
+    if not raw_id:
+        return error_result("distill_skipped", "raw record missing id; cannot distill")
+    raw_path = str(write_result.get("path") or "").strip()
+    raw_content = str(args.get("content_markdown") or "")
+    if not raw_content.strip():
+        return error_result("distill_skipped", "empty raw content; nothing to distill")
+
+    client, err = _build_llm_client()
+    if err is not None:
+        return err
+    try:
+        from .memory_llm import LLMError, make_raw_record
+        from .memory_llm_pipeline import map_reduce_distill
+    except Exception as exc:  # pragma: no cover — defensive
+        return error_result("llm_unavailable", f"pipeline import failed: {exc}")
+
+    captured_at = datetime.now(timezone.utc).isoformat()
+    raw_view = make_raw_record(
+        record_id=raw_id,
+        content=raw_content,
+        source=f"memory_write:{raw_path}" if raw_path else "memory_write",
+        captured_at=captured_at,
+        author=str(args.get("author") or "system"),
+    )
+
+    try:
+        distilled = map_reduce_distill(
+            client,
+            [raw_view],
+            record_id=f"{raw_id}-distilled",
+            distilled_at=captured_at,
+            user_instruction=args.get("distill_user_instruction"),
+            kind="distilled_summary",
+            tags=args.get("distill_tags") or args.get("tags"),
+            max_tokens=args.get("distill_max_tokens"),
+        )
+    except LLMError as exc:
+        return error_result("distill_failed", str(exc))
+    except Exception as exc:  # pragma: no cover — unexpected
+        logger.exception("unexpected error in distill pipeline")
+        return error_result("distill_failed", f"unexpected: {exc}")
+
+    summary_text = str(distilled.get("content") or "").strip()
+    if not summary_text:
+        return error_result("distill_failed", "empty summary text")
+
+    persist = memory_write_record(
+        config,
+        content_markdown=summary_text,
+        record_kind="observation",
+        scope="user_private",
+        author=str(args.get("author") or "system"),
+        derived_from_record_ids=[raw_id],
+        task_id=str(args["task_id"]) if args.get("task_id") is not None else None,
+        branch=str(args["branch"]) if args.get("branch") is not None else None,
+    )
+    return {
+        "ok": bool(persist.get("ok")),
+        "summary": summary_text,
+        "distilled_record_id": persist.get("id"),
+        "distilled_path": persist.get("path"),
+        "model": distilled.get("model"),
+        "pipeline": distilled.get("pipeline", {}),
+        "usage": client.usage_snapshot(),
+        "persist_result": persist,
+    }
+
+
+def _run_recall_summarize(args: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+    """LLM map-reduce summary over already-retrieved records (read-only)."""
+    if not records:
+        return error_result("summarize_skipped", "no records to summarize")
+    client, err = _build_llm_client()
+    if err is not None:
+        return err
+    try:
+        from .memory_llm import LLMError
+        from .memory_llm_pipeline import summarize_records_for_recall
+    except Exception as exc:  # pragma: no cover
+        return error_result("llm_unavailable", f"pipeline import failed: {exc}")
+    try:
+        outcome = summarize_records_for_recall(
+            client,
+            records,
+            query=args.get("summary_query") or args.get("query"),
+            max_tokens=args.get("summary_max_tokens"),
+            max_chars_per_record=int(args.get("summary_max_chars_per_record") or 4000),
+        )
+    except LLMError as exc:
+        return error_result("summarize_failed", str(exc))
+    except Exception as exc:  # pragma: no cover
+        logger.exception("unexpected error in recall summarize")
+        return error_result("summarize_failed", f"unexpected: {exc}")
+    outcome["ok"] = True
+    outcome["usage"] = client.usage_snapshot()
+    return outcome
+
+
 def _check_required(args: dict[str, Any], *keys: str) -> dict[str, Any] | None:
     """Return error_result if any required key is missing from args, else None.
 
@@ -116,7 +247,7 @@ def _dispatch_memory_write(config: MemoryConfig, args: dict[str, Any]) -> dict[s
         err = _check_required(args, "content_markdown")
         if err:
             return err
-        return memory_write_record(
+        write_result = memory_write_record(
             config,
             content_markdown=str(args.get("content_markdown", "")),
             schema_version=str(args["schema_version"]) if args.get("schema_version") is not None else None,
@@ -157,6 +288,10 @@ def _dispatch_memory_write(config: MemoryConfig, args: dict[str, Any]) -> dict[s
             blueprint_paths=args.get("blueprint_paths"),
             system_area=str(args["system_area"]) if args.get("system_area") is not None else None,
         )
+        if bool(args.get("distill")) and write_result.get("ok"):
+            distill_outcome = _run_distill_for_write(config, args, write_result)
+            write_result["distilled"] = distill_outcome
+        return write_result
     if operation == "observation":
         err = _check_required(args, "content_markdown")
         if err:
@@ -241,7 +376,7 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             other_path=str(args.get("other_path", "")),
         )
     if operation == "retrieve_context":
-        return memory_retrieve_context(
+        result = memory_retrieve_context(
             config,
             query=str(args["query"]) if args.get("query") is not None else None,
             user=str(args["user"]) if args.get("user") is not None else None,
@@ -264,6 +399,13 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             max_tokens=args.get("max_tokens"),
             max_items=args.get("max_items"),
         )
+        if bool(args.get("summarize")) and result.get("ok"):
+            summary_outcome = _run_recall_summarize(
+                args,
+                result.get("context_items") or result.get("selected_records") or [],
+            )
+            result["summary"] = summary_outcome
+        return result
     if operation == "important_memories":
         return memory_get_important_memories(
             config,
@@ -295,6 +437,103 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
         "invalid_input",
         "operation must be one of: compile, runtime_digest, trace_lineage, list_conflicts, compare_snapshots, retrieve_context, important_memories, config_diagnose",
     )
+
+
+# ── memory_enhance dispatch (LLM-backed soft enhancements, opt-in) ─────────
+
+
+_ENHANCE_OPS = {
+    "classify_record",
+    "extract_candidates",
+    "merge_candidates",
+    "generate_skill_candidate",
+    "explain_conflict",
+    "generate_handoff",
+}
+
+
+def _dispatch_memory_enhance(config: MemoryConfig, args: dict[str, Any]) -> dict[str, Any]:
+    op = str(args.get("operation") or "").strip()
+    if op not in _ENHANCE_OPS:
+        return error_result(
+            "invalid_input",
+            f"operation must be one of: {', '.join(sorted(_ENHANCE_OPS))}",
+        )
+
+    plugin_root = getattr(config, "plugin_root", None)
+    client, err = _build_llm_client(plugin_root)
+    if err is not None:
+        return err
+
+    # Local import to keep top-of-file lean.
+    from . import memory_llm_enhance as enh
+    from .memory_records import ALLOWED_RECORD_KINDS, ALLOWED_SCOPES, ALLOWED_TAGS
+
+    try:
+        if op == "classify_record":
+            content = str(args.get("content_markdown") or args.get("content") or "")
+            allowed_kinds = args.get("allowed_kinds") or sorted(ALLOWED_RECORD_KINDS)
+            allowed_scopes = args.get("allowed_scopes") or sorted(ALLOWED_SCOPES)
+            allowed_tags = args.get("allowed_tags") or sorted(ALLOWED_TAGS)
+            return enh.classify_record(
+                client,
+                content=content,
+                allowed_kinds=list(allowed_kinds),
+                allowed_scopes=list(allowed_scopes),
+                allowed_tags=list(allowed_tags),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+            )
+        if op == "extract_candidates":
+            return enh.extract_candidates(
+                client,
+                content=str(args.get("content_markdown") or args.get("content") or ""),
+                source_record_id=(str(args["source_record_id"]) if args.get("source_record_id") else None),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+            )
+        if op == "merge_candidates":
+            return enh.merge_candidates(
+                client,
+                candidates=list(args.get("candidates") or []),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+            )
+        if op == "generate_skill_candidate":
+            return enh.generate_skill_candidate(
+                client,
+                records=list(args.get("records") or []),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+                max_chars_per_record=int(args.get("max_chars_per_record") or 4000),
+            )
+        if op == "explain_conflict":
+            return enh.explain_conflict(
+                client,
+                record_a=dict(args.get("record_a") or {}),
+                record_b=dict(args.get("record_b") or {}),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+            )
+        if op == "generate_handoff":
+            return enh.generate_handoff(
+                client,
+                records=list(args.get("records") or []),
+                task_id=(str(args["task_id"]) if args.get("task_id") else None),
+                branch=(str(args["branch"]) if args.get("branch") else None),
+                max_tokens=args.get("max_tokens"),
+                thinking=args.get("thinking"),
+                reasoning_effort=args.get("reasoning_effort"),
+                max_chars_per_record=int(args.get("max_chars_per_record") or 4000),
+            )
+    except Exception as exc:  # noqa: BLE001 — surface as in-band structured error
+        return error_result(f"enhance_failed:{op}", str(exc))
+    return error_result("invalid_input", f"unhandled enhance operation: {op}")
 
 
 def _dispatch_tool(config: MemoryConfig, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -351,6 +590,8 @@ def _dispatch_tool(config: MemoryConfig, name: str, args: dict[str, Any]) -> dic
             )
         elif name == "memory_write":
             return _dispatch_memory_write(config, args)
+        elif name == "memory_enhance":
+            return _dispatch_memory_enhance(config, args)
         elif name == "memory_write_record":
             err = _check_required(args, "content_markdown")
             if err:
@@ -541,5 +782,6 @@ __all__ = [
     "_dispatch_memory_read",
     "_dispatch_memory_write",
     "_dispatch_memory_context",
+    "_dispatch_memory_enhance",
     "_dispatch_tool",
 ]

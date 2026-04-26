@@ -17,3 +17,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# LLM credentials (must NOT be committed). Keep llm_config.example.json as the template.
+llm_config.local.json
+*.api_key
+*.apikey

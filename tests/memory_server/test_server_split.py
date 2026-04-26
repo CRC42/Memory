@@ -2,7 +2,7 @@
 
 Verifies:
 - Public symbols are still importable from `servers.memory_server.server`.
-- Default facade exposes exactly 3 tools (memory_read/write/context).
+- Default facade exposes the four facades (memory_read/write/context/enhance).
 - expose_admin_tools=True adds the legacy/admin set without dropping facades
   and without duplicating `memory_write`.
 - Each context operation enum is wired in dispatch.
@@ -52,6 +52,7 @@ def test_public_reexports_present():
     assert "memory_read" in _BASE_DESCRIPTIONS
     assert "memory_write" in _BASE_DESCRIPTIONS
     assert "memory_context" in _BASE_DESCRIPTIONS
+    assert "memory_enhance" in _BASE_DESCRIPTIONS
     # Tests still import these from the top-level server module.
     for name in (
         "_build_file_roles",
@@ -70,7 +71,7 @@ def test_default_facade_returns_three_tools(tmp_path):
     config = _make_config(tmp_path, expose_admin=False)
     tools = _build_tools(config)
     names = [t.name for t in tools]
-    assert names == ["memory_read", "memory_write", "memory_context"]
+    assert names == ["memory_read", "memory_write", "memory_context", "memory_enhance"]
 
 
 def test_expose_admin_adds_legacy_without_duplicating_memory_write(tmp_path):

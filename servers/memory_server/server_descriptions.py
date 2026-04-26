@@ -47,6 +47,15 @@ _BASE_DESCRIPTIONS: dict[str, str] = {
         "runtime digest reads, lineage tracing, conflict listing, snapshot comparison, "
         "important memory output, and P3 context retrieval through an operation field."
     ),
+    "memory_enhance": (
+        "Opt-in LLM enhancement facade. Operations: classify_record (suggest "
+        "record_kind/scope/tags), extract_candidates (mine claim/rule_candidate "
+        "from raw text), merge_candidates (dedupe a candidate batch), "
+        "generate_skill_candidate (distil a skill from observations), "
+        "explain_conflict (analyse two records), generate_handoff (produce next-"
+        "session handoff). Read-only: all operations return structured suggestions; "
+        "callers decide what (if anything) to persist via memory_write_record."
+    ),
     "memory_write_file": (
         "Write content to a memory file with safety controls. "
         "Supports overwrite and append modes. Auto-backup, atomic write, "

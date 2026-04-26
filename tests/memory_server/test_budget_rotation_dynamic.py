@@ -161,8 +161,8 @@ def test_build_tools_dynamic_descriptions(repo: Path) -> None:
     """_build_tools produces descriptions containing dynamic file roles."""
     config = load_config(repo)
     tools = _build_tools(config)
-    assert len(tools) == 3
-    assert {tool.name for tool in tools} == {"memory_read", "memory_write", "memory_context"}
+    assert len(tools) == 4
+    assert {tool.name for tool in tools} == {"memory_read", "memory_write", "memory_context", "memory_enhance"}
 
     read_tool = next(t for t in tools if t.name == "memory_read")
     assert "hot task context" in read_tool.description
@@ -176,7 +176,7 @@ def test_build_tools_dynamic_descriptions(repo: Path) -> None:
     admin_config = replace(config, mcp_expose_admin_tools=True)
     admin_tools = _build_tools(admin_config)
     admin_tool_names = {tool.name for tool in admin_tools}
-    assert len(admin_tools) == 23
+    assert len(admin_tools) == 24
     assert "memory_write_record" in admin_tool_names
     assert "memory_rebuild_index" in admin_tool_names
     assert "memory_validate_candidate" in admin_tool_names

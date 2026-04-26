@@ -1,5 +1,105 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-26 (v0.7.0-P4-B LLM 增强接口 + memory_enhance facade)
+
+> **状态：v0.7.0 路线 P4-B 完成。新增单一 facade `memory_enhance`，按 `operation` 路由 6 个 opt-in LLM 增强能力。read-only：返回结构化建议不写盘；上层决定是否以 `status="candidate"` 调 `memory_write_record`。测试 442 → 475 (+33)。同日完成 DeepSeek 真接口冒烟（`'OK'`，12 tokens，¥0.000013）确认 OpenAI-compatible wire format 可联通。**
+
+### 新增
+
+- **`memory_llm_enhance.py`**（NEW，~430 行）：6 个 LLM 增强能力函数。
+  - `_parse_json_response(text, *, expected_top=dict)`：容忍 ```` ```json ``` ```` 围栏 + 杂散文本，提取首未尾成对 `{}`/`[]`，解析失败抛 `LLMEnhanceError`。
+  - `_llm_json_call(client, *, system, user, ..., op, expected_top=dict) -> (parsed, meta)`：统一调用，捕获 `usage_delta = {prompt_tokens, completion_tokens, estimated_cost_cny}`，meta 携带 `model`。
+  - `classify_record(client, *, content, allowed_kinds, allowed_scopes, allowed_tags, ...)` → `{ok, record_kind, scope, tags, confidence∈[0,1], rationale, model, usage_delta}`；kind/scope 必须命中入参 allowlist（默认取 `ALLOWED_RECORD_KINDS / ALLOWED_SCOPES`）；tags 自动过滤；confidence clamp。
+  - `extract_candidates(client, *, content, source_record_id=None, ...)` → `{ok, candidates:[{kind∈{claim_candidate,rule_candidate}, content_markdown, confidence, tags, rationale, source_record_id}], ...}`；空数组合法。
+  - `merge_candidates(client, *, candidates, ...)` → `{ok, groups:[{representative_id, member_ids[], merged_content_markdown, rationale}]}`；必须输出输入 id 的**全分区**（无遗漏 / 无重复 / 无未知 id），否则 `LLMEnhanceError`。
+  - `generate_skill_candidate(client, *, records, max_chars_per_record=4000, ...)` → `{ok, title, content_markdown, tags, confidence, rationale, source_record_count, ...}`；记录正文超长按字符截断。
+  - `explain_conflict(client, *, record_a, record_b, ...)` → `{ok, record_ids:[a,b], conflict_type∈{contradiction,overlap,scope_mismatch,no_conflict,unclear}, severity∈{low,medium,high}, explanation, resolution_options[], ...}`；severity 自动小写规范化。
+  - `generate_handoff(client, *, records, task_id=None, branch=None, ...)` → `{ok, task_id, branch, summary_markdown, key_points[], open_questions[], next_actions[], source_record_count, ...}`；空字符串元素自动过滤。
+
+### 接入
+
+- **`server_dispatch.py`**：新增 `_ENHANCE_OPS = {"classify_record","extract_candidates","merge_candidates","generate_skill_candidate","explain_conflict","generate_handoff"}` 与 `_dispatch_memory_enhance(config, args)`；按 `operation` 路由；try/except → `error_result("enhance_failed:<op>", str(exc))`；LLM 工厂返回 `(None, error_result("llm_unavailable", ...))` 时直接透传。`_dispatch_tool` 中 `name == "memory_enhance"` 路由到该函数；`__all__` 加入 `_dispatch_memory_enhance`。
+- **`server_descriptions.py`**：新增 `memory_enhance` 条目（read-only opt-in LLM facade，6 ops 列举）。
+- **`server_tools.py`**：在 `_build_facade_tools` 注册 `Tool(name="memory_enhance", ...)`，schema 含 `operation` 枚举（6 op）+ `content_markdown` / `content` / `source_record_id` / `allowed_kinds|scopes|tags` / `candidates[]` / `records[]` / `record_a` / `record_b` / `task_id` / `branch` / `max_tokens` / `max_chars_per_record(default 4000)` / `thinking` / `reasoning_effort`，`required:["operation"]`，`additionalProperties:false`。
+
+### 测试
+
+- **`tests/memory_server/test_llm_enhance.py`**（NEW，22 项）：`_parse_json_response` 围栏 / 杂散提取 / 空 / 非法 JSON / wrong top；`classify_record` 过滤非法 tag + clamp confidence / 拒绝 allowlist 外 kind / 拒绝 allowlist 外 scope / 拒绝空 content；`extract_candidates` 类型规范化 / 空数组合法 / 拒绝非法 kind / 拒绝空 content；`merge_candidates` 全分区 / 漏 id / 重复 id / 未知 id / 空输入；`generate_skill_candidate` 结构 / 截断 / 空记录；`explain_conflict` severity 规范化 / 拒绝非法 conflict_type / 拒绝空记录；`generate_handoff` 字段透传 / 过滤空字符串 key_point / 拒绝缺字段。
+- **`tests/memory_server/test_llm_enhance_dispatch.py`**（NEW，6 项）：classify 派发 happy path / 未知 operation → `invalid_input` / extract 派发（source_record_id 透传）/ generate_handoff 派发（task_id 透传）/ LLM 不可用 in-band `llm_unavailable` / LLM 响应非法 → `enhance_failed:classify_record`。
+- **`test_server_split.py`**、**`test_mcp_protocol.py`**、**`test_budget_rotation_dynamic.py`**：facade 工具列表 expectations 同步加入 `memory_enhance`（默认 facade 由 3 → 4；admin 23 → 24）。
+
+### 真接口冒烟（DeepSeek）
+
+```text
+client.complete_text("Reply with just the word OK.")
+→ 'OK'   prompt_tokens=11, completion_tokens=1, est. cost ¥0.000013
+```
+
+确认 `MCP/Memory/llm_config.local.json` 配置（`base_url=https://api.deepseek.com`，`model=deepseek-v4-flash`）的 OpenAI-compatible wire format 可端到端联通；`load_llm_config(plugin_root=Path('.'))` 必须传 `Path` 而不是 `str`。
+
+### 验证
+
+```powershell
+cd MCP/Memory
+.\.venv\Scripts\python.exe -m pytest tests/ -q   # 475 passed
+```
+
+### 硬约束保留
+
+- `memory_enhance` 是 **read-only**：从不写盘；上层决定是否以 `status="candidate"` 通过 `memory_write_record` 落盘。
+- raw 仍 immutable + authoritative；distilled 仍 replaceable。
+- 全部能力 opt-in，未调用即 0 LLM 调用 0 token。
+- LLM 失败统一 in-band 错误（`enhance_failed:<op>` / `llm_unavailable` / `invalid_input`），绝不 silent 失败。
+- 6 项能力名最终对应 `memory_llm_policy.LLM_CAPABILITY_MATRIX` 的注册项；未注册即 `UnknownCapability`。
+
+---
+
+## 2026-04-25 (v0.7.0-P4 LLM pipeline 接入主路径)
+
+> **状态：v0.7.0 路线 P4 完成。`memory_write` / `memory_context` 主路径首次具备 opt-in LLM 蒸馏与召回概括能力。测试 416 → 442 (+26)。raw 仍 immutable + authoritative；LLM 失败仅 in-band 错误，绝不丢失主写。**
+
+### 新增
+
+- **`memory_llm_pipeline.py`**（NEW，~430 行）：单一 LLM token-spend orchestrator。
+  - `compute_distill_cache_key(raws, *, model, system, user)` → SHA-256 over `{model, system, user, records:[id,content,source,captured_at]}`，同输入同模型不重复花 token。
+  - `DistillCache(entries: dict[str,str])` 进程内字典缓存。
+  - `chunk_raw_records(raws, *, max_input_tokens, overhead_tokens=512)` 按 token 估算贪心切块，floor `MIN_CHUNK_BUDGET_TOKENS=1024`。
+  - `map_reduce_distill(client, raws, *, ...) -> dict` 多 chunk 自动 map-reduce（每 chunk 独立蒸馏 → REDUCE_SYSTEM_PROMPT 合并），单 chunk 直出；返回的 distilled 记录附 `pipeline={chunks, llm_calls, cache_hits, reduced}`；拒绝 distilled 输入；空集抛 `LLMConfigError`。
+  - `summarize_records_for_recall(client, records, *, query=None, ...) -> dict` 对召回结果做相同的 chunk + map-reduce 概括，返回 `{summary, model, chunks, llm_calls, cache_hits, reduced}`。
+
+### 接入
+
+- **`memory_write` / `op=record`**：新增 opt-in `distill: bool` + `distill_user_instruction: str` + `distill_tags: array` + `distill_max_tokens: int`。
+  - 主写成功后构造 `make_raw_record(record_id=raw_id, source="memory_write:<path>", captured_at=now, author=...)`；
+  - `map_reduce_distill(...)` 蒸馏并 `memory_write_record(record_kind="observation", scope="user_private", derived_from_record_ids=[raw_id], ...)` 落第二条记录；
+  - 返回 `result.distilled = {ok, summary, distilled_record_id, distilled_path, model, pipeline, usage, persist_result}`；
+  - LLM 不可用 / 失败 → `{ok: false, error: "llm_unavailable"|...}`，主写已落盘不会被回滚。
+- **`memory_context` / `op=retrieve_context`**：新增 opt-in `summarize: bool` + `summary_query: str` + `summary_max_tokens: int` + `summary_max_chars_per_record: int`(default 4000)。
+  - 召回成功且有记录后，对 `context_items`/`selected_records` 截断每条 `summary_max_chars_per_record` 字符，喂给 `summarize_records_for_recall`；
+  - 返回 `result.summary = {ok, summary, model, pipeline:{chunks, llm_calls, cache_hits, reduced}, usage}`；
+  - 无记录 → `{ok: false, error: "summarize_skipped"}`。
+
+### 测试
+
+- **`tests/memory_server/test_llm_pipeline.py`**（NEW，20 项）：缓存 key 确定性 / 模型敏感 / prompt 敏感 / 顺序敏感 / 额外元数据不影响；chunk 单 / 拆分 / 零上限 / 空集 / 类型守卫；map-reduce 单 chunk 无 reduce / 缓存命中短路 / 多 chunk 触发 reduce / 拒绝 distilled / 空集报错；summarize 单 chunk / 缓存 / 截断 / 空集 / query 改变 cache key。
+- **`tests/memory_server/test_llm_pipeline_dispatch.py`**（NEW，6 项）：distill 持久化 → 1 raw + 1 observation；distill 默认关闭（0 transport call）；LLM 不可用时 in-band `llm_unavailable`；summarize 附挂 summary；summarize 默认关闭；summarize 无记录返回 `summarize_skipped`。
+
+### 验证
+
+```powershell
+cd MCP/Memory
+.\.venv\Scripts\python.exe -m pytest tests/ -q   # 442 passed
+```
+
+### 硬约束保留
+
+- raw 写一次冻结（immutable=True，authoritative=True），LLM 输出**永不**直接落入 raw 真源或非 LLM 索引。
+- distilled 仍 `replaceable=True` + `derived_from=[raw_ids]`，可被任意 LLM 重做。
+- 全部 LLM 接入 opt-in；未触发开关时 `memory_write` / `memory_context` 行为与 v0.6.1 完全一致，0 LLM 调用 / 0 token。
+- 能力归属仍走 `memory_llm_policy.LLM_CAPABILITY_MATRIX` 单一事实源；未注册能力 → `UnknownCapability`。
+
+---
+
 ## 2026-04-26 (v0.6.0 完整发布: P0+P1+P2 全部落地)
 
 > **状态：v0.6.0「开箱即用稳健性版」全部 11 项 (P0×3 + P1×5 + P2×3) 完成。测试 230 → 333 (+103)。所有项严格遵循 §15.9.5 TDD 纪律：先写失败测试 → 最小实现 → 全量回归。**

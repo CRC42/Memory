@@ -5,7 +5,7 @@ by dispatching `ListToolsRequest` and `CallToolRequest` through the SDK's
 registered request-handler chain. This validates:
 
 - `create_server(config)` wires up `list_tools` and `call_tool` correctly.
-- Facade tools (`memory_read`, `memory_write`, `memory_context`) are reachable
+- Facade tools (`memory_read`, `memory_write`, `memory_context`, `memory_enhance`) are reachable
   via the actual MCP request envelope.
 - Tool responses are JSON-serialised into a single `TextContent` block whose
   body parses back to the same dict the dispatch layer produced.
@@ -64,23 +64,28 @@ async def _call_tool(server, name: str, arguments: dict) -> dict:
 
 
 def test_mcp_list_tools_default_facade(repo: Path) -> None:
-    """Default config exposes exactly the 3 facade tools via MCP envelope."""
+    """Default config exposes exactly the 4 facade tools via MCP envelope."""
     config = load_config(repo)
     server = create_server(config)
     tools = _run(_list_tools(server))
     names = sorted(t.name for t in tools)
-    assert names == ["memory_context", "memory_read", "memory_write"]
+    assert names == ["memory_context", "memory_enhance", "memory_read", "memory_write"]
 
 
 def test_mcp_list_tools_admin_mode(repo: Path) -> None:
-    """expose_admin_tools=true exposes 23 unique tools (3 facades + 20 legacy)."""
+    """expose_admin_tools=true exposes 24 unique tools (4 facades + 20 legacy)."""
     config = _load_with_admin(repo, True)
     server = create_server(config)
     tools = _run(_list_tools(server))
     names = [t.name for t in tools]
-    assert len(names) == 23, f"expected 23 tools, got {len(names)}: {names}"
-    assert len(set(names)) == 23, "tool names must be unique"
-    assert "memory_read" in names and "memory_write" in names and "memory_context" in names
+    assert len(names) == 24, f"expected 24 tools, got {len(names)}: {names}"
+    assert len(set(names)) == 24, "tool names must be unique"
+    assert (
+        "memory_read" in names
+        and "memory_write" in names
+        and "memory_context" in names
+        and "memory_enhance" in names
+    )
     assert "memory_get" in names  # legacy admin tool
 
 

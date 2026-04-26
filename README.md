@@ -1,6 +1,6 @@
 # Memory MCP Server
 
-给 AI 用的「项目记忆服务器」。本仓库下的 MCP 插件，把项目动态记忆（活跃上下文、任务进度、规则、证据、谱系）固化为 Markdown 真源 + SQLite 派生索引，AI 通过 3 个 facade 工具读写、搜索、编译、按预算输出重要记忆。
+给 AI 用的「项目记忆服务器」。本仓库下的 MCP 插件，把项目动态记忆（活跃上下文、任务进度、规则、证据、谱系）固化为 Markdown 真源 + SQLite 派生索引，AI 通过 4 个 facade 工具读写、搜索、编译、按预算输出重要记忆，并在显式开关下走 LLM 增强能力。
 
 详细设计见 [MemorySystemDesignDocument.md](./MemorySystemDesignDocument.md)，开发流水见 [DEVLOG.md](./DEVLOG.md)。
 
@@ -15,8 +15,11 @@
   - `.ai-context/` — 当前任务热上下文（一般不入 Git）
   - `.ai-memory/` — 配置、索引、备份、审计、缓存（不入 Git）
 - **当前能力**：读/搜/写普通文件、结构化记录（candidate → validated → published → archived）、SQLite FTS + 中文 bigram/trigram、deterministic 编译（runtime / snapshot / review / dao-fa-shu 视图）、谱系与冲突追踪、按 token/字符/条数预算的 `retrieve_context` /「重要记忆输出」。
-- **MCP 默认工具**：3 个 facade（`memory_read` / `memory_write` / `memory_context`），开发期可开 `expose_admin_tools=true` 暴露 23 个 legacy/admin 工具。
-- **状态**：v0.6.0 OOTB 硬化版（P0+P1+P2 全部完成），333 项测试全过。新增能力：strict user-id 校验、共享文件 overwrite 拒绝、启动 auto-maintenance、`bootstrap.ps1` 单一入口、UE facet 自动推断 + 未知组件警告、shared 文件按周自动归档、`config_diagnose`、`link_artifact` 路径归一化 + git_sha、`cli scale-baseline` + 健康回归告警、health 启动自愈、scoring 策略 hash 一致性。详见 [DEVLOG.md](DEVLOG.md) 2026-04-26 条目。
+- **MCP 默认工具**：4 个 facade（`memory_read` / `memory_write` / `memory_context` / `memory_enhance`），开发期可开 `expose_admin_tools=true` 暴露共 24 个工具（4 facade + 20 legacy/admin）。
+- **LLM 接入**（v0.6.1）：OpenAI 兼容客户端（默认 DeepSeek）+ 原始不可改 / 蒸馏可替换原语 + 输入/输出/总成本预算闸门 + LLM/非-LLM 职责矩阵。详见 §3.5、§4.8。
+- **LLM pipeline 接入主路径**（v0.7.0 P4）：`memory_write` 支持 `distill=true` 自动落 distilled 蒸馏记录；`memory_context` 支持 `summarize=true` 把召回结果交给 LLM 概括；内置 SHA-256 内容哈希 dedup + token 估算 chunking + map-reduce orchestrator。详见 §3.6、§5.1。
+- **LLM 增强接口 facade**（v0.7.0 P4-B）：`memory_enhance` 单一 MCP 工具路由 6 个 opt-in LLM 能力（classify_record / extract_candidates / merge_candidates / generate_skill_candidate / explain_conflict / generate_handoff）。只返回结构化建议，不写盘；上层决定是否以 candidate 謡落 `memory_write_record`。详见 §3.7、§5.1.B。
+- **状态**：v0.7.0-P4。全套 475 项测试全过（v0.6.1 416 + LLM pipeline 接入 26 + LLM 增强接口 33）；活环境冲烟已验证 DeepSeek wire-format 可联通。
 
 ---
 
@@ -126,7 +129,7 @@ env = { PYTHONPATH = 'C:\Work\GIT\ToolTest\MCP\Memory', PYTHONUTF8 = '1' }
 # 启动调试
 powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_server.ps1
 
-# 跑全部测试（应输出 333 passed）
+# 跑全部测试（应输出 475 passed）
 powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
 ```
 
@@ -141,8 +144,9 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 | 工具 | 主要用途 |
 |---|---|
 | `memory_read` | 读文件 / 搜普通记忆 / 搜结构化记录 / 读 runtime digest |
-| `memory_write` | 写普通文件 / 写结构化记录 / 写 observation / 关联 artifact |
-| `memory_context` | 编译视图 / 追谱系 / 列冲突 / 对比 snapshot / 上下文装配 / 重要记忆输出 |
+| `memory_write` | 写普通文件 / 写结构化记录 / 写 observation / 关联 artifact / 可选 LLM 蒸馏 |
+| `memory_context` | 编译视图 / 追谱系 / 列冲突 / 对比 snapshot / 上下文装配 / 重要记忆输出 / 可选 LLM 召回概括 |
+| `memory_enhance` | 6 个 opt-in LLM 能力的 read-only facade（classify / extract / merge / skill / conflict / handoff） |
 
 每个工具通过 `operation` 参数分发到子能力。例：
 
@@ -189,7 +193,144 @@ powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests
 { "mcp": { "expose_admin_tools": true } }
 ```
 
-打开后总计暴露 23 个工具（`memory_get` / `memory_search` / `memory_compile` / `memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record` / `memory_health_check` / `memory_record_observation` / `memory_link_artifact` / `memory_trace_lineage` 等）。生产/普通用户保持默认 3 facade 即可。
+打开后总计暴露 24 个工具（4 facade + 20 legacy/admin：`memory_get` / `memory_search` / `memory_search_records` / `memory_guard_check` / `memory_backup` / `memory_compact` / `memory_write_record` / `memory_rebuild_index` / `memory_update_index` / `memory_compile` / `memory_get_runtime_digest` / `memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record` / `memory_delete_record` / `memory_record_observation` / `memory_link_artifact` / `memory_trace_lineage` / `memory_health_check` / `memory_migrate_records`）。注：legacy `memory_write` 与 facade `memory_write` 同名，已在合并时去重，故 admin 总数为 24（不是 25）。生产/普通用户保持默认 4 facade 即可。
+
+### 3.5 LLM 接入（v0.6.1）
+
+LLM 是 **可选插件式蒸馏器**，不在主路径上。关闭 LLM 时所有写入/检索/编译能力照常工作（详见 §4.8）。
+
+**配置**
+
+```powershell
+# 1) 复制模板
+Copy-Item MCP/Memory/llm_config.example.json MCP/Memory/llm_config.local.json
+# 2) 填 api_key（文件已 gitignore）
+# 3) 也支持 env：MEMORY_LLM_API_KEY / MEMORY_LLM_BASE_URL / MEMORY_LLM_MODEL ...
+```
+
+默认指向 DeepSeek（`https://api.deepseek.com`，模型 `deepseek-chat`，OpenAI 兼容）。可指向任意 OpenAI-style endpoint。
+
+**成本闸门**（默认值就足以防失控）
+
+| 配置项 | 默认 | 作用 |
+|---|---|---|
+| `max_output_tokens_per_call` | 1024 | 每次调用的 `max_tokens` 上限，钳制超过的请求 |
+| `max_input_tokens_per_call` | 32000 | 估算 prompt token 超限 → `LLMInputTooLarge`，**不触网** |
+| `max_total_output_tokens` | 200000 | 进程累计输出 token 预算 → `LLMBudgetExceeded` |
+| `input_cny_per_mtok` / `output_cny_per_mtok` | 1.0 / 2.0 | DeepSeek-flash 价格，记账用 |
+| `max_total_cost_cny` | 0（关闭） | 进程累计估算成本上限（CNY） |
+| `default_thinking` | false | 思考模式默认关；按需 per-call `thinking=True` |
+
+`LLMClient.usage_snapshot()` 输出 `call_count` / `total_prompt_tokens` / `total_completion_tokens` / `total_estimated_cost_cny`。
+
+**核心 API**
+
+```python
+from servers.memory_server.memory_llm import (
+    LLMClient, make_raw_record, distill_raw_records,
+)
+client = LLMClient()  # 自动加载 llm_config.local.json / env
+raws = [make_raw_record(record_id="r-1", content="...", source="ue_mcp", captured_at="...")]
+distilled = distill_raw_records(client, raws, record_id="d-1", distilled_at="...")
+# distilled["derived_from"] == ["r-1"]，可被任意 LLM 重做
+```
+
+**关键不变量**
+
+- raw 记录一旦 `make_raw_record` → `immutable=True`，任何 LLM 都不能改/删
+- distilled 记录 `replaceable=True` + `derived_from=[raw_ids]`，可被任意 LLM 自由覆盖（`supersede_distilled`）
+- LLM 输出**永不**直接落入 raw 真源或非 LLM 索引
+
+详见设计文档 §2.0 / §2.1.A / §11.3.1 / §12。
+
+### 3.6 LLM pipeline 接入主路径（v0.7.0-P4）
+
+```jsonc
+// memory_write 自动蒸馏（opt-in）
+{
+  "operation": "record",
+  "content_markdown": "Decision: switch logging backend to spdlog because of perf gains.",
+  "record_kind": "decision",
+  "scope": "personal",
+  "distill": true,                        // 默认 false；仅在 true 时调 LLM
+  "distill_user_instruction": "...",      // 可选
+  "distill_max_tokens": 1024              // 可选
+}
+// 返回 result.distilled = {ok, summary, distilled_record_id, distilled_path, model, pipeline, usage, persist_result}
+// 失败：{ok: false, error: "llm_unavailable"|...}；主写仍然成功，raw 已落盘
+```
+
+```jsonc
+// memory_context 召回结果 LLM 概括（opt-in）
+{
+  "operation": "retrieve_context",
+  "query": "subsystem A",
+  "top_k": 5,
+  "summarize": true,
+  "summary_query": "subsystem A 设计决策回顾",
+  "summary_max_chars_per_record": 4000
+}
+// 返回 result.summary = {ok, summary, model, pipeline:{chunks,llm_calls,cache_hits,reduced}, usage}
+```
+
+实现要点：
+- `memory_llm_pipeline.compute_distill_cache_key` 用 `model + system + user + records` 做 SHA-256 ⇒ 同输入同模型不重复花 token
+- `chunk_raw_records` 按 token 估算贪心切块，超 budget 自动 map-reduce
+- raw 永远先落盘；LLM 失败仅 in-band 错误，绝不影响主写
+
+### 3.7 LLM 增强接口 facade（v0.7.0-P4-B）
+
+`memory_enhance` 是单一 MCP 工具入口，按 `operation` 字段路由 6 个 opt-in LLM 能力。**全部 read-only**：
+返回结构化建议，**不写盘**；上层根据需要把结果以 `status="candidate"` 经 `memory_write_record` 落盘。
+
+| operation | 输入要点 | 返回字段 |
+|-----------|----------|----------|
+| `classify_record` | `content_markdown` + 可选 `allowed_kinds/scopes/tags` | `record_kind`, `scope`, `tags`, `confidence∈[0,1]`, `rationale` |
+| `extract_candidates` | `content_markdown` + 可选 `source_record_id` | `candidates:[{kind∈{claim_candidate,rule_candidate}, content_markdown, confidence, tags, rationale, source_record_id}]` |
+| `merge_candidates` | `candidates:[{id, content_markdown}]`（≥2） | `groups:[{representative_id, member_ids[], merged_content_markdown, rationale}]`（必须**完整划分**输入 id） |
+| `generate_skill_candidate` | `records:[{...}]` | `title`, `content_markdown`, `tags`, `confidence`, `rationale`, `source_record_count` |
+| `explain_conflict` | `record_a`, `record_b` | `conflict_type∈{contradiction,overlap,scope_mismatch,no_conflict,unclear}`, `severity∈{low,medium,high}`, `explanation`, `resolution_options[]` |
+| `generate_handoff` | `records:[{...}]` + 可选 `task_id`, `branch` | `summary_markdown`, `key_points[]`, `open_questions[]`, `next_actions[]`, `source_record_count` |
+
+通用：所有响应携带 `model` 与 `usage_delta = {prompt_tokens, completion_tokens, estimated_cost_cny}`；失败统一 in-band 返回 `{error:"enhance_failed:<op>"|"llm_unavailable"|"invalid_input", reason}`。
+
+```jsonc
+// 示例：分类
+{
+  "operation": "classify_record",
+  "content_markdown": "决定将日志后端切换到 spdlog 以获得更高吞吐...",
+  "allowed_kinds": ["decision","note","claim_candidate"],
+  "max_tokens": 400
+}
+```
+
+```jsonc
+// 示例：合并候选
+{
+  "operation": "merge_candidates",
+  "candidates": [
+    {"id":"a","content_markdown":"使用 spdlog 的原因 1"},
+    {"id":"b","content_markdown":"spdlog 性能数据 ..."},
+    {"id":"c","content_markdown":"无关：其他主题"}
+  ]
+}
+```
+
+```jsonc
+// 示例：生成交接
+{
+  "operation": "generate_handoff",
+  "task_id": "TASK-123",
+  "branch": "feature/x",
+  "records": [{"content_markdown":"今日完成 ..."}, {"content_markdown":"待办 ..."}]
+}
+```
+
+实现要点：
+- 单文件 `memory_llm_enhance.py`，`_parse_json_response` 容忍 ```` ```json ``` ```` 围栏与杂散文本；解析失败 → `LLMEnhanceError`
+- 6 个能力均通过 `memory_llm_policy.LLM_CAPABILITY_MATRIX` 的能力名（`classify` / `extract_claims` / `merge_candidates` / `generate_skill_candidate` / `explain_conflict` / `generate_handoff`）；未注册即 `UnknownCapability`
+- 严格 allowlist：`classify_record` 的 `kind/scope` 必须落入入参 allowed list（默认取 `ALLOWED_RECORD_KINDS / ALLOWED_SCOPES`），未通过即 `enhance_failed:classify_record`
+- `merge_candidates` 必须输出输入 id 的**全分区**（无遗漏、无重复、无未知 id）
 
 ---
 
@@ -231,13 +372,73 @@ candidate → validated → published → archived 流程仍然可用（带 conf
 
 ### 4.7 Facade 收敛 MCP 表面
 
-默认只暴露 3 个 facade，避免 AI 客户端在 20+ 低频管理工具里迷路。admin/legacy 工具改走 CLI / scripts / skill / 显式开关，以「日常调用集」与「治理/维护集」分层。
+默认只暴露 4 个 facade，避免 AI 客户端在 20+ 低频管理工具里迷路。admin/legacy 工具改走 CLI / scripts / skill / 显式开关，以「日常调用集」与「治理/维护集」分层。
+
+### 4.8 LLM 只做 LLM 擅长的，其余全部确定性
+
+> **raw 不可改 → LLM 想接哪都行；但只接 LLM 真正擅长的环节。**
+
+判断要不要在某处用 LLM：
+
+1. 非 LLM 已经做得足够好？→ **不引入**（确定性、零成本、零延迟）。
+2. 离开 LLM 就根本做不好？→ **引入**，但落 distilled 层、可被任意 LLM 重建、不污染 raw。
+
+能力归属由 [`memory_llm_policy.py`](servers/memory_server/memory_llm_policy.py) 单一事实源管理：`LLM_CAPABILITY_MATRIX` + `should_use_llm()` + `must_be_deterministic()`。未注册的能力 → `UnknownCapability`，强制每次决策显式登记。
+
+| 锁死为非-LLM | 由 LLM 做 | hybrid（LLM 提议 → 非-LLM 落盘） |
+|---|---|---|
+| raw 写入 / 哈希 / 冻结 | 自然语言摘要 | 冲突识别（语义层） |
+| Front Matter 解析 / Schema 校验 | 跨 raw 主题聚类 | 自然语言查询解析 |
+| 事件日志 / Lock / Backup / Compactor | 自由文本重写 |  |
+| FTS 检索 / 评分 / 衰减 |  |  |
+| Token 估算 / 模板 digest |  |  |
+| 链路追溯 / 治理 / 预算控制 |  |  |
+
+**系统级不变量**
+
+- 任意环节关闭 LLM，系统功能不退化为 0：raw 仍写入、FTS 仍可检索、模板 compile 仍出 digest
+- LLM 输出永不直接覆盖 raw 或非 LLM 索引
+- distilled 可丢可重建，不损坏真源
+
+完整矩阵与集成图见设计文档 §12。
 
 ---
 
 ## 5. 开发计划与状态
 
-### 5.1 v0.6.0 OOTB 硬化（已完成 ✅）
+### 5.1 v0.6.1 LLM 接入 + 自治蒸馏 + 职责矩阵（已完成 ✅）
+
+测试 333 → **416 passed**。详见设计文档 §2.0 / §2.1.A / §11.3.1 / §12，DEVLOG 2026-04-25 条目。
+
+| 模块 | 关键能力 |
+|------|----------|
+| `memory_llm.py` | OpenAI 兼容客户端（默认 DeepSeek），`thinking`/`reasoning_effort` 开关，输入 cap (`LLMInputTooLarge`) + CJK-aware prompt 估算 + 输出 cap + 总成本预算 (`LLMBudgetExceeded`) + `usage_snapshot` 含估算 CNY |
+| `memory_llm.py` 原语 | `make_raw_record`（immutable=True 写一次冻结）、`make_distilled_record`（必须 `derived_from`）、`assert_raw_writable`（写守卫）、`supersede_distilled`（任意 LLM 可重建）、`distill_raw_records`（raw → LLM → distilled 桥） |
+| `memory_llm_policy.py` | `LLM_CAPABILITY_MATRIX` 单一事实源（18 项能力 → `non_llm`/`llm`/`hybrid`），`should_use_llm` / `must_be_deterministic` / `UnknownCapability` 强制注册 |
+| 配置 | `llm_config.example.json`（gitignored `llm_config.local.json`）+ `MEMORY_LLM_*` env 全套覆盖 |
+
+### 5.1.A v0.7.0-P4 LLM pipeline 接入主路径（已完成 ✅）
+
+测试 416 → **442 passed**（+26：20 项 pipeline 单元 + 6 项 dispatch 集成）。
+
+| 模块 / 接口 | 关键能力 |
+|------|----------|
+| `memory_llm_pipeline.py`（NEW） | `compute_distill_cache_key`（SHA-256 over `model + system + user + records`）、`DistillCache`、`chunk_raw_records`（greedy by token estimate，floor 1024）、`map_reduce_distill`（多 chunk 走 reduce，单 chunk 直出）、`summarize_records_for_recall`（召回结果 LLM 概括） |
+| `memory_write` | 新增 opt-in `distill=true` + `distill_user_instruction` / `distill_max_tokens`；主写成功后异步触发 distill，落到 `record_kind=observation` + `scope=user_private` + `derived_from_record_ids=[raw_id]`；LLM 失败 in-band 报 `llm_unavailable`，主写绝不丢失 |
+| `memory_context` | 新增 opt-in `summarize=true` + `summary_query` / `summary_max_tokens` / `summary_max_chars_per_record`；返回 `summary={ok,summary,model,pipeline,usage}` |
+| 硬约束 | raw 仍 immutable + authoritative；distilled 仍 replaceable；未触发开关 → 0 LLM 调用 0 token；触发后失败仅返回结构化错误 |
+
+### 5.1.B v0.7.0-P4-B LLM 增强接口 facade（已完成 ✅）
+
+测试 442 → **475 passed**（+33：22 项单元 + 6 项 dispatch + 5 项 _parse_json_response 子项）。详见 §3.7。
+
+| 模块 / 接口 | 关键能力 |
+|------|----------|
+| `memory_llm_enhance.py`（NEW） | `_parse_json_response`（容忍 ```` ```json ``` ```` 围栏，提取首未尾成对括号，错误住 → `LLMEnhanceError`）、6 个能力函数：`classify_record` / `extract_candidates` / `merge_candidates` / `generate_skill_candidate` / `explain_conflict` / `generate_handoff` |
+| MCP `memory_enhance` | 单一 facade，`operation` 路由到上述 6 个能力；**read-only**，返回结构化建议 + `model` + `usage_delta`；未调用 LLM 不会调；失败 in-band 返 `enhance_failed:<op>` / `llm_unavailable` / `invalid_input` |
+| 硬约束 | 不写盘 / 不改 raw；`merge_candidates` 必须返回输入 id 的完整划分；`classify_record.kind/scope` 必须落入 allowlist；上层选择是否以 `status="candidate"` 调 `memory_write_record` 落盘 |
+
+### 5.2 v0.6.0 OOTB 硬化（已完成 ✅）
 
 11 项全部按 TDD 落地，测试 230 → **333 passed**。详见 [DEVLOG.md](./DEVLOG.md) 2026-04-26 条目与设计文档 §15.9。
 
@@ -255,17 +456,18 @@ candidate → validated → published → archived 流程仍然可用（带 conf
 | P2 健康/演进 | health 启动自愈 | 清理 60s 以上 `*.tmp` / `*.lock` |
 | P2 健康/演进 | scoring 策略 hash 一致性 | events.jsonl 写哈希 + health `scoring_strategy_changed` |
 
-### 5.2 v0.7.0 路线（高 → 低）
+### 5.3 v0.7.0 路线（高 → 低）
 
-1. **P4 LLM 软增强**：query rewrite、tag/facet 推荐、snapshot narrative、conflict explanation、title/abstract 优化。LLM 不能直接发布系统记忆、不能覆盖真源、不能替代 deterministic compile。
-2. **P5 本地 RAG / 向量补召回**：语义模糊召回与低 FTS 命中场景。向量索引落 `.ai-memory/`，可删可重建，永不作为真源。检索顺序：`metadata → FTS → vector supplement → rerank`。
-3. **`bootstrap.ps1` e2e 演练**：在真实开发机（含已有 `.vscode/mcp.json` 和遗留 `settings.json`）上端到端演练并把指纹收回 README/DEVLOG。
+1. **P4 LLM pipeline 接入主路径**（已完成 ✅）：详见 §5.1.A。
+2. **P4-B LLM 增强接口 facade**（已完成 ✅）：`memory_enhance` 单一 facade 路由 6 个 opt-in LLM 能力。详见 §3.7 / §5.1.B。
+3. **P5 本地 RAG / 向量补召回**：语义模糊召回与低 FTS 命中场景。向量索引落 `.ai-memory/`，可删可重建，永不作为真源。检索顺序：`metadata → FTS → vector supplement → rerank`。
+4. **`bootstrap.ps1` e2e 演练**：在真实开发机（含已有 `.vscode/mcp.json` 和遗留 `settings.json`）上端到端演练并把指纹收回 README/DEVLOG。
 
 > 历史里程碑（v0.4 → v0.5.10）见 [DEVLOG.md](./DEVLOG.md)。
 
 ---
 
-## 6. 大型 UE 多人项目就绪度评估（v0.6.0）
+## 6. 大型 UE 多人项目就绪度评估（v0.6.1）
 
 以「2-20 人 / 同 workspace / 多 VS Code + Codex 会话」为目标场景。
 
@@ -295,13 +497,14 @@ candidate → validated → published → archived 流程仍然可用（带 conf
 
 ### 6.3 v0.7.0 之前 *不能* 假设的能力
 
-- LLM 自动 query rewrite / 总结（仍需手工或外部 agent 触发）。
-- 向量召回（仅 FTS + bigram/trigram；中文长 token 短查询的召回兜底依赖人工 tag）。
+- 向量召回（仅 FTS + bigram/trigram；中文长 token 短查询的召回兜底依赖人工 tag；P5 路线）。
 - 跨机器实时协作（不是 server，没有 WebSocket / 中心服务）。
+
+> v0.7.0-P4 起 LLM 蒸馏自动写盘 / 召回摘要已接入 `memory_write` / `memory_context`，需通过显式 `distill=true` / `summarize=true` 开关启用。v0.7.0-P4-B 另增单一 facade `memory_enhance`（6 个 opt-in LLM 能力），**read-only**，返回结构化建议不写盘；上层可以 candidate 状态调 `memory_write_record` 落盘。
 
 ### 6.4 结论
 
-**当前 v0.6.0 已具备「同 workspace 多人 + 多 agent」UE 大型项目的生产可用基线**：
+**当前 v0.6.1 已具备「同 workspace 多人 + 多 agent」UE 大型项目的生产可用基线**：
 
 - 数据安全（用户身份、写入冲突、崩溃耐久度）
 - 并发安全（跨进程锁、SQLite WAL、乐观锁、压测）

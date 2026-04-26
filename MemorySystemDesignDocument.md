@@ -12,12 +12,13 @@
 
 ### 0.1 已有实现
 
-当前仓库中的 Memory MCP 默认对外暴露 3 个 facade tools，并保留 legacy/admin 兼容工具：
+当前仓库中的 Memory MCP 默认对外暴露 4 个 facade tools，并保留 legacy/admin 兼容工具：
 
 - `memory_read`：读取文件、普通搜索、结构化记录搜索、读取 runtime digest
-- `memory_write`：普通文件写入、结构化记录写入、observation 证据写入、artifact/facet 关联
-- `memory_context`：编译 runtime / snapshot / review 视图、读取 digest、追踪 lineage、列出 conflicts、对比 snapshot、装配上下文
-- `mcp.expose_admin_tools=true`：开发期或纯 MCP 客户端兼容完整 legacy/admin 工具集
+- `memory_write`：普通文件写入、结构化记录写入、observation 证据写入、artifact/facet 关联（可选 distill）
+- `memory_context`：编译 runtime / snapshot / review 视图、读取 digest、追踪 lineage、列出 conflicts、对比 snapshot、装配上下文（可选 summarize）
+- `memory_enhance`（6 个 opt-in LLM 增强能力的 read-only facade）
+- `mcp.expose_admin_tools=true`：开发期或纯 MCP 客户端兼容完整 legacy/admin 工具集，合并后去重总数 24（4 facade + 20 legacy/admin）
 
 内部已具备：路径安全、原子写入、备份/压缩/guard、CJK 搜索、结构化记录、SQLite FTS、治理发布、确定性编译、P3 snapshot/scoring/retrieval、record IO 公共层和深度健壮性加固。
 
@@ -67,17 +68,55 @@
 
 ## 2. 核心设计原则
 
+### 2.0 自动化原则（首要原则）
+
+> **本系统的目标是尽量"无人值守"。**
+
+记忆落地不应依赖人工确认。LLM 提炼、归类、改写、覆盖、归档全部走自动化链路。
+人工只在两个场景介入：
+
+1. 出现明显错误或冲突时手动修正
+2. 直接以 `human` 身份新增 raw 原始记忆
+
+为了让"无人值守"安全成立，必须把"原始信息"与"派生信息"严格分层（见 §2.1.A）。
+
+### 2.1.A 真源不可变原则（Raw-Immutable）
+
+**唯一受写保护的层是 `raw` 原始信息层。**
+
+- `raw` 一旦写入即冻结：`immutable=True`、`authoritative=True`、不可被任何
+  LLM/agent 修改或删除。源是文件系统 + 事件日志，不是任何 LLM 的输出。
+- 任何 LLM 提炼物都属于 `distilled` 派生层：`immutable=False`、`authoritative=False`、
+  `status=distilled`，**不需要人工 validate / publish**，可被任意 LLM 自动改写
+  或重建。
+- 派生记录必须携带 `derived_from=[raw_id, ...]` 字段，把谱系绑死在不可变 raw
+  层。这样：
+  - 任意 LLM（含本地、不同模型、不同版本）都能从 raw 重新生成 distilled
+  - 任意时刻人工都能审阅、回滚、重建任意 distilled 视图
+  - 不同 LLM 之间互相覆盖 distilled 不会丢失原始证据
+
+实现层面（参见 `memory_llm.py`）：
+
+- `make_raw_record(...)` — 构造冻结的 raw 记录，标记 `immutable=True`
+- `make_distilled_record(..., derived_from=[...])` — 构造可替换的 distilled 记录，
+  必须提供 `derived_from`
+- `supersede_distilled(previous, ...)` — 用新 LLM 重写 distilled，自动继承
+  原 `derived_from` 链路
+- `assert_raw_writable(record)` — 写入路径上的硬守卫，遇到 raw 立即抛
+  `RawImmutableError`
+
 ### 2.1 真源原则
 
 记忆系统的真源不是模型输出，而是：
 
-- Markdown 记忆文件
+- Markdown 记忆文件（`raw` 层为主，`distilled` 层为派生快照）
 - 结构化元数据
 - 事件日志
-- 候选记录
-- 已发布系统记忆
+- 候选记录（兼容历史，新流程默认走 distilled）
+- 已发布系统记忆（兼容历史）
 
-LLM 只能参与提炼和填表，不能成为唯一真源。
+LLM 永远不能修改 raw 层；它只能在 distilled 层产出可被自身或其他 LLM 重写的
+记录。
 
 ### 2.2 分层原则
 
@@ -468,10 +507,25 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 ### 7.3 写入阶段不能做的事
 
-- LLM 直接发布正式系统记忆
-- LLM 直接决定最终 skill 发布
-- LLM 直接删除正式系统记忆
-- LLM 在无来源时生成系统共识
+> 在 raw-immutable + distilled-replaceable 模型下，LLM 的写入边界是
+> **"raw 永远不能改，distilled 可以随便改"**。
+
+LLM 不能：
+
+- 修改任何 `raw` / `immutable=True` 的记录（必须抛 `RawImmutableError`）
+- 删除任何 `raw` 记录或事件日志
+- 把 `distilled` 记录提升为 `raw` 或 `authoritative=True`
+- 在 `derived_from` 为空时产出 distilled 记录（必须能追溯回 raw）
+
+LLM 可以（无需人工确认）：
+
+- 写入新的 `raw` 记录（`immutable=True` 立即冻结）
+- 写入新的 `distilled` 记录
+- 用新 LLM 输出 `supersede` 之前的 distilled 记录
+- 自动归类、打标、生成 abstract、生成 snapshot narrative
+
+历史 `published` / `validated` / `dao` 层属于兼容路径，仍保留人工/规则限制
+（见 §10），但不再是默认链路。
 
 ## 8. 编译模型
 
@@ -696,6 +750,12 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 ### 10.1 候选流程
 
+> ⚠️ **`candidate -> validated -> published` 是历史兼容流程，不是默认路径。**
+> 自动化主流程改走 §2.1.A 的 raw-immutable + distilled-replaceable 模型：
+> - 新写入默认是 `raw`（冻结）或 `distilled`（可被任意 LLM 覆盖）
+> - distilled 不需要人工 validate / publish 即可生效
+> - 仅当历史数据迁移、跨团队共识发布等特殊场景才走下面的 candidate 流程
+
 当前仓库仍保留记录验证、发布、归档这条治理链路，用于兼容现有实现、测试和历史数据迁移；但它不再是后续最高优先级。
 
 系统记忆与 skill 当前仍可经过：
@@ -814,7 +874,12 @@ LLM 在这里的角色是按 schema 填表的记录助手，不是最终裁决�
 
 在此基础上，后续最高优先级不再是扩展插件内治理，而是补齐“重要记忆输出”接口：让 LLM / agent 能在严格预算内拿到之前最重要的动态记忆，再由外部流程决定是否沉淀为项目规则。
 
-默认 MCP 对外只暴露 3 个 facade tools：
+默认 MCP 对外暴露 4 个 facade tools：
+
+- `memory_read`
+- `memory_write`
+- `memory_context`
+- `memory_enhance`（v0.7.0-P4-B 起；read-only LLM 增强，不写盘）
 
 - `memory_read`
   - 负责读取、搜索、搜索结构化记录、读取 runtime digest。
@@ -862,8 +927,8 @@ Skill:
 当前兼容策略：
 
 - 内部 Python 函数继续保留，不立即删除。
-- 开发期可通过配置开关继续暴露完整工具集：`mcp.expose_admin_tools=true`，当前兼容工具数为 23（含 3 个 facade）。
-- 默认 MCP tool list 收敛为 3 个 facade。
+- 开发期可通过配置开关继续暴露完整工具集：`mcp.expose_admin_tools=true`，当前兼容工具总数为 24（含 4 个 facade）。
+- 默认 MCP tool list 收敛为 4 个 facade。
 - CLI 和 skill 负责高风险、低频、管理类操作。
 - 如果某些纯 MCP 客户端不能执行 CLI，可用配置显式开启 legacy/admin tools。
 
@@ -923,14 +988,91 @@ Skill:
 
 ### 11.3 增强能力接口（可选依赖 LLM）
 
-- `memory_classify_record`
-- `memory_extract_candidate`
-- `memory_merge_candidates`
-- `memory_generate_skill_candidate`
-- `memory_explain_conflict`
-- `memory_generate_handoff`
+> **v0.7.0-P4-B 起：6 项接口已落地，统一通过单一 facade `memory_enhance` 暴露。**
+> 实现位置：`servers/memory_server/memory_llm_enhance.py`；MCP 路由位置：`server_dispatch._dispatch_memory_enhance`。
 
-这些接口失败时不得影响基础链路。
+| 设计名 | facade operation | 实现函数 | 状态 |
+|--------|------------------|----------|------|
+| `memory_classify_record` | `classify_record` | `classify_record` | ✅ v0.7.0-P4-B |
+| `memory_extract_candidate` | `extract_candidates` | `extract_candidates` | ✅ v0.7.0-P4-B |
+| `memory_merge_candidates` | `merge_candidates` | `merge_candidates` | ✅ v0.7.0-P4-B |
+| `memory_generate_skill_candidate` | `generate_skill_candidate` | `generate_skill_candidate` | ✅ v0.7.0-P4-B |
+| `memory_explain_conflict` | `explain_conflict` | `explain_conflict` | ✅ v0.7.0-P4-B |
+| `memory_generate_handoff` | `generate_handoff` | `generate_handoff` | ✅ v0.7.0-P4-B |
+
+这些接口失败时不得影响基础链路：
+
+- `memory_enhance` 是**read-only**：所有 op 仅返回结构化建议，**永不写盘**；上层（agent）显式以 `status="candidate"` 调 `memory_write_record` 才会落盘。
+- LLM 不可用 / 解析失败 / allowlist 不通过 / 输入非法 → 统一返回 in-band 错误（`llm_unavailable` / `enhance_failed:<op>` / `invalid_input`），绝不破坏基础链路或污染 raw。
+- 6 项能力名最终对应 `memory_llm_policy.LLM_CAPABILITY_MATRIX` 注册项；未注册即 `UnknownCapability`。
+- 详细字段契约与示例：见 `MCP/Memory/README.md` §3.7。
+
+#### 11.3.1 LLM 接入方案（OpenAI 兼容协议）
+
+LLM 软增强统一走 OpenAI 兼容的 `/chat/completions` 协议，默认 profile 指向
+DeepSeek（`https://api.deepseek.com`，模型 `deepseek-chat`）。任何兼容
+OpenAI 协议的服务（DeepSeek / OpenAI / Moonshot / 本地 vLLM / Ollama OpenAI 网关
+等）只需切换 `base_url` + `model` 即可复用。
+
+实现位置：`servers/memory_server/memory_llm.py`，对外暴露：
+
+- `LLMConfig` / `load_llm_config()`：配置加载
+- `LLMClient.chat(messages, ...)` / `LLMClient.complete_text(prompt, ...)`：客户端
+- `build_chat_payload()` / `extract_text()`：纯函数原语，便于在不联网情况下
+  做 deterministic 单元测试
+
+设计约束：
+
+- 仅依赖 stdlib（`urllib`），不引入运行时新依赖
+- 所有 LLM 调用均为可注入 transport，方便测试以 mock 方式覆盖
+- LLM 失败必须抛 `LLMRequestError`，由调用方决定是否退化为无 LLM 路径
+- 不在日志中输出 API key、不在事件流中持久化 prompt 全文（按需脱敏）
+
+配置来源（按优先级从高到低）：
+
+1. 显式构造 `LLMConfig` 或调用参数 `overrides`
+2. 环境变量
+   - `MEMORY_LLM_API_KEY`（兼容回落 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`）
+   - `MEMORY_LLM_BASE_URL`、`MEMORY_LLM_MODEL`、`MEMORY_LLM_TIMEOUT`
+3. 插件根目录本地文件 `MCP/Memory/llm_config.local.json`（**不入 Git**，
+   `.gitignore` 已排除；模板见 `llm_config.example.json`）
+
+⚠️ 安全约束：`llm_config.local.json` 与任何 `*.api_key` / `*.apikey` 文件已在
+`MCP/Memory/.gitignore` 中标记忽略，禁止把真实 API key 提交到任何版本库。
+
+#### 11.3.2 LLM pipeline 接入主路径（v0.7.0-P4）
+
+实现位置：`servers/memory_server/memory_llm_pipeline.py`，作为 `memory_llm`
+原语之上的 token-spend orchestrator，统一处理「同输入不重复花钱」「过长
+输入分块汇总」两个工程问题：
+
+- `compute_distill_cache_key(raws, *, model, system_prompt, user_instruction=None)`：
+  对 `{model, system, user, records:[{id, content, source, captured_at}, ...]}`
+  做 SHA-256；同一组 raw + 同一模型 + 同一 prompt → 同 key，可被进程内
+  `DistillCache` 短路。
+- `chunk_raw_records(raws, *, max_input_tokens, overhead_tokens=512)`：
+  按 token 估算贪心切块，floor `MIN_CHUNK_BUDGET_TOKENS=1024`；输入限制
+  超过单 chunk 时自动多 chunk。
+- `map_reduce_distill(client, raws, *, record_id, distilled_at, ...) -> dict`：
+  单 chunk 直出（避免无谓的 reduce 调用）；多 chunk 时每 chunk 蒸馏后
+  以 `REDUCE_SYSTEM_PROMPT` 合并；返回 distilled 记录附
+  `pipeline={chunks, llm_calls, cache_hits, reduced}`。拒绝 distilled 输入；
+  空集抛 `LLMConfigError`。
+- `summarize_records_for_recall(client, records, *, query=None, ...) -> dict`：
+  对召回结果走相同的 chunk + map-reduce 概括逻辑。
+
+主路径接入：
+
+| 入口 | opt-in 字段 | 行为 |
+|------|------------|------|
+| `memory_write` op=`record` | `distill: bool`, `distill_user_instruction`, `distill_max_tokens` | 主写成功后构造 raw view → `map_reduce_distill` → `memory_write_record(record_kind="observation", scope="user_private", derived_from_record_ids=[raw_id])` 落第二条记录；返回 `result.distilled`。失败仅 in-band 报 `llm_unavailable`，主写已落盘不会回滚。 |
+| `memory_context` op=`retrieve_context` | `summarize: bool`, `summary_query`, `summary_max_tokens`, `summary_max_chars_per_record`(默认 4000) | 召回成功且有记录后概括 `context_items`/`selected_records`；返回 `result.summary`。无记录 → `summarize_skipped`。 |
+
+硬约束（与 §2.1.A 一致）：
+
+- raw 永远先落盘；LLM 失败绝不影响主写
+- distilled 仍 `replaceable=True` + `derived_from=[raw_ids]`
+- 默认全部 opt-in；未触发开关 → 0 LLM 调用 / 0 token
 
 ### 11.4 MCP 写入接口示例
 
@@ -979,9 +1121,74 @@ Skill:
 }
 ```
 
-## 12. 无 LLM 兜底方案
+## 12. 无 LLM 兜底方案 + LLM/非-LLM 职责划分
 
-### 12.1 必须保证的能力
+### 12.0 总原则
+
+> **raw 原始信息不可改 → LLM 想接哪个环节都可以；
+> 但只在"LLM 真正擅长"的环节用，其他全部由确定性代码完成。**
+
+判断一个能力该不该走 LLM，按这两条筛：
+
+1. **它是不是非 LLM 已经做得足够好的事？** —— 是的话不引入 LLM（确定性、零成本、零延迟）。
+2. **它是不是离开 LLM 就根本做不好的事？** —— 是的话由 LLM 做，并在 distilled 层
+   落地，可被任何 LLM 重建，不污染 raw。
+
+下面给一份明确的能力矩阵；后续任何"要不要在这里塞 LLM"的争论都按这张表走。
+
+### 12.1 能力矩阵
+
+| 能力 | 由谁负责 | 备注 |
+|---|---|---|
+| 原始记录写入 / 哈希 / 冻结 | **非 LLM**（`memory_writer` + `make_raw_record`） | raw 由代码生成、由代码冻结，LLM 永远不动 |
+| Front Matter 解析、Schema 校验 | **非 LLM**（`memory_frontmatter` / `memory_records`） | 规则即可解决 |
+| 事件日志、Lock、Backup、Compactor | **非 LLM**（`memory_events` / `memory_locks` / `memory_backup` / `memory_compactor`） | 写盘安全完全靠 deterministic 链路 |
+| 关键词 / FTS 检索 | **非 LLM**（`memory_search` / `memory_retrieval`） | SQLite FTS 已是 BM25 级别基线 |
+| 评分 / 排序 / 衰减 | **非 LLM**（`memory_scoring` + `memory_strategy_hash`） | 规则可解释、可回归 |
+| Token 估算（输入闸门） | **非 LLM**（`token_estimator`，CJK-aware） | 节省 LLM 调用本身的 prompt token |
+| 编译模板 digest（无 LLM 兜底） | **非 LLM**（`memory_compile_*`） | §12.3 描述的"稳但朴素"路径，永远可用 |
+| 自然语言摘要 / 重写 / 蒸馏 | **LLM**（`distill_raw_records` → `make_distilled_record`） | 必须 `derived_from` 指回 raw |
+| 跨 raw 主题聚类 / 命名 | **LLM**（蒸馏的一种 kind） | 落 distilled，可重做 |
+| 冲突识别（语义层） | **LLM 提议 → 非 LLM 校验** | LLM 输出冲突候选；最终判定/落盘走 governance 流程 |
+| 自然语言查询解析 | **LLM 提议 → 非 LLM 检索** | LLM 把 NL 查询翻成结构化关键词 / facets，再交给 FTS |
+| 链路追溯 / `derived_from` 维护 | **非 LLM**（`memory_lineage`） | 谱系是审计基础，不能让 LLM 决定 |
+| 治理（candidate→validated→published） | **非 LLM**（`memory_governance`，可选路径） | 仅历史兼容，新流程默认 raw + distilled |
+| 成本/预算控制 | **非 LLM**（`LLMConfig`/`LLMClient` budgets） | 决不能让 LLM 自己决定要不要再花一次钱 |
+
+### 12.2 集成模式
+
+LLM 在系统里扮演的是"插件式蒸馏器"，不是核心路径：
+
+```
+                       (deterministic)
+   raw 写入 ─► memory_writer ─► immutable raw on disk
+                                  │
+                                  ▼
+   FTS 索引 ─► memory_search       │ (always available)
+                                  │
+                                  ▼
+                       compile 模板 (非 LLM 兜底，§12.4)
+                                  │
+                                  ├── 没有 LLM？输出"稳但朴素"摘要
+                                  │
+                                  └── 有 LLM 且任务是 LLM 擅长项？
+                                         │
+                                         ▼
+                                   distill_raw_records
+                                         │
+                                         ▼
+                                  make_distilled_record
+                                  (replaceable, derived_from=raw_ids)
+```
+
+关键不变量：
+
+- **任意环节失败/关闭 LLM，系统功能不退化为 0**：raw 仍写入、FTS 仍可检索、模板 compile 仍出 digest。
+- **LLM 输出从不直接覆盖任何 raw 或非 LLM 索引**：它只能产出 distilled 记录。
+- **distilled 记录可丢可重建**：清空 distilled 层并不会损坏 raw 真源。
+- **主路径 LLM 接入** (v0.7.0-P4)：`memory_write(distill=true)` 在 raw 落盘后才触发蒸馏；`memory_context(summarize=true)` 在召回结果之上做概括；二者均 opt-in，未触发时 0 LLM 调用。详见 §11.3.2。
+
+### 12.3 必须保证的能力（无 LLM 时）
 
 在无 LLM 条件下，系统仍必须支持：
 
@@ -993,10 +1200,10 @@ Skill:
 - 规则校验
 - SQLite FTS 检索
 - 模板式 digest 编译
-- 候选验证与发布流程
+- 候选验证与发布流程（兼容层）
 - Git 协作
 
-### 12.2 无 LLM 时的编译策略
+### 12.4 无 LLM 时的编译策略
 
 采用模板和规则生成：
 
@@ -1007,6 +1214,15 @@ Skill:
 - 当前 handoff 草稿
 
 也就是说，没有 LLM 时，也要能得到“稳但朴素”的编译结果。
+
+### 12.5 单一事实源（代码层）
+
+策略矩阵在代码侧由 `servers/memory_server/memory_llm_policy.py` 落地：
+
+- `LLM_CAPABILITY_MATRIX`：能力 → owner（`"llm"` / `"non_llm"` / `"hybrid"`）
+- `should_use_llm(capability) -> bool`：写入路径要不要走 LLM 的统一判断
+- 任何后续 PR 想"在 X 处加 LLM"必须先在矩阵里登记并加上对应单测；
+  避免散落的 `if has_llm: ...` 把责任划分模糊化。
 
 ## 13. Git 策略
 
@@ -1659,7 +1875,7 @@ P4 测试：
 #### 15.9.5 测试与发布纪律
 
 - **TDD 强制**：每个 P0/P1/P2 项目必须先提交失败测试，再提交最小实现，再回归全量。
-- **不破坏 facade**：所有新行为通过现有 3 facade 工具表达；admin / CLI 是兼容入口。
+- **不破坏 facade**：所有新行为通过现有 4 facade 工具（`memory_read` / `memory_write` / `memory_context` / `memory_enhance`）表达；admin / CLI 是兼容入口。
 - **不依赖 LLM / 网络**：所有自动化在离线环境必须可运行。
 - **错误返回结构化**：`{ok: false, error: "...", request_id: "...", hint: "..."}`，禁止 raise 到 MCP 边界。
 - **每完成一项**：DEVLOG 加条目（含测试增量），README 更新版本号与测试数。
