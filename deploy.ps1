@@ -3,7 +3,8 @@
     [switch]$InstallDeps,
     [switch]$InstallDevDeps,
     [switch]$ForceRecreate,
-    [switch]$RegisterVSCode
+    [switch]$RegisterVSCode,
+    [string]$RepoRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,7 +110,11 @@ if ($InstallDeps -or $InstallDevDeps) {
 }
 
 if ($RegisterVSCode) {
-    & (Join-Path $memoryRoot "setup_mcp.ps1")
+    if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+        & (Join-Path $memoryRoot "setup_mcp.ps1")
+    } else {
+        & (Join-Path $memoryRoot "setup_mcp.ps1") -RepoRoot $RepoRoot
+    }
 }
 
 Write-Host "Python: $venvPython"

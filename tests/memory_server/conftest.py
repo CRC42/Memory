@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-MEMORY_ROOT = PROJECT_ROOT / "MCP" / "memory"
+# Plugin root = parent of tests/. No assumption about where the plugin
+# is checked out inside the host project (works for MCP/Memory/, Tools/Memory/,
+# vendor/memory-mcp/, etc.).
+MEMORY_ROOT = Path(__file__).resolve().parents[2]
 if str(MEMORY_ROOT) not in sys.path:
     sys.path.insert(0, str(MEMORY_ROOT))
 

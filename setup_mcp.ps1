@@ -1,5 +1,7 @@
 param(
-    [string]$WorkspaceRoot
+    [string]$WorkspaceRoot,
+    [string]$RepoRoot,
+    [switch]$AbsolutePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,19 +47,29 @@ function Convert-ToHashtable($Value) {
 }
 
 $memoryRoot = (Resolve-Path $PSScriptRoot).Path
-if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
-    $WorkspaceRoot = (Resolve-Path (Join-Path $memoryRoot "..\..")).Path
+
+# Resolve repo root via the shared helper (supports -RepoRoot, $env:MEMORY_REPO_ROOT,
+# .git/.svn/.hg/pyproject.toml/*.uproject/*.code-workspace marker auto-detect).
+. (Join-Path $memoryRoot "scripts\_Resolve-MemoryRoots.ps1")
+if ([string]::IsNullOrWhiteSpace($RepoRoot) -and -not [string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    # -WorkspaceRoot is the legacy alias of -RepoRoot.
+    $RepoRoot = $WorkspaceRoot
 }
-else {
-    $WorkspaceRoot = (Resolve-Path $WorkspaceRoot).Path
-}
+$roots = Resolve-MemoryRoots -MemoryRoot $memoryRoot -RepoRoot $RepoRoot
+$WorkspaceRoot   = $roots.RepoRoot
+$memoryRelToRepo = $roots.MemoryRelToRepo  # posix relpath, e.g. "MCP/Memory" or "Tools/Memory"
+
+# Path inside mcp.json:
+#   - default: ${workspaceFolder}/<MemoryRelToRepo>/...   (portable across team)
+#   - -AbsolutePath OR plugin lives outside repo (rel = $null): write absolute paths
+$useWorkspaceFolderVar = (-not $AbsolutePath) -and ($null -ne $memoryRelToRepo)
 
 $vscodeDir = Join-Path $WorkspaceRoot ".vscode"
 $mcpJsonPath = Join-Path $vscodeDir "mcp.json"
 $venvPython = Join-Path $memoryRoot ".venv\Scripts\python.exe"
 
 if (!(Test-Path $venvPython)) {
-    throw "Python venv not found: $venvPython. Run MCP/memory/deploy.ps1 first."
+    throw "Python venv not found: $venvPython. Run <MemoryRoot>/deploy.ps1 first."
 }
 
 if (!(Test-Path $vscodeDir)) {
@@ -82,16 +94,31 @@ if (!$mcpConfig.ContainsKey("servers") -or $null -eq $mcpConfig["servers"]) {
 }
 
 $servers = $mcpConfig["servers"]
+# Path stored in mcp.json: prefer ${workspaceFolder}/<rel> so the file is
+# portable across machines and team members. -AbsolutePath (or plugin not
+# under the repo) forces absolute paths instead.
+$rootArg = if ($useWorkspaceFolderVar) { '${workspaceFolder}' } else { Convert-ToPosixPath $WorkspaceRoot }
+$pythonArg = if ($useWorkspaceFolderVar) {
+    '${workspaceFolder}/' + $memoryRelToRepo + '/.venv/Scripts/python.exe'
+} else {
+    Convert-ToPosixPath $venvPython
+}
+$pythonPathArg = if ($useWorkspaceFolderVar) {
+    '${workspaceFolder}/' + $memoryRelToRepo
+} else {
+    Convert-ToPosixPath $memoryRoot
+}
+
 $servers["project-memory-mcp"] = @{
-    command = Convert-ToPosixPath $venvPython
+    command = $pythonArg
     args = @(
         "-m",
         "servers.memory_server",
         "--root",
-        (Convert-ToPosixPath $WorkspaceRoot)
+        $rootArg
     )
     env = @{
-        PYTHONPATH = Convert-ToPosixPath $memoryRoot
+        PYTHONPATH = $pythonPathArg
         PYTHONUTF8 = "1"
     }
 }

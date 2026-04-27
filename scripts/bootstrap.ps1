@@ -30,18 +30,24 @@
 
 param(
     [string]$UserName,
-    [string]$PythonExe = "python"
+    [string]$PythonExe = "python",
+    [string]$RepoRoot
 )
 
 $ErrorActionPreference = "Stop"
 
 $mcpRoot   = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$repoRoot  = (Resolve-Path (Join-Path $mcpRoot "..\..")).Path
+. (Join-Path $PSScriptRoot "_Resolve-MemoryRoots.ps1")
+$roots     = Resolve-MemoryRoots -MemoryRoot $mcpRoot -RepoRoot $RepoRoot
+$repoRoot  = $roots.RepoRoot
 $venvDir   = Join-Path $mcpRoot ".venv"
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 
 Write-Host "[bootstrap] repo root : $repoRoot"
 Write-Host "[bootstrap] mcp  root : $mcpRoot"
+if ($roots.MemoryRelToRepo) {
+    Write-Host "[bootstrap] mcp  rel  : $($roots.MemoryRelToRepo)"
+}
 
 # ── Step 1: venv + deps ────────────────────────────────────────────────
 if (-not (Test-Path $venvPython)) {

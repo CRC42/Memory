@@ -28,8 +28,7 @@ from unittest.mock import patch
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-MEMORY_ROOT = PROJECT_ROOT / "MCP" / "memory"
+MEMORY_ROOT = Path(__file__).resolve().parents[2]
 if str(MEMORY_ROOT) not in sys.path:
     sys.path.insert(0, str(MEMORY_ROOT))
 

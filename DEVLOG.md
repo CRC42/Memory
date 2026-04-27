@@ -1,5 +1,43 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-27 (路径解耦：插件可部署在任意相对路径)
+
+> **状态：插件位置不再硬编码 `<RepoRoot>/MCP/Memory/`，可部署在 `Tools/Memory/`、`vendor/memory-mcp/` 等任意相对路径；同时显式支持 MCP server + CLI 两种使用模式。** 测试维持 506 passed。
+
+### 改动概览
+
+- 新增 `scripts/_Resolve-MemoryRoots.ps1` 共享 helper：以 `-MemoryRoot` 为输入，按 `-RepoRoot` 参数 → `$env:MEMORY_REPO_ROOT` → 标记文件向上查找（`.git` / `.svn` / `.hg` / `pyproject.toml` / `*.uproject` / `*.code-workspace` / `*.sln`）→ 旧布局兜底 + warning 的顺序解析；返回 `MemoryRoot` / `RepoRoot` / `MemoryRelToRepo`（posix 相对路径，可能为 `null`）。
+- 5 份测试（`conftest.py`、`test_concurrent_writes.py`、`test_multi_agent_stress.py`、`test_robustness_followup.py`、`test_write_robustness.py`）：`PROJECT_ROOT = parents[4]` + `MEMORY_ROOT = PROJECT_ROOT / "MCP" / "Memory"` → `MEMORY_ROOT = parents[2]`，去除外部目录深度假设。
+- 9 份 PS 脚本接入 helper：
+  - `setup_mcp.ps1`：新增 `-RepoRoot` / `-AbsolutePath`，`mcp.json` 路径占位改为 `${workspaceFolder}/<MemoryRelToRepo>/...`，`<MemoryRelToRepo>` 由 helper 动态计算（不再写死 `MCP/Memory`）；`-WorkspaceRoot` 保留为 `-RepoRoot` 的旧别名。
+  - `deploy.ps1`：新增 `-RepoRoot`，转发给 `setup_mcp.ps1`。
+  - `scripts/bootstrap.ps1`、`scripts/run_memory_server.ps1`、`scripts/deploy_memory_mcp.ps1`：新增 `-RepoRoot` 参数 + 调用 helper。
+  - `scripts/Resolve-MemoryTestPython.ps1`：签名改为可选 `-MemoryRoot` / `-RepoRoot`，不再假设插件位于 `<RepoRoot>/MCP/Memory`。
+  - 6 份 `run_memory_*_tests.ps1`：去除 `parents[3]` 风格的 repo root 推导，`memoryRoot` 直接从 `$PSScriptRoot/..` 取。
+- README §2 重写「安装方式」：增加 `<MemoryRoot>` 概念、`<RepoRoot>` 解析顺序说明、CLI 模式示例（`python -m servers.memory_server.cli ... guard|health|backup|...`）。
+
+### 验证
+
+- `pytest tests/ -q`：506 passed in ~18s（多次重跑稳定）。
+- `Resolve-MemoryRoots` 6 种场景实测全通过：
+  1. 默认 `MCP/Memory/` 自检 ✓
+  2. 显式 `-RepoRoot` ✓
+  3. `$env:MEMORY_REPO_ROOT` ✓
+  4. 模拟 `Tools/Memory/`（带 `.git`）→ `MemoryRelToRepo=Tools/Memory` ✓
+  5. 模拟 `vendor/memory-mcp/`（带 `pyproject.toml`，深 2 层）→ `MemoryRelToRepo=vendor/memory-mcp` ✓
+  6. 无标记目录 → 警告 + 兜底 ✓
+- `setup_mcp.ps1` 端到端在临时 `Tools/Memory/` 布局下生成的 `mcp.json` 正确写出 `${workspaceFolder}/Tools/Memory/...` 占位（不再硬编码 `MCP/Memory`）。
+- `run_memory_guard_tests.ps1` 等脚本独立运行通过。
+- README §2 重写：287 → 124 行，删冗余的 `bootstrap` vs `setup_mcp` 重复段、合并 LLM 接入说明，保留 `<MemoryRoot>`/`<RepoRoot>` 占位约定。
+
+### 影响范围 / 兼容性
+
+- `setup_mcp.ps1 -WorkspaceRoot <path>` 旧用法仍可用（自动映射成 `-RepoRoot`）。
+- 旧的 `MCP/Memory/` 默认布局零行为变化；新增 `Tools/Memory/` 等部署位置时不再需要改源码，只要把整棵插件目录拷过去即可。
+- Python runtime 早就 100% 依赖 `MemoryConfig.repo_root`（来自 `--root` CLI 参数），本次未做 runtime 改动。
+
+---
+
 ## 2026-04-27 (v0.7.1-P4C-slice2：LLM 档 + 三档降级 + key_documents 配置)
 
 > **状态：LLM 档落地（hybrid：LLM 提议 + deterministic 兜底）；`key_documents.mode` + `renderers.prefer_order` 配置生效；`embedding` 档仍保留为 `not_implemented`（按用户要求暂不做 RAG）。** 测试 497 → 506（+9）。
