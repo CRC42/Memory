@@ -81,6 +81,25 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
         "expose_admin_tools": False,
         "fsync_strict": False,
     },
+    "key_documents": {
+        # Mode for the four derived key documents (activeContext / progress
+        # / techContext / systemPatterns).
+        # - "auto":     rebuild_key_documents is allowed and the writer
+        #               will overwrite the in-place file with a generated body
+        #               (manual edits archived first). [default]
+        # - "manual":   rebuild_key_documents returns error=key_documents_manual_mode
+        #               so legacy v0.6 hand-written workflow keeps working.
+        # - "disabled": same as manual but also intended for environments
+        #               where the four files are managed by an external tool.
+        "mode": "auto",
+        # Renderer preference order. The first available tier wins; lower
+        # tiers are tried only as a fallback when the higher tier raises.
+        # "embedding" is reserved for a future RAG-backed tier and is
+        # currently equivalent to "deterministic".
+        "renderers": {
+            "prefer_order": ["llm", "deterministic"],
+        },
+    },
 }
 
 
@@ -134,6 +153,8 @@ class MemoryConfig:
     mcp_allow_unknown_user: bool = False
     mcp_shared_overwrite_policy: str = "reject"  # "reject" | "downgrade"
     mcp_auto_maintenance: dict[str, Any] | None = None
+    key_documents_mode: str = "auto"
+    key_documents_prefer_order: tuple[str, ...] = ("llm", "deterministic")
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -202,6 +223,41 @@ def _parse_multi_user(raw: Any) -> MultiUserConfig | None:
         user_scoped_paths=user_scoped_paths,
         shared_paths_policy=shared_paths_policy,
     )
+
+
+_VALID_KEY_DOC_MODES = {"auto", "manual", "disabled"}
+_VALID_KEY_DOC_RENDERERS = {"deterministic", "llm", "embedding"}
+
+
+def _parse_key_documents_mode(raw: Any) -> str:
+    if not isinstance(raw, dict):
+        return "auto"
+    mode = str(raw.get("mode") or "auto").strip().lower()
+    if mode not in _VALID_KEY_DOC_MODES:
+        return "auto"
+    return mode
+
+
+def _parse_key_documents_prefer_order(raw: Any) -> tuple[str, ...]:
+    default = ("llm", "deterministic")
+    if not isinstance(raw, dict):
+        return default
+    renderers = raw.get("renderers")
+    if not isinstance(renderers, dict):
+        return default
+    order = renderers.get("prefer_order")
+    if not isinstance(order, list):
+        return default
+    cleaned: list[str] = []
+    for item in order:
+        token = str(item).strip().lower()
+        if token in _VALID_KEY_DOC_RENDERERS and token not in cleaned:
+            cleaned.append(token)
+    if "deterministic" not in cleaned:
+        cleaned.append("deterministic")
+    if not cleaned:
+        return default
+    return tuple(cleaned)
 
 
 def _ensure_layout(repo_root: Path) -> None:
@@ -321,4 +377,6 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         mcp_auto_maintenance=(
             dict(mcp_cfg.get("auto_maintenance")) if isinstance(mcp_cfg.get("auto_maintenance"), dict) else None
         ),
+        key_documents_mode=_parse_key_documents_mode(merged.get("key_documents")),
+        key_documents_prefer_order=_parse_key_documents_prefer_order(merged.get("key_documents")),
     )

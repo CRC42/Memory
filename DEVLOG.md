@@ -1,5 +1,158 @@
 # DEVLOG - MCP Memory
 
+## 2026-04-27 (v0.7.1-P4C-slice2：LLM 档 + 三档降级 + key_documents 配置)
+
+> **状态：LLM 档落地（hybrid：LLM 提议 + deterministic 兜底）；`key_documents.mode` + `renderers.prefer_order` 配置生效；`embedding` 档仍保留为 `not_implemented`（按用户要求暂不做 RAG）。** 测试 497 → 506（+9）。
+
+### 配置
+
+- `memory_config.DEFAULT_CONFIG_CONTENT` 新增 `key_documents` 段：
+  - `mode ∈ {auto(默认), manual, disabled}`：`manual` / `disabled` 下 `rebuild_key_documents` 直接返回 `error="key_documents_manual_mode"`，磁盘零侧效，保 v0.6 行为兼容。
+  - `renderers.prefer_order`：默认 `["llm", "deterministic"]`，`auto` 模式按此顺序逐档尝试，第一档成功即停。
+- `MemoryConfig` 新增 `key_documents_mode: str` 与 `key_documents_prefer_order: tuple[str, ...]` 字段，`load_config` 经 `_parse_key_documents_mode / _parse_key_documents_prefer_order` 解析；非法 mode/renderer 自动回落默认值并强制保留 `deterministic` 兜底。
+
+### memory_key_documents 升级
+
+- 新函数 `render_llm_document(config, *, doc_key, user, llm_client, generated_at)`：
+  - 通过 `make_raw_record` 把 `CompilableRecord` 包装为 raw record dict（`provenance=raw_capture` / `immutable=True`），喂给 `map_reduce_distill`。
+  - **schema 不变**：header（`generated_by=memory-mcp renderer=llm …`）、`# Title`、`> _role_` 三段由 deterministic 代码控制；LLM 只填正文，不可写 H1，不可加任何前后缀。
+  - 系统提示强制约束：grounded-only / no fabrication / 同语言。空语料返回与 deterministic 一致的「No raw records」骨架。
+- `_rebuild_one(config, *, doc_key, user, request_id, tier, llm_client)`：新增 `tier` 与 `llm_client` 参数；任一档抛出异常都返回 `render_failed` 让编排器尝试下一档。
+- `rebuild_key_documents(...)` 改为编排器：
+  - 默认 `renderer="auto"`：按 `config.key_documents_prefer_order` 走（`llm` 不可用自动跳过；deterministic 兜底永远在末位）。
+  - `renderer="llm"`：强制 LLM；client 不可用时 per-doc 报 `llm_unavailable`（不静默降级）。
+  - `renderer="deterministic"`：强制 deterministic 单档。
+  - `renderer="embedding"`：返回 `not_implemented`（占位，待后续 RAG 阶段）。
+- 新辅助 `_maybe_build_llm_client()`：lazy 构建 LLMClient，构建失败返回 `(None, llm_unavailable_err)`，主路径不抛。
+
+### 测试新增（+9）
+
+- `test_rebuild_returns_manual_mode_when_disabled` / `…disabled_value`：mode=manual/disabled → `key_documents_manual_mode`，文件未创建。
+- `test_rebuild_auto_falls_back_to_deterministic_when_llm_unavailable`：auto 模式 LLM 不可用 → renderer=deterministic 成功。
+- `test_rebuild_llm_renderer_without_client_returns_llm_unavailable`：renderer=llm 且 client 不可用 → per-doc `llm_unavailable`。
+- `test_rebuild_embedding_renderer_returns_not_implemented`。
+- `test_render_llm_document_uses_map_reduce_distill`：stub 客户端 + monkeypatch `map_reduce_distill`，验证 raw 包装 + 输出含 LLM 正文 + header `renderer=llm`。
+- `test_rebuild_auto_uses_llm_when_client_available`：auto 模式有 client 时优先 LLM 档。
+- `test_rebuild_auto_falls_back_when_llm_render_raises`：LLM 渲染中途抛错 → auto 回落 deterministic 成功。
+- `test_config_parses_key_documents_section` / `…defaults_when_key_documents_absent`。
+- 模块级 autouse fixture `_disable_llm_by_default` 强制屏蔽真 LLM，避免误触 DeepSeek 计费。
+
+### 影响 / 不变量
+
+- 已实现层 `LLM_CAPABILITY_MATRIX["rebuild_key_document"] = "hybrid"`：LLM 提议 + deterministic 包装持久化，与矩阵约定一致。
+- raw 仍 `immutable=True`：LLM 渲染只读 raw，不写 raw；只覆盖派生关键文档。
+- 锁 / backup(tag=pre_rebuild) / atomic write / append_event(`key_document_rebuilt`) 全程复用 P4C-slice1 通道；新增 `renderer_used` 字段进入审计事件。
+- 手写检测 + 归档语义不变；编排器各 tier 共用同一锁/归档/写入路径，不允许中间状态泄漏。
+
+### 仍待落地
+
+- `embedding` 档（RAG 检索 + 模板拼装）：按用户指示推迟到 P5 之后。
+- `compiled/snapshots/<doc>-<timestamp>.md` 显式回滚：当前依赖 `backups/` 的 `pre_rebuild` 批次 + `_atomic_write_text` 的 tmp+replace 已构成"原内容永不丢"的等价保证；如需独立 snapshots 子目录与时间戳，留待真实回滚事故触发。
+
+---
+
+## 2026-04-27 (v0.7.1-P4C-slice1：关键文档可重建 — deterministic 档落地)
+
+> **状态：deterministic 档完整落地；LLM / embedding 档保留契约接口，返回 `not_implemented`。** 测试由 481 增至 497（+16）。
+
+### 新增
+
+- `servers/memory_server/memory_key_documents.py`（新模块）：
+  - `KEY_DOCUMENTS` / `KEY_DOCUMENT_KEYS`：四份关键文档的 spec 表（rel_path / title / role / include_kinds / preferred_tags / max_items）。
+  - `build_generated_header` / `is_generated` / `parse_generated_meta`：派生层头注释的生成与识别。
+  - `select_records_for`：按 `record_kind` 过滤、按偏好标签 + 时间倒序排序，限制 `max_items`。
+  - `render_deterministic_document`：完全无 LLM 即可成文，schema 固定（标题、角色 blockquote、每条记录 `## 标题 + meta + body`）。
+  - `_archive_manual_edit`：rebuild 前若现存文件不含 `generated_by` 头则归档到 `memory-bank/archive/manual-edits/<doc>-<timestamp>.md`，再写入派生层。
+  - `rebuild_key_documents(config, *, targets=None, user=None, renderer="deterministic")`：编排器。
+- `tests/memory_server/test_key_documents.py`：16 个 TDD 测试覆盖 header 契约、KEY_DOCUMENTS 完整性、deterministic 渲染、空语料兜底、归档语义、幂等不重复归档、未知 target 报错、`renderer="llm"` 暂报 `not_implemented`、通过 `memory_context` dispatch 能调用。
+
+### 修改
+
+- `servers/memory_server/server_dispatch.py`：`_dispatch_memory_context` 新增 `operation="rebuild_key_documents"` 分支；error message 同步列出新操作。
+- `servers/memory_server/server_tools.py`：`memory_context.inputSchema` 的 `operation` 枚举追加 `rebuild_key_documents`，新增 `targets[]`（enum 限定四个文档）与 `renderer` 字段。
+- `servers/memory_server/memory_llm_policy.py`：`LLM_CAPABILITY_MATRIX` 登记 `rebuild_key_document: "hybrid"`（避免后续接入 LLM 时被 `UnknownCapability` 卡住）。
+
+### 安全语义复用
+
+- 复用 `file_lock` 保证跨进程互斥；`backup_files(tag="pre_rebuild")` 留下回滚点；`_atomic_write_text` 保证 fsync + os.replace；`append_event(event_type="key_document_rebuilt")` 进 audit 流。
+- 显式**绕过** `memory_writer.memory_write` 的 `user_scoped` 重定向与 `append_only` 拒绝 — 因为关键文档作为派生视图必须按 `rel_path` 整体覆盖；这一豁免封装在 `memory_key_documents._rebuild_one`，不开放给外部调用方。
+
+### 仍未落地（留待 P4-C-slice2/3）
+
+- LLM renderer（`renderer="llm"`）：调用 `map_reduce_distill` 提议正文，deterministic 校验头部并持久化。
+- embedding-template renderer（`renderer="embedding"`）：用本地向量 + 模板，无外部 LLM 时仍优于 deterministic。
+- `key_documents.mode ∈ {auto, manual, disabled}` 配置开关：当前默认行为等效 `auto`，但配置节尚未加入 `MemoryConfig`。
+- 失败时回滚到 `compiled/snapshots/<doc>-<timestamp>.md` 的链路：当前依赖 `pre_rebuild` 备份，专门快照层未实现。
+- `memory_users.py` 对 `activeContext.md` 的 user_scoped 重定向 与 `memory_shared_compactor.py` 的周归档：和派生视图语义存在冲突，需在后续 slice 协调。
+
+---
+
+## 2026-04-27 (v0.7.1 doctrinal pivot：无感原则 + 关键文档可重建)
+
+> **状态：文档级方向收敛，未改代码、未改测试。**README §0、设计文档 §0.3/§1/§2.0/§4.5 同步声明：用户 / AI 只写 raw；`activeContext.md` / `progress.md` / `techContext.md` / `systemPatterns.md` 重新定位为**派生关键文档**，由系统按「LLM → 本地 embedding 模板 → deterministic」三档自动重建。这是「raw 不可改 + distilled 可重建」契约（v0.6.1 §2.1.A）的产品级延伸，把"无感"从"LLM 提炼无需人工确认"推到"关键文档无需人工编辑"。
+
+### 设计契约（必须在 P4-C 实现时严格遵守）
+
+- **raw 永远 `immutable=True`**：任何关键文档损坏不污染真源；删派生文档 → rebuild → 恢复。
+- **关键文档头部强制注释**：`<!-- generated_by=memory-mcp renderer=llm|embedding_template|deterministic source_record_ids=[…] generated_at=… config_hash=… -->`。git diff / audit 工具必须能识别派生层。
+- **三档 renderer schema 一致**：同段落顺序、同 section 标题；只允许内容详尽度差异，不允许结构差异，便于降级时不破坏外部消费方。
+- **deterministic 必须可独立成文**：完全无 LLM 时按 record_kind / scope / recency / importance 排序后用模板拼装，**无臆造、无遗漏字段**。
+- **手写检测 + 归档**：rebuild 前若文件无 `generated_by` 头注释 → 自动归档到 `archive/manual-edits/<doc>-<timestamp>.md` 再重建，避免静默覆盖人工编辑。
+- **失败回滚**：任意档失败先尝试下一档；全部失败时回滚到 `compiled/snapshots/<doc>-<timestamp>.md`。
+- **过渡期开关**：`.ai-memory/config.json` `key_documents.mode ∈ {auto(默认), manual(v0.6 行为)}`。
+
+### 文档变更
+
+- `README.md`：新增 `§0 产品定位（最高原则：无感）`；`§3.2 推荐工作流` 改写为「只写 raw → 关键文档自动重建」；新增 `§4.5.1 关键文档 = 派生视图`；`§5.3` 路线新增 `P4-C 关键文档可重建`，调整为 `v0.7.x` 路线。
+- `MemorySystemDesignDocument.md`：状态行更新为 v0.7.1；`§0.3` 主线收敛声明 raw + 自动重建；`§1` 文档目标置顶「无感原则」并补「无 LLM 兜底重建」；`§2.0 自动化原则` 升级为 `§2.0 无感原则`，原文保留为 `§2.0.A`；`§4.5 编译记忆` 显式纳入四份关键文档。
+- `DEVLOG.md`：本条目。
+
+### 代码影响（本条目不改代码）
+
+- 现有 `memory_context` / `memory_compiler` / `memory_compile_render` / `memory_llm_pipeline` 已具备多数构件；P4-C 待落地：
+  - `memory_context` 新增 `operation="rebuild_key_documents"` 与 `targets[]` 参数。
+  - `memory_compile_render` 新增 4 个 deterministic 模板（active/progress/tech/pattern），与 LLM renderer 共享 schema。
+  - `memory_compile_writer` 复用现有 backup → tmp → fsync → replace 路径写关键文档；新增手写检测 + manual-edits 归档。
+  - `memory_config` 新增 `key_documents.mode`、`key_documents.renderers` 段。
+
+### 不变量保留
+
+- raw immutable / authoritative / event-logged：不动。
+- `LLM_CAPABILITY_MATRIX` 单一事实源：P4-C 新增 `rebuild_key_document` 能力（`hybrid` — LLM 提议，deterministic 兜底，必须登记）。
+- 共享文件 append-only / 多人写入隔离 / If-Match 乐观锁：不动。关键文档列入「整文件 replace 但带 generated_by 头注释 + manual-edits 归档」的特例策略。
+- 测试 481 不动；P4-C 落地时按 TDD 加新用例。
+
+### 验证（仅文档）
+
+```powershell
+git diff --stat MCP/Memory/README.md MCP/Memory/MemorySystemDesignDocument.md MCP/Memory/DEVLOG.md
+```
+
+---
+
+## 2026-04-27 (v0.7.0-P4-B 口径收敛与 distilled 持久化修正)
+
+> **状态：修复 LLM/Memory 文档与实现口径不一致。`memory_write(distill=true)` 现在持久化为 `record_kind="distilled_summary"` + `status="distilled"` 的 replaceable 派生记录，而不是 raw `observation`；README / 设计文档统一为 4 facade、P4/P4-B 已完成主体、distill 为同步执行。LLM policy 矩阵补齐 6 个 `memory_enhance` 能力。测试 475 → 481 (+6 policy 口径钉死)。**
+
+### 修复
+
+- **distilled 落盘语义对齐**：`server_dispatch._run_distill_for_write` 的第二条记录改为 `distilled_summary` / `status=distilled` / `scope=user_private`，并写入 `provenance=llm`、`replaceable=true`、`authoritative=false`、`model`、`distilled_at`、`derived_from_record_ids=[raw_id]`。
+- **结构化记录 schema 扩展**：`memory_records.py` 增加 `distilled_summary` record kind 与 `distilled` status，允许 v2 Front Matter 保存 distilled 派生层元数据。
+- **LLM policy 单一事实源补齐**：`LLM_CAPABILITY_MATRIX` 登记 `classify_record` / `extract_candidates` / `merge_candidates` / `generate_skill_candidate` / `explain_conflict` / `generate_handoff`，避免 README/设计文档写着已登记但代码未登记。
+- **文档口径统一**：README 与设计文档统一默认 4 facade、v0.7.0-P4/P4-B 当前状态、同步 distill 行为、测试数 481、P5 向量召回仍为后续能力。
+
+### 验证
+
+```powershell
+MCP\Memory\.venv\Scripts\python.exe -m pytest MCP\Memory\tests\memory_server\test_llm_policy.py MCP\Memory\tests\memory_server\test_llm_pipeline_dispatch.py MCP\Memory\tests\memory_server\test_llm_pipeline.py MCP\Memory\tests\memory_server\test_llm.py -q
+# 115 passed
+
+powershell -ExecutionPolicy Bypass -File MCP/Memory/scripts/run_memory_all_tests.ps1
+# 481 passed in 17.55s
+```
+
+---
+
 ## 2026-04-26 (v0.7.0-P4-B LLM 增强接口 + memory_enhance facade)
 
 > **状态：v0.7.0 路线 P4-B 完成。新增单一 facade `memory_enhance`，按 `operation` 路由 6 个 opt-in LLM 增强能力。read-only：返回结构化建议不写盘；上层决定是否以 `status="candidate"` 调 `memory_write_record`。测试 442 → 475 (+33)。同日完成 DeepSeek 真接口冒烟（`'OK'`，12 tokens，¥0.000013）确认 OpenAI-compatible wire format 可联通。**

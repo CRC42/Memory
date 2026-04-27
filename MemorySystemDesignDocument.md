@@ -1,10 +1,10 @@
 # MCP 记忆系统设计文档
 
-> 状态：vNext 设计稿；P0/P1/P2、P3 结构升级首版与 P3 hardening 已落地
+> 状态：v0.7.1 无感原则收敛设计稿；P0/P1/P2、P3 结构升级首版、P3 hardening、P4 LLM pipeline、P4-B `memory_enhance` facade 均已落地；P4-C「关键文档可重建」为本轮最高优先的未落地项。
 >
-> 日期：2026-04-23
+> 日期：2026-04-27
 >
-> 适用范围：`ToolTest/MCP/Memory` 后续演进设计、重要记忆输出、MCP 对外接口扩展
+> 适用范围：`ToolTest/MCP/Memory` 后续演进设计、重要记忆输出、关键文档重建、MCP 对外接口扩展
 
 ## 0. 当前项目基线
 
@@ -49,26 +49,59 @@
 - 当前文档仍把联合治理扩展写成主线，但新的产品方向应是“动态记忆供给”，而不是“插件内自动审查”
 - CLI / 管理 skill 需要承接 guard、backup、compact、index、governance、snapshot review 等低频管理动作
 
-因此，本文档定义的目标不是替换当前系统，而是在当前 3-tool facade 与 P3 完成态之上，把后续主线明确收敛为：以小预算输出重要记忆，供用户或外部 agent/规则系统继续沉淀；联合治理能力保留为兼容层，不再作为最高优先级。
+因此，本文档定义的目标不是替换当前系统，而是在当前 4-tool facade 与 P3/P4 完成态之上，把后续主线明确收敛为：**人类/AI 只写 raw，关键记忆文档（`activeContext.md` / `progress.md` / `techContext.md` / `systemPatterns.md`）由系统自动重建**。以小预算输出重要记忆、以三档降级（LLM → 本地 embedding+模板 → deterministic）重建关键文档，是本轮最高优先；联合治理能力保留为兼容层。
 
-当前默认产品定位也随之明确为：**用户不需要做任何维护**。日常使用只涉及记忆写入、普通检索和简洁上下文装配；只有在需要提取“当前重要信息”时，才调用详细的重要记忆输出接口。
+当前默认产品定位也随之明确为：**用户不需要做任何维护；也不需要手写任何关键文档**。日常使用只涉及 raw 写入、普通检索、按需重建关键文档与简洁上下文装配；只有需要提取「当前重要信息」时，才调用详细的重要记忆输出接口。
 
 ## 1. 文档目标
 
 构建一套适用于多人协作的项目记忆系统，满足以下目标：
 
+- **用户/AI 只写 raw，关键文档由系统自动重建（无感原则）**
 - 支持个人长期沉淀与协作交接
 - 支持输出“小而准”的重要记忆供 LLM / agent 复用
 - 支持把值得长期沉淀的记忆导出为外部规则系统的候选输入
 - 支持全文检索与历史追溯
 - 支持与 Git 工作流兼容
 - 支持以 MCP 形式对外提供统一接口
-- 在无 LLM 条件下仍可运行
-- 在有 LLM 条件下支持更强的分类、提炼、编译能力
+- 在无 LLM 条件下仍可运行（含关键文档 deterministic 重建）
+- 在有 LLM 条件下支持更强的分类、提炼、重建能力
 
 ## 2. 核心设计原则
 
-### 2.0 自动化原则（首要原则）
+### 2.0 无感原则（最高优先，v0.7.1 起明确）
+
+> **用户 / AI agent 只负责「持续吐 raw」。所有关键记忆文档由系统自动重建，不依赖人工编辑。**
+
+#### 2.0.1 两层硬契约
+
+| 层 | 谁写 | 是否可改 | 例子 |
+|---|---|---|---|
+| **raw 真源层** | 人类 / agent / 工具自动产出 | **写一次冻结**（`immutable=True`） | observation / decision / note / incident / claim / rule |
+| **派生关键文档层** | 系统自动重建 | **整文件可重建可丢弃** | `activeContext.md` / `progress.md` / `techContext.md` / `systemPatterns.md` / runtime digest |
+
+关键记忆文档不再是「主编辑文件」，而是**对当前 raw 集合的一种可重建渲染视图**。删掉重建后，内容应语义等价。
+
+#### 2.0.2 三档重建降级
+
+1. **LLM**：预算/可用性 OK 时默认走；质量最高。
+2. **本地小模型 / embedding 模板**：本地向量检索 + 按角色预填的模板。
+3. **deterministic**：按 record_kind / scope / recency / importance 排序后用模板拼装，**零 LLM 依赖仍然成文且无臆造**。
+
+任一档失败自动跌落下一档；全部失败时从 `compiled/snapshots/<doc>-<timestamp>.md` 回退；raw 始终不受损。
+
+#### 2.0.3 人工介入场景（仅两种）
+
+1. 以 `human` 身份新增一条 raw（修正 / 补充事实）。
+2. 手动修改某份关键文档——仅作为「最后打磨」，下次 rebuild 前会被自动归档到 `archive/manual-edits/` 以保证不丢失；如需永久保留，应同时写一条对应 raw。
+
+任何其他场景下，用户不需要、也不被期望手工编辑 `progress.md` / `techContext.md` / `systemPatterns.md` / `activeContext.md`。
+
+#### 2.0.4 与原「自动化原则」的关系
+
+原「自动化原则」（见 §2.0、§2.1.A）仍有效；v0.7.1 把它推到终点：不仅「LLM 提炼不需要人工确认」，连「关键文档写出不需要人工手写」也一起自动化。
+
+### 2.0.A 原 §2.0 自动化原则（保留）
 
 > **本系统的目标是尽量"无人值守"。**
 
@@ -268,13 +301,16 @@ LLM 永远不能修改 raw 层；它只能在 distilled 层产出可被自身或
 - 当前分支 digest
 - 系统 digest
 - 候选发布视图
+- **关键记忆文档**（`activeContext.md` / `progress.md` / `techContext.md` / `systemPatterns.md`）——v0.7.1 起明确为编译产物，不再是主编辑层
 
 特点：
 
-- 由系统编译生成
+- 由系统编译生成（三档渲染器：LLM → embedding 模板 → deterministic）
 - 不是手工主编辑层
 - 可重建
 - 可丢弃
+- 头部携带 `<!-- generated_by=memory-mcp renderer=… source_record_ids=[…] generated_at=… config_hash=… -->` 元注释，便于 git diff 与 audit
+- 存场 `compiled/snapshots/<doc>-<timestamp>.md` 作为 fallback 起点
 
 ## 5. 目录结构
 
@@ -1065,7 +1101,7 @@ OpenAI 协议的服务（DeepSeek / OpenAI / Moonshot / 本地 vLLM / Ollama Ope
 
 | 入口 | opt-in 字段 | 行为 |
 |------|------------|------|
-| `memory_write` op=`record` | `distill: bool`, `distill_user_instruction`, `distill_max_tokens` | 主写成功后构造 raw view → `map_reduce_distill` → `memory_write_record(record_kind="observation", scope="user_private", derived_from_record_ids=[raw_id])` 落第二条记录；返回 `result.distilled`。失败仅 in-band 报 `llm_unavailable`，主写已落盘不会回滚。 |
+| `memory_write` op=`record` | `distill: bool`, `distill_user_instruction`, `distill_max_tokens` | 主写成功后构造 raw view → `map_reduce_distill` → `memory_write_record(record_kind="distilled_summary", status="distilled", scope="user_private", derived_from_record_ids=[raw_id])` 落第二条记录；返回 `result.distilled`。失败仅 in-band 报 `llm_unavailable`，主写已落盘不会回滚。 |
 | `memory_context` op=`retrieve_context` | `summarize: bool`, `summary_query`, `summary_max_tokens`, `summary_max_chars_per_record`(默认 4000) | 召回成功且有记录后概括 `context_items`/`selected_records`；返回 `result.summary`。无记录 → `summarize_skipped`。 |
 
 硬约束（与 §2.1.A 一致）：
@@ -1608,7 +1644,7 @@ importance = governance + usage + impact + novelty + conflict + decay
    - `memory_context(operation="retrieve_context")` 已对齐同一套预算路径，不再以 `top_k` 作为主控制；`top_k` 仅作为未显式传 `max_items` 时的条数上限。
    - `retrieve_context` 保持简洁：正文集中在 `context_items`，分类段落只做索引；详细外部沉淀信号仍通过 `important_memories` 提供。
 1. **MCP 对外接口收敛**（首版已完成）
-   - 默认 MCP 只暴露 `memory_read`、`memory_write`、`memory_context` 三个 facade tools。
+   - 默认 MCP 只暴露 `memory_read`、`memory_write`、`memory_context`、`memory_enhance` 四个 facade tools。
    - legacy/admin 兼容工具降为内部函数或显式配置暴露。
    - guard、backup、compact、index、health、migrate、governance、snapshot 管理动作迁移到 CLI / scripts / skill。
    - 已增加配置开关 `mcp.expose_admin_tools=true` 支持开发期或纯 MCP 客户端继续暴露 admin/legacy tools。
@@ -1625,7 +1661,7 @@ importance = governance + usage + impact + novelty + conflict + decay
    - 已补齐恢复演练文档：损坏索引、超预算、审计日志轮转、误发布/误删除的 CLI 恢复步骤可从 README / admin skill 执行。
    - 已修正文档时间线，确保 DEVLOG 与设计文档中的版本日期不晚于实际记录日期。
 9. 治理相关能力保留为兼容层：validate / publish / archive / promote / degrade 不再作为主路线扩张。
-10. P4 再接入本地模型或云端 LLM，把 LLM 能力限制在 query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
+10. P4 已接入本地模型或云端 LLM 兼容层；后续 LLM 增量能力继续限制在 query rewrite、重要记忆摘要优化、快照叙事和冲突解释等软增强范围。
 11. P5 最后评估本地 RAG / 向量补召回；RAG 只能作为 metadata / FTS 后的语义补充。
 
 ### 15.6 P3 模块落地状态
@@ -1669,7 +1705,7 @@ P0-3 已完成（2026-04-23）：
 - 新增 `memory_record_io.py` 作为唯一的 record IO 公共层。
 - `iter_record_files` / `iter_parsed_records` / `find_record_by_id` / `refresh_index_if_exists` / `write_same_record` / `write_record_to_target` 在此集中实现。
 - `memory_governance.py` / `memory_lineage.py` / `memory_maintenance.py` / `memory_compiler.py` 不再各自实现这些函数。
-- 默认 MCP facade 工具数仍为 3 个；P0-3 完成时测试 133 全部通过。
+- 默认 MCP facade 工具数仍为 4 个；P0-3 完成时测试 133 全部通过。
 
 P0-4 已完成（2026-04-23）：
 
@@ -1904,13 +1940,11 @@ P2（稳健性观测）：
 - P2-2 health 启动自愈：异常时尝试 `rebuild-index`、清理孤儿 `.tmp`、清理过期 lock sidecar 后再上报。
 - P2-3 多 server 实例策略哈希一致性提示：策略 schema 哈希写入 `events.jsonl`，不一致时启动期警告。
 
-`v0.7.0`：LLM 软增强版（规划中）
+`v0.7.0`：LLM 软增强版（已完成 P4 / P4-B 主体）
 
-- query rewrite
-- tag / facet 推荐
-- snapshot narrative
-- conflict explanation
-- candidate draft
+- 已完成：`memory_write(distill=true)` 写后蒸馏、`memory_context(summarize=true)` 召回摘要。
+- 已完成：`memory_enhance` read-only facade，覆盖 classify / extract / merge / skill / conflict / handoff 六项 opt-in 能力。
+- 未完成：query rewrite、snapshot narrative 的常规入口和更完整的自动化策略。
 
 `v0.7.5`：向量补召回版
 
@@ -1957,11 +1991,11 @@ P2（稳健性观测）：
 
 - 已完成：`retrieve_context` 与 `important_memories` 的预算路径对齐为严格 `budget-first`、可解释、可控尺寸的输出接口。
 - 当前默认使用方式为免维护：普通用户不需要执行任何 maintenance / governance / admin 操作。
-- MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
+- MCP 对外接口收敛首版已完成：默认只暴露 `memory_read`、`memory_write`、`memory_context`、`memory_enhance`，其余管理能力迁移到 CLI / scripts / skill，并保留 `mcp.expose_admin_tools=true` 用于 legacy/admin tools。
 - P3 首版已完成：时间快照、谱系关系、importance scoring、facet、分层召回、上下文装配和 dao/fa/shu 视图已落地。
-- 当前下一步是 P4 LLM 软增强；`memory_corpus.py` 已在 v0.5.2 完成，`memory_frontmatter.py` / `memory_budget.py` / `server_*` 拆分已在 v0.5.3 完成，render / targets / scoring 已在 v0.5.8 完成，并叠加 v0.5.4-v0.5.6 的并发 / 崩溃安全加固（跨进程 sidecar 文件锁、SQLite WAL、乐观锁 if_match、fsync_strict、disk_full 结构化错误、PathManager 长路径归一化），以及 v0.5.11 的 guard 旧配置兜底与 retrieval 预筛。
+- P4 LLM 软增强主体已完成；`memory_corpus.py` 已在 v0.5.2 完成，`memory_frontmatter.py` / `memory_budget.py` / `server_*` 拆分已在 v0.5.3 完成，render / targets / scoring 已在 v0.5.8 完成，并叠加 v0.5.4-v0.5.6 的并发 / 崩溃安全加固（跨进程 sidecar 文件锁、SQLite WAL、乐观锁 if_match、fsync_strict、disk_full 结构化错误、PathManager 长路径归一化），以及 v0.5.11 的 guard 旧配置兜底与 retrieval 预筛。
 - 插件内治理扩展降级为兼容方向：保留 validate / publish / archive 能力，但不再把自动审查和规则晋升作为主路线。
-- P4 再做 LLM 软增强：query rewrite、tag/facet 推荐、重要记忆摘要优化、快照叙事和冲突解释。
+- P4 后续只保留增量增强：query rewrite、快照叙事常规入口、重要记忆摘要策略优化。
 - P5 最后做本地 RAG / 向量补召回，且只作为 metadata / FTS 后的语义补充。
 
 ### 16.1 对当前项目的直接意义

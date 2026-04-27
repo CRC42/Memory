@@ -41,6 +41,7 @@ P3_RECORD_KINDS = {
     "incident",
     "decision",
     "procedure",
+    "distilled_summary",
     "snapshot_daily",
     "snapshot_weekly",
     "snapshot_monthly",
@@ -51,7 +52,7 @@ ALLOWED_RECORD_KINDS = V1_RECORD_KINDS | P3_RECORD_KINDS
 V1_SCOPES = {"personal", "shared", "local", "archive"}
 P3_SCOPES = {"session", "user_private", "task_or_branch", "project_shared", "org_shared"}
 ALLOWED_SCOPES = V1_SCOPES | P3_SCOPES
-ALLOWED_STATUSES = {"raw", "candidate", "validated", "published", "degraded", "archived"}
+ALLOWED_STATUSES = {"raw", "candidate", "validated", "published", "degraded", "archived", "distilled"}
 ALLOWED_MEMORY_TIERS = {"hot", "warm", "cold", "fossil"}
 ALLOWED_COGNITIVE_LEVELS = {"dao", "fa", "shu"}
 
@@ -78,6 +79,12 @@ V2_SCALAR_FIELDS = [
     "cognitive_level",
     "importance_score",
     "system_area",
+    "provenance",
+    "immutable",
+    "authoritative",
+    "replaceable",
+    "model",
+    "distilled_at",
 ]
 
 V2_FIELDS = set(V2_LIST_FIELDS) | set(V2_SCALAR_FIELDS)
@@ -95,6 +102,8 @@ def _default_status(record_kind: str) -> str:
         return "published"
     if record_kind == "archive_record":
         return "archived"
+    if record_kind == "distilled_summary":
+        return "distilled"
     return "raw"
 
 
@@ -209,6 +218,12 @@ def memory_write_record(
     class_names: list[str] | None = None,
     blueprint_paths: list[str] | None = None,
     system_area: str | None = None,
+    provenance: str | None = None,
+    immutable: bool | None = None,
+    authoritative: bool | None = None,
+    replaceable: bool | None = None,
+    model: str | None = None,
+    distilled_at: str | None = None,
 ) -> dict[str, Any]:
     """Write a structured memory record as Markdown + Front Matter."""
     normalized_tags = _normalize_string_list(tags)
@@ -237,6 +252,12 @@ def memory_write_record(
         "class_names": _normalize_string_list(class_names),
         "blueprint_paths": _normalize_string_list(blueprint_paths),
         "system_area": system_area,
+        "provenance": provenance,
+        "immutable": immutable,
+        "authoritative": authoritative,
+        "replaceable": replaceable,
+        "model": model,
+        "distilled_at": distilled_at,
     }
     effective_schema_version = (
         schema_version

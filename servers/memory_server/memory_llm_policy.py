@@ -41,9 +41,18 @@ LLM_CAPABILITY_MATRIX: dict[str, Owner] = {
     "distill_summary": "llm",
     "topic_cluster": "llm",
     "rewrite": "llm",
+    "generate_handoff": "llm",
     # --- Hybrid: LLM proposes, deterministic layer accepts/persists ---
     "conflict_detection": "hybrid",
     "nl_query_parse": "hybrid",
+    "classify_record": "hybrid",
+    "extract_candidates": "hybrid",
+    "merge_candidates": "hybrid",
+    "generate_skill_candidate": "hybrid",
+    "explain_conflict": "hybrid",
+    # P4-C: rebuild a key document body. LLM proposes the prose,
+    # deterministic layer enforces header/contracts and atomic write.
+    "rebuild_key_document": "hybrid",
 }
 
 

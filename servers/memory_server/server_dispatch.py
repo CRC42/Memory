@@ -16,6 +16,7 @@ from .memory_compiler import memory_compare_snapshots, memory_compile, memory_ge
 from .memory_config import MemoryConfig
 from .memory_governance import memory_archive_record, memory_publish_candidate, memory_validate_candidate
 from .memory_guard import memory_guard_check
+from .memory_key_documents import KEY_DOCUMENT_KEYS, rebuild_key_documents
 from .memory_lineage import (
     memory_link_artifact,
     memory_list_conflicts,
@@ -116,10 +117,17 @@ def _run_distill_for_write(
     persist = memory_write_record(
         config,
         content_markdown=summary_text,
-        record_kind="observation",
+        record_kind="distilled_summary",
         scope="user_private",
+        status="distilled",
         author=str(args.get("author") or "system"),
         derived_from_record_ids=[raw_id],
+        provenance=str(distilled.get("provenance") or "llm"),
+        immutable=bool(distilled.get("immutable", False)),
+        authoritative=bool(distilled.get("authoritative", False)),
+        replaceable=bool(distilled.get("replaceable", True)),
+        model=str(distilled.get("model") or ""),
+        distilled_at=str(distilled.get("distilled_at") or captured_at),
         task_id=str(args["task_id"]) if args.get("task_id") is not None else None,
         branch=str(args["branch"]) if args.get("branch") is not None else None,
     )
@@ -433,9 +441,19 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
     if operation == "config_diagnose":
         from .memory_diagnose import config_diagnose
         return config_diagnose(config)
+    if operation == "rebuild_key_documents":
+        raw_targets = args.get("targets")
+        if raw_targets is not None and not isinstance(raw_targets, list):
+            return error_result("invalid_input", "targets must be a list of key document names")
+        return rebuild_key_documents(
+            config,
+            targets=[str(t) for t in raw_targets] if raw_targets else None,
+            user=str(args["user"]) if args.get("user") is not None else None,
+            renderer=str(args.get("renderer") or "deterministic"),
+        )
     return error_result(
         "invalid_input",
-        "operation must be one of: compile, runtime_digest, trace_lineage, list_conflicts, compare_snapshots, retrieve_context, important_memories, config_diagnose",
+        "operation must be one of: compile, runtime_digest, trace_lineage, list_conflicts, compare_snapshots, retrieve_context, important_memories, config_diagnose, rebuild_key_documents",
     )
 
 

@@ -10,6 +10,7 @@ import pytest
 
 from servers.memory_server import server_dispatch
 from servers.memory_server.memory_config import load_config
+from servers.memory_server.memory_frontmatter import parse_record_markdown
 from servers.memory_server.memory_llm import LLMClient, LLMConfig
 from servers.memory_server.server import _dispatch_tool
 
@@ -66,12 +67,19 @@ def test_dispatch_write_record_with_distill_persists_summary(repo: Path, monkeyp
     assert distilled["pipeline"]["llm_calls"] == 1
     assert transport_calls["n"] == 1
 
-    # Persisted distilled record exists and links back to raw via derived_from_record_ids.
+    # Persisted distilled record exists as a replaceable derived layer and links back to raw.
     persisted_path = Path(repo) / distilled["distilled_path"]
     assert persisted_path.exists()
     body = persisted_path.read_text(encoding="utf-8")
     assert "auto distilled summary" in body
-    assert raw_id in body  # listed under derived_from_record_ids
+    metadata, _ = parse_record_markdown(body)
+    assert metadata["record_kind"] == "distilled_summary"
+    assert metadata["status"] == "distilled"
+    assert metadata["provenance"] == "llm"
+    assert metadata["replaceable"] == "true"
+    assert metadata["authoritative"] == "false"
+    assert metadata["model"] == "m-stub"
+    assert raw_id in metadata["derived_from_record_ids"]
 
 
 def test_dispatch_write_record_distill_default_off(repo: Path, monkeypatch) -> None:
