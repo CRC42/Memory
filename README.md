@@ -38,6 +38,39 @@ powershell -ExecutionPolicy Bypass -File <MemoryRoot>/scripts/bootstrap.ps1
 
 依赖：核心 `mcp>=1.0.0`、测试 `pytest>=7,<9`，详见 [requirements.txt](./requirements.txt)。优先用 `<MemoryRoot>/vendor/` 离线 wheel，失败回落 pip 在线。
 
+### 2.1.1 仅部署 venv + 依赖（`deploy.bat` / `deploy.ps1`）
+
+只想把 Python venv 和依赖拉起来（不改 VS Code 配置）就用这一步。**默认行为已经是「建 venv → 装依赖 → 校验 import」一条龙**，无需额外开关。
+
+```bat
+:: Windows 推荐：bat 包装，自动 -ExecutionPolicy Bypass，规避机器策略问题
+cd <MemoryRoot>
+deploy.bat                                     :: 一键安装 + 校验（推荐）
+deploy.bat -ForceRecreate                      :: venv 异常时彻底重建
+deploy.bat -PythonExe "C:\Py311\python.exe"    :: 指定解释器
+deploy.bat -InstallDevDeps                     :: 同时装 pytest 等开发依赖
+deploy.bat -RegisterVSCode                     :: 顺便把 mcp.json 写到 <RepoRoot>/.vscode/
+deploy.bat -SkipInstall                        :: 仅建 venv，不装依赖
+deploy.bat -NoVerify                           :: 跳过 import 校验
+```
+
+```powershell
+# 也可以直接调 PowerShell 版本（参数完全一致）
+powershell -ExecutionPolicy Bypass -File <MemoryRoot>/deploy.ps1
+```
+
+Python 解释器自动发现顺序（必须匹配 `vendor/` 里 wheel 的 cp 标签，目前是 **cp311**）：
+
+1. `-PythonExe <path>`（用户显式指定，最高优先级）
+2. **UE 自带 Python**：`%UE_ROOT%\Engine\Binaries\ThirdParty\Python3\Win64\python.exe`，默认依次探测 `UE_5.7 / 5.6 / 5.5 / 5.4`
+3. `py -3.11` 启动器（Windows Python Launcher）
+4. PATH 上的 `python` / `python3`
+
+发现的解释器若与 vendor 标签不匹配（例如系统是 3.12，vendor 是 cp311），脚本会报错并打印安装/指定提示，**不会**用错版本继续构建。已存在的 `.venv` 若版本不匹配会自动重建。
+
+> **常见坑**：如果 `pip list` 在 venv 里只看得到 `pip / setuptools`，说明依赖没装上 → 直接 `deploy.bat -ForceRecreate` 重新跑即可。脚本默认会做 import 校验，缺包时立即失败并提示。
+
+
 ### 2.2 手动注册到非 VS Code 客户端
 
 **Codex** (`%USERPROFILE%\.codex\config.toml`)：路径必须绝对，按本机替换 `<RepoRoot>` / `<MemoryRelToRepo>`：
