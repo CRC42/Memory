@@ -388,17 +388,6 @@ def write_compiled_view(
     )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Internal aliases used by the view orchestrators below
-# ──────────────────────────────────────────────────────────────────────
-
-_record_time = record_time
-_scored_records = scored_records
-_summary_with_score = summary_with_score
-_compiled_path = compiled_path
-_bullet_value = bullet_value
-
-
 # ── Time helpers ───────────────────────────────────────────────────────
 
 
@@ -548,9 +537,9 @@ def compile_snapshot_target(
     in_window = [
         record
         for record in records
-        if (timestamp := _record_time(record)) is not None and window_start <= timestamp <= window_end
+        if (timestamp := record_time(record)) is not None and window_start <= timestamp <= window_end
     ]
-    scored = _scored_records(config, in_window)
+    scored = scored_records(config, in_window)
     top_changes = [
         item
         for item in scored
@@ -626,7 +615,7 @@ def compile_snapshot_target(
         else:
             lines.append("- none")
     lines.append("")
-    rel_path = _compiled_path(target, task_id=label)
+    rel_path = compiled_path(target, task_id=label)
     content = "\n".join(lines)
 
     # v0.10.0 §15.3 — optional LLM-generated executive summary for
@@ -667,11 +656,11 @@ def compile_snapshot_target(
             "window_end": window_end.isoformat(),
             "derived_from_snapshot_ids": derived_snapshots,
             "summary": {
-                "top_changes": [_summary_with_score(record, score_data) for record, score_data in top_changes[:5]],
+                "top_changes": [summary_with_score(record, score_data) for record, score_data in top_changes[:5]],
                 "top_reused_memories": [
-                    _summary_with_score(record, score_data) for record, score_data in top_reused[:5]
+                    summary_with_score(record, score_data) for record, score_data in top_reused[:5]
                 ],
-                "open_questions": [_summary_with_score(record, score_data) for record, score_data in open_items[:5]],
+                "open_questions": [summary_with_score(record, score_data) for record, score_data in open_items[:5]],
             },
         },
     )
@@ -705,7 +694,7 @@ def compile_level_digest(
         if str(record.metadata.get("cognitive_level", "")) == level
         and str(record.metadata.get("status", "")) in {"validated", "published"}
     ]
-    scored = _scored_records(config, filtered)
+    scored = scored_records(config, filtered)
     title = f"{level.upper()} Digest"
     lines = [
         f"# {title}",
@@ -737,7 +726,7 @@ def compile_level_digest(
     return write_compiled_view(
         config,
         target=target,
-        rel_path=_compiled_path(target),
+        rel_path=compiled_path(target),
         content="\n".join(lines),
         included=filtered,
         user=user,
@@ -759,7 +748,7 @@ def compile_review_queue(
     branch: str | None,
     body_mode: str,
 ) -> dict[str, Any]:
-    scored = _scored_records(
+    scored = scored_records(
         config,
         [
             record
@@ -793,7 +782,7 @@ def compile_review_queue(
     result = write_compiled_view(
         config,
         target="review_queue",
-        rel_path=_compiled_path("review_queue"),
+        rel_path=compiled_path("review_queue"),
         content="\n".join(lines),
         included=[record for record, _score_data in scored[:20]],
         user=user,
@@ -802,7 +791,7 @@ def compile_review_queue(
         body_mode=body_mode,
     )
     if result.get("ok"):
-        result["ranked"] = [_summary_with_score(record, score_data) for record, score_data in scored[:10]]
+        result["ranked"] = [summary_with_score(record, score_data) for record, score_data in scored[:10]]
     return result
 
 
@@ -831,14 +820,14 @@ def compile_rollback_context(
         or bool(record.metadata.get("supersedes"))
         or bool(record.metadata.get("conflicts_with"))
     ]
-    scored = _scored_records(config, rollback_candidates)
+    scored = scored_records(config, rollback_candidates)
     lines = [
         "# Rollback Context",
         "",
         "> Deterministic rollback-oriented context view.",
         "",
-        f"- task_id: `{_bullet_value(task_id)}`",
-        f"- branch: `{_bullet_value(branch)}`",
+        f"- task_id: `{bullet_value(task_id)}`",
+        f"- branch: `{bullet_value(branch)}`",
         "",
         "## Rollback Chain",
         "",
@@ -853,7 +842,7 @@ def compile_rollback_context(
     result = write_compiled_view(
         config,
         target="rollback_context",
-        rel_path=_compiled_path("rollback_context", user=user, task_id=task_id, branch=branch),
+        rel_path=compiled_path("rollback_context", user=user, task_id=task_id, branch=branch),
         content="\n".join(lines),
         included=rollback_candidates,
         user=user,
@@ -862,7 +851,7 @@ def compile_rollback_context(
         body_mode=body_mode,
     )
     if result.get("ok"):
-        result["ranked"] = [_summary_with_score(record, score_data) for record, score_data in scored[:10]]
+        result["ranked"] = [summary_with_score(record, score_data) for record, score_data in scored[:10]]
     return result
 
 
