@@ -1,3 +1,25 @@
+"""Candidate → validated → published governance pipeline (legacy compat).
+
+============================================================================
+⚠️  DEPRECATED — ATTIC-ONLY  (DesignDoc §10 / §15.4 slim-down decision)
+----------------------------------------------------------------------------
+The `candidate → validated → published` link is *no longer* the default
+write path; new code MUST go through the raw + distilled flow described
+in DesignDoc §2.1.
+
+  * MCP exposure : default-hidden; only registered when
+                   `mcp.expose_admin_tools=True` (server_tools.py).
+  * CLI exposure : kept for **historical-data migration** + cross-team
+                   consensus publishing (cli.py validate/publish/archive).
+  * Test coverage: kept to prevent rot, NOT to encourage new callers.
+
+Do NOT extend this module with new features.  Bug fixes that keep the
+existing atomic-write contract intact are still welcome; anything that
+adds new pipeline stages, new caller hooks, or new candidate sub-states
+MUST be rejected and redirected to the raw + distilled path.
+============================================================================
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone

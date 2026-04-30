@@ -137,19 +137,20 @@ memory-bank/
 - **预筛优化**（v0.5.11）：索引健康时先用 SQLite metadata/facet 缩小候选集，再回 Markdown 真源做确定性排序；索引异常时无损回退全量扫描
 - **回退**：标签缺失时仍可按 `scope` / `author` / 时间范围 / 关键词 / 全文检索兜底
 
-## 10. 验证与发布治理（兼容层）
+## 10. 验证与发布治理（兼容层，已 attic）
 
-> ⚠️ `candidate -> validated -> published` 是历史兼容流程，不是默认路径。新流程默认走 §2.1 的 raw + distilled。仅历史数据迁移、跨团队共识发布等场景才走此链路。
+> ⚠️ `candidate -> validated -> published` 是历史兼容流程，不是默认路径。新流程默认走 §2.1 的 raw + distilled。
+> 仅历史数据迁移、跨团队共识发布等场景才走此链路。详细冻结范围、允许/禁止的改动见 §15.4。
 
 链路：`raw -> candidate -> validated -> published -> degraded/archive`。
 
 实现要点：
 
-- `memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record`：临时文件 → `os.replace` → 删旧路径，全程原子
-- `memory_delete_record` 只允许删 archived 记录，墓碑写入 `.ai-memory/tombstones.jsonl`
-- 多人模式默认开启：`activeContext.md` 自动按 `{user}.md` 分流；`progress.md` / `techContext.md` / `systemPatterns.md` / `projectbrief.md` 默认 append-only（旧配置无 `write_policy` 也通过 `multi_user.user_scoped_paths` / `shared_paths_policy` 兜底）
-- 维护工具：`memory_health_check` / `memory_migrate_records` / `memory_update_index`
-- 安全加固（v0.4.1 起，v0.5.4-0.5.6 加强）：`O_CREAT|O_EXCL|O_WRONLY` + fsync + `os.replace` + `FILE_SHARE_DELETE` 重试 + 长路径 `\\?\` 规范化 + `DiskFullError` 结构化错误 + `events.jsonl` 滚动归档；详见 DEVLOG
+- `memory_validate_candidate` / `memory_publish_candidate` / `memory_archive_record`：临时文件 → `os.replace` → 删旧路径，全程原子。默认不暴露为 MCP，仅在 `mcp.expose_admin_tools=true` 时注册；CLI 依然保留。
+- `memory_delete_record` 只允许删 archived 记录，墓碑写入 `.ai-memory/tombstones.jsonl`。
+- 多人模式默认开启：`activeContext.md` 自动按 `{user}.md` 分流；`progress.md` / `techContext.md` / `systemPatterns.md` / `projectbrief.md` 默认 append-only（旧配置无 `write_policy` 也通过 `multi_user.user_scoped_paths` / `shared_paths_policy` 兜底）。
+- 维护工具：`memory_health_check` / `memory_migrate_records` / `memory_update_index`。
+- 安全加固（v0.4.1 起，v0.5.4-0.5.6 加强）：`O_CREAT|O_EXCL|O_WRONLY` + fsync + `os.replace` + `FILE_SHARE_DELETE` 重试 + 长路径 `\\?\` 规范化 + `DiskFullError` 结构化错误 + `events.jsonl` 滚动归档；详见 DEVLOG。
 
 ## 11. MCP 接口
 
@@ -277,9 +278,17 @@ memory-bank/
 | v0.11.0 | RAG 召回质量解锁 + LLM 调用统一首批（§15.1-A/C/D + §15.2-A/B/D；621 passed + 3 skipped） | OK |
 | v0.11.1 | v0.11.x 保留项收口（§15.1-B verified `PRESETS` + §15.2-C `llm_smoke.py`；624 passed + 3 skipped） | OK |
 
-### 15.4 已降级方向（保留兼容，不再扩张）
+### 15.4 已降级方向（attic，保留兼容入口，不再扩张）
 
-- **多人联合项目治理**：现有 validate / publish / archive 链路保留用于历史数据；治理动作迁至 CLI / scripts / 管理 skill；不再把"插件内自动审查与规则晋升"当作主产品方向。
+- **多人联合项目治理**（candidate → validated → published → archive）：现有 validate / publish / archive 链路保留用于历史数据迁移；治理动作迁至 CLI / scripts / 管理 skill；不再把「插件内自动审查与规则晋升」当作主产品方向。
+  - 现状：
+    - `memory_governance.py` / `memory_maintenance.memory_delete_record` 实现保留。
+    - MCP 面：默认隐藏，仅在 `mcp.expose_admin_tools=True` 时注册（`server_tools._build_legacy_tools`）。
+    - CLI 面：`cli.py validate` / `publish` / `archive` / `delete` 保留，供历史数据迁移使用。
+    - `memory_governance.py` 文件头带 `DEPRECATED — ATTIC-ONLY` 横幅。
+  - **attic 期允许的改动**：保持厄子写入契约的 bug fix；测试维护；CLI 可读性修复。
+  - **attic 期不允许的改动**：新增 pipeline 阶段；新 caller hook；新 candidate 子状态；把任何默认路径重新接回这条链路。
+  - **解冻条件**：出现多人多仓库治理需求，且 raw + distilled 路径证明不足以表达跨团队共识。
 
 ### 15.5 已冻结方向（保留实现，不再扩张）
 

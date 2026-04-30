@@ -326,7 +326,15 @@ def _build_facade_tools(file_roles: str, path_hint: str) -> list[Tool]:
 
 
 def _build_legacy_tools(file_roles: str, path_hint: str) -> list[Tool]:
-    """Legacy/admin tool set (only registered when expose_admin_tools=True)."""
+    """Legacy/admin tool set (only registered when expose_admin_tools=True).
+
+    ⚠️  This bucket is the runtime surface of the DEPRECATED governance
+    link (DesignDoc §10 / §15.4) plus other admin-only ops.  Default
+    deployments do NOT see these tools; they exist for historical-data
+    migration, cross-team consensus publishing, and ops/CLI workflows.
+    Do not add new tools here unless the same admin-only contract
+    applies; new product features belong on the four default facades.
+    """
     return [
         Tool(
             name="memory_get",
