@@ -7,7 +7,14 @@ param(
     [switch]$RegisterVSCode,
     [switch]$Verify,
     [switch]$NoVerify,
-    [string]$RepoRoot
+    [string]$RepoRoot,
+    # Embedding model bootstrap (off by default; opt-in to keep deploy hermetic).
+    [switch]$DownloadModel,
+    [switch]$SkipDownloadModel,
+    [string]$ModelPreset = "bge-small-zh-v1.5",
+    [string]$ModelVendorDir,
+    [switch]$ModelOffline,
+    [switch]$ModelOptional
 )
 
 # Default behaviour: ensure venv + ensure deps + verify imports.
@@ -282,6 +289,45 @@ if ($RegisterVSCode) {
         & (Join-Path $memoryRoot "setup_mcp.ps1")
     } else {
         & (Join-Path $memoryRoot "setup_mcp.ps1") -RepoRoot $RepoRoot
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7) Optional: bootstrap embedding model (P5 RAG provider)
+#    Off by default. Triggers when:
+#      * -DownloadModel switch is set, OR
+#      * env MEMORY_DOWNLOAD_MODEL=1 is set
+#    Suppressed by -SkipDownloadModel.
+#    Default source: vendor/models/<preset>/  (offline, sha256-verified copy)
+#    Falls back to https download unless -ModelOffline is set.
+# ---------------------------------------------------------------------------
+$envWantDownload = $env:MEMORY_DOWNLOAD_MODEL -and ($env:MEMORY_DOWNLOAD_MODEL -ne "0")
+if (-not $SkipDownloadModel -and ($DownloadModel -or $envWantDownload)) {
+    $downloadScript = Join-Path $memoryRoot "scripts\download_embedding_model.py"
+    if (-not (Test-Path $downloadScript)) {
+        Write-Host "WARNING: model download requested but $downloadScript not found." -ForegroundColor Yellow
+    } else {
+        $modelRepo = if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $memoryRoot } else { $RepoRoot }
+        $argsList = @("`"$downloadScript`"", "--repo", "`"$modelRepo`"", "--preset", $ModelPreset)
+        if ($ModelVendorDir) { $argsList += @("--vendor-dir", "`"$ModelVendorDir`"") }
+        if ($ModelOffline)   { $argsList += "--no-network" }
+        Write-Host "Bootstrapping embedding model preset: $ModelPreset" -ForegroundColor Cyan
+        $prevEAP4 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        & $venvPython @argsList
+        $modelExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP4
+        if ($modelExit -ne 0) {
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "Model bootstrap FAILED (exit=$modelExit)." -ForegroundColor Yellow
+            Write-Host "  Manual retry:" -ForegroundColor Yellow
+            Write-Host "    `"$venvPython`" `"$downloadScript`" --repo `"$modelRepo`" --preset $ModelPreset" -ForegroundColor DarkYellow
+            Write-Host "  Offline / bundled deployment:" -ForegroundColor Yellow
+            Write-Host "    1) Pre-stage files under $memoryRoot\vendor\models\$ModelPreset\ (sha256 must match preset)" -ForegroundColor DarkYellow
+            Write-Host "    2) Re-run with -DownloadModel -ModelOffline (refuses HTTP fallback)" -ForegroundColor DarkYellow
+            Write-Host "  See vendor\models\README.md for the full bundling layout." -ForegroundColor DarkYellow
+            if (-not $ModelOptional) { exit $modelExit }
+            Write-Host "  -ModelOptional set: continuing without embedding model (RAG falls back to deterministic-hash)." -ForegroundColor Yellow
+        }
     }
 }
 

@@ -49,7 +49,7 @@ def test_deterministic_capabilities_forbid_llm(capability: str) -> None:
 
 @pytest.mark.parametrize(
     "capability",
-    ["distill_summary", "topic_cluster", "rewrite", "generate_handoff"],
+    ["distill_summary", "topic_cluster", "rewrite", "generate_handoff", "summarize_recall", "snapshot_narrative"],
 )
 def test_llm_native_capabilities_use_llm(capability: str) -> None:
     """Free-text generation/clustering/rewriting are LLM-native."""
@@ -68,6 +68,8 @@ def test_llm_native_capabilities_use_llm(capability: str) -> None:
         "merge_candidates",
         "generate_skill_candidate",
         "explain_conflict",
+        "rebuild_key_document",
+        "query_rewrite",
     ],
 )
 def test_hybrid_capabilities_use_llm_then_validate(capability: str) -> None:

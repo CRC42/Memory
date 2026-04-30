@@ -100,6 +100,38 @@ DEFAULT_CONFIG_CONTENT: dict[str, Any] = {
             "prefer_order": ["llm", "deterministic"],
         },
     },
+    # P5 Phase 1 — local CPU-only RAG / vector supplement (see
+    # MemorySystemDesignDocument.md §15.4).  All defaults are conservative:
+    # the tier is OFF until the user explicitly opts in, and even when on
+    # it never triggers a network call (provider=auto picks the best
+    # locally-available CPU provider; missing models silently fall back).
+    "embeddings": {
+        "enabled": False,
+        "provider": "auto",
+        "model_path": ".ai-memory/models/bge-small-zh.onnx",
+        "index_dir": ".ai-memory/vector_index",
+        "max_batch": 32,
+        "max_index_chunks": 100_000,
+        "rebuild_on_provider_change": True,
+    },
+    # v0.10.0 — unified LLM capability defaults (see
+    # MemorySystemDesignDocument.md §15.3 / memory_llm_runner.py).
+    # All capabilities OFF by default — v0.10.0 only ships the *runner*;
+    # flipping a capability to enabled is an explicit per-user decision so
+    # the cost surface stays predictable.  Per-capability blocks override
+    # the global "enabled" / "timeout" / "max_tokens" knobs.
+    "llm_defaults": {
+        "enabled": False,
+        "timeout": None,
+        "max_tokens": None,
+        "capabilities": {
+            # "distill_summary": {"enabled": True, "timeout": 60},
+            # "summarize_recall": {"enabled": True},
+            # "rebuild_key_document": {"enabled": True, "timeout": 90},
+            # "query_rewrite": {"enabled": True, "timeout": 30, "max_tokens": 256},
+            # "snapshot_narrative": {"enabled": True, "timeout": 60},
+        },
+    },
 }
 
 
@@ -155,6 +187,18 @@ class MemoryConfig:
     mcp_auto_maintenance: dict[str, Any] | None = None
     key_documents_mode: str = "auto"
     key_documents_prefer_order: tuple[str, ...] = ("llm", "deterministic")
+    # P5 Phase 1 — see MemorySystemDesignDocument.md §15.4
+    embeddings_enabled: bool = False
+    embeddings_provider: str = "auto"
+    embeddings_model_path: Path | None = None
+    embeddings_index_dir: Path | None = None
+    embeddings_max_batch: int = 32
+    embeddings_max_index_chunks: int = 100_000
+    embeddings_rebuild_on_provider_change: bool = True
+    # v0.10.0 — unified LLM capability defaults; consumed by
+    # :mod:`memory_llm_runner`. Stored as a free-form dict so adding new
+    # knobs does not churn the dataclass.
+    llm_defaults: dict[str, Any] | None = None
 
     def repo_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.repo_root).as_posix()
@@ -379,4 +423,91 @@ def load_config(repo_root: str | Path, config_path: str | Path | None = None) ->
         ),
         key_documents_mode=_parse_key_documents_mode(merged.get("key_documents")),
         key_documents_prefer_order=_parse_key_documents_prefer_order(merged.get("key_documents")),
+        **_parse_embeddings(root, merged.get("embeddings")),
+        llm_defaults=_parse_llm_defaults(merged.get("llm_defaults")),
     )
+
+
+def _parse_llm_defaults(raw: Any) -> dict[str, Any] | None:
+    """Parse the optional ``llm_defaults`` config block (v0.10.0).
+
+    Returns ``None`` when the block is absent or empty so :mod:`memory_llm_runner`
+    can fall back to its built-in :data:`DEFAULT_CAPABILITY_PROFILES` without
+    extra branching.  Unknown keys are preserved verbatim so future capabilities
+    can ship config without a config-loader change.
+    """
+
+    if not isinstance(raw, dict):
+        return None
+    cleaned: dict[str, Any] = {}
+    for key in ("enabled", "timeout", "max_tokens"):
+        if key in raw and raw[key] is not None:
+            cleaned[key] = raw[key]
+    capabilities = raw.get("capabilities")
+    if isinstance(capabilities, dict):
+        cleaned_caps: dict[str, Any] = {}
+        for cap_name, cap_overrides in capabilities.items():
+            if not isinstance(cap_overrides, dict):
+                continue
+            inner: dict[str, Any] = {}
+            for inner_key in ("enabled", "timeout", "max_tokens"):
+                if inner_key in cap_overrides and cap_overrides[inner_key] is not None:
+                    inner[inner_key] = cap_overrides[inner_key]
+            if inner:
+                cleaned_caps[str(cap_name).strip()] = inner
+        if cleaned_caps:
+            cleaned["capabilities"] = cleaned_caps
+    return cleaned or None
+
+
+_VALID_EMBEDDING_PROVIDERS = {"auto", "deterministic-hash", "local-onnx"}
+
+
+def _parse_embeddings(repo_root: Path, raw: Any) -> dict[str, Any]:
+    """Parse the optional "embeddings" config block.
+
+    Returns kwargs ready to splat into :class:`MemoryConfig`.  Missing or
+    invalid fields fall back to the defaults so the vector tier always
+    stays OFF unless the user explicitly enables it (see §15.4 "可选 + 可降级").
+    """
+
+    defaults = DEFAULT_CONFIG_CONTENT["embeddings"]
+    if not isinstance(raw, dict):
+        raw = {}
+
+    provider = str(raw.get("provider", defaults["provider"])).strip().lower() or "auto"
+    if provider not in _VALID_EMBEDDING_PROVIDERS:
+        provider = "auto"
+
+    model_path_raw = raw.get("model_path", defaults["model_path"])
+    model_path = (
+        _to_repo_path(repo_root, str(model_path_raw))
+        if isinstance(model_path_raw, str) and model_path_raw.strip()
+        else None
+    )
+
+    index_dir_raw = raw.get("index_dir", defaults["index_dir"])
+    index_dir = (
+        _to_repo_path(repo_root, str(index_dir_raw))
+        if isinstance(index_dir_raw, str) and index_dir_raw.strip()
+        else _to_repo_path(repo_root, str(defaults["index_dir"]))
+    )
+
+    def _pos_int(value: Any, fallback: int) -> int:
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        return fallback
+
+    return {
+        "embeddings_enabled": bool(raw.get("enabled", defaults["enabled"])),
+        "embeddings_provider": provider,
+        "embeddings_model_path": model_path,
+        "embeddings_index_dir": index_dir,
+        "embeddings_max_batch": _pos_int(raw.get("max_batch"), int(defaults["max_batch"])),
+        "embeddings_max_index_chunks": _pos_int(
+            raw.get("max_index_chunks"), int(defaults["max_index_chunks"])
+        ),
+        "embeddings_rebuild_on_provider_change": bool(
+            raw.get("rebuild_on_provider_change", defaults["rebuild_on_provider_change"])
+        ),
+    }

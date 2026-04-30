@@ -16,14 +16,92 @@ from .memory_budget import (  # P1-D: shared budget primitives
 from .memory_compiler import load_compile_cache_entries
 from .memory_config import MemoryConfig
 from .memory_corpus import CompilableRecord, compact_body as _compact_body, iter_compilable_records as _iter_records
+from .memory_events import append_event
 from .memory_lineage import memory_list_conflicts
 from .memory_paths import PathSecurityError
 from .memory_record_index import prefilter_record_paths
 from .memory_result import error_result, ok_result
 from .memory_scoring import build_reference_counts, load_usage_stats, parse_timestamp, score_record
+from .memory_vector_search import vector_search
 from .token_estimator import estimate_tokens
 
 DEFAULT_RETRIEVAL_SCOPES = ["shared", "personal", "session", "task_or_branch", "project_shared", "org_shared"]
+
+
+# ── P5 Phase 2b — vector supplement tunables (see DesignDoc §15.4) ────
+# Conservative numbers so the FTS ranking continues to dominate.  These
+# are not user-facing config keys yet; once we have ONNX recall data we
+# can promote them to MemoryConfig.
+_VECTOR_RECALL_MIN_SCORE = 0.20  # below this, treat as "no semantic match"
+_VECTOR_SUPPLEMENT_WEIGHT = 0.25  # weight when ONLY the vector tier hit
+_VECTOR_SUPPLEMENT_BOOST = 0.10   # additive boost when both FTS and vector hit
+_VECTOR_SUPPLEMENT_CEILING = 0.5  # absolute cap to keep FTS dominant
+_VECTOR_SUPPLEMENT_TOP_K = 50     # how many vector neighbours we look at
+
+
+def _vector_supplement(
+    config: MemoryConfig,
+    query: str | None,
+    records: list[CompilableRecord],
+) -> dict[str, float]:
+    """Run the optional vector tier and project hits back to ``record_id``.
+
+    Returns ``{record_id: best_chunk_score}`` for records present in the
+    candidate set.  Always safe to call: missing index, disabled tier, or
+    any embedding failure yields an empty mapping so the caller's ranking
+    falls back to FTS-only behaviour (per \u00a715.4.1 "\u53ef\u9009 + \u53ef\u964d\u7ea7").
+    """
+
+    if not getattr(config, "embeddings_enabled", False):
+        return {}
+    if not isinstance(query, str) or not query.strip():
+        return {}
+    candidate_ids = {str(r.metadata.get("id", "")) for r in records}
+    if not candidate_ids:
+        return {}
+    try:
+        result = vector_search(config, query, top_k=_VECTOR_SUPPLEMENT_TOP_K)
+    except Exception as exc:
+        # \u00a715.1-D: never silently swallow \u2014 leave a breadcrumb so health
+        # surface can show how often the optional tier is being skipped.
+        try:
+            append_event(
+                config,
+                "vector_supplement_skipped",
+                {
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "query_preview": query[:80],
+                },
+                status="warn",
+            )
+        except Exception:
+            # Event logging is best-effort \u2014 never let it mask the original
+            # silent-degrade contract of the vector tier.
+            pass
+        return {}
+    if not result.get("ok"):
+        try:
+            append_event(
+                config,
+                "vector_supplement_skipped",
+                {
+                    "reason": str(result.get("error") or result.get("status") or "vector_search_not_ok"),
+                    "query_preview": query[:80],
+                },
+                status="warn",
+            )
+        except Exception:
+            pass
+        return {}
+    best: dict[str, float] = {}
+    for hit in result.get("hits", []):
+        rid = str(hit.get("record_id", ""))
+        if rid not in candidate_ids:
+            continue
+        score = float(hit.get("score", 0.0))
+        if score > best.get(rid, 0.0):
+            best[rid] = score
+    return best
 
 
 def _normalize_list(value: list[str] | None) -> list[str]:
@@ -300,12 +378,43 @@ def _rank_records(
     records: list[CompilableRecord],
     corpus_records: list[CompilableRecord],
     query: str | None,
+    extra_queries: list[str] | None = None,
 ) -> list[tuple[CompilableRecord, dict[str, Any], float, float]]:
+    # P5 Phase 2b: optional vector supplement (§15.4).  Only consulted when
+    # the user has explicitly opted into the embedding tier; any failure
+    # downgrades silently to FTS-only ranking so the main path stays alive.
+    vector_recall = _vector_supplement(config, query, records)
+
+    # v0.10.0 — query_rewrite supplement.  ``extra_queries`` holds variants
+    # produced by :mod:`memory_query_rewrite`.  We score each variant the
+    # same way as the primary query and take the per-record maximum so a
+    # synonym hit can rescue a record that the original phrasing missed.
+    variant_queries = [q for q in (extra_queries or []) if isinstance(q, str) and q.strip()]
+
     recall: list[tuple[CompilableRecord, float]] = []
     for record in records:
-        match_score = _query_match_score(record, query)
+        primary_score = _query_match_score(record, query)
+        match_score = primary_score
+        for variant in variant_queries:
+            variant_score = _query_match_score(record, variant)
+            if variant_score > match_score:
+                match_score = variant_score
+        record_id = str(record.metadata.get("id", ""))
+        vec_score = vector_recall.get(record_id, 0.0)
         if match_score < 0:
-            continue
+            # No lexical hit; promote into the candidate set only when the
+            # vector tier produced a meaningful similarity.
+            if vec_score >= _VECTOR_RECALL_MIN_SCORE:
+                match_score = vec_score * _VECTOR_SUPPLEMENT_WEIGHT
+            else:
+                continue
+        elif vec_score >= _VECTOR_RECALL_MIN_SCORE:
+            # Lexical hit AND vector hit → small additive boost.  Capped so
+            # the FTS signal still dominates ranking.
+            match_score = min(
+                match_score + vec_score * _VECTOR_SUPPLEMENT_BOOST,
+                _VECTOR_SUPPLEMENT_CEILING,
+            )
         recall.append((record, match_score))
 
     usage_stats = load_usage_stats(config)
@@ -498,6 +607,7 @@ def memory_get_important_memories(
     max_chars: int | None = None,
     max_tokens: int | None = None,
     max_items: int | None = None,
+    query_variants: list[str] | None = None,
 ) -> dict[str, Any]:
     budget_error = _validate_budget_inputs(max_chars=max_chars, max_tokens=max_tokens, max_items=max_items)
     if budget_error:
@@ -530,7 +640,13 @@ def memory_get_important_memories(
 
     records = collected["records"]
     facet_filtered = collected["facet_filtered"]
-    ranked = _rank_records(config, records=facet_filtered, corpus_records=records, query=query)
+    ranked = _rank_records(
+        config,
+        records=facet_filtered,
+        corpus_records=records,
+        query=query,
+        extra_queries=query_variants,
+    )
     selected_pairs, important_memories, dropped_candidates, budget_report = _pack_ranked_records(
         ranked,
         max_chars=effective_max_chars,
@@ -614,6 +730,7 @@ def memory_retrieve_context(
     max_chars: int | None = None,
     max_tokens: int | None = None,
     max_items: int | None = None,
+    query_variants: list[str] | None = None,
 ) -> dict[str, Any]:
     limit = top_k or 10
     if limit <= 0:
@@ -645,7 +762,13 @@ def memory_retrieve_context(
 
     records = collected["records"]
     facet_filtered = collected["facet_filtered"]
-    ranked = _rank_records(config, records=facet_filtered, corpus_records=records, query=query)
+    ranked = _rank_records(
+        config,
+        records=facet_filtered,
+        corpus_records=records,
+        query=query,
+        extra_queries=query_variants,
+    )
     effective_max_chars = max_chars if max_chars is not None else IMPORTANT_MEMORY_DEFAULT_MAX_CHARS
     effective_max_tokens = max_tokens if max_tokens is not None else IMPORTANT_MEMORY_DEFAULT_MAX_TOKENS
     effective_max_items = max_items if max_items is not None else limit

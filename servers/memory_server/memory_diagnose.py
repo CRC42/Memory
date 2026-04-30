@@ -121,4 +121,74 @@ def config_diagnose(config: MemoryConfig) -> dict[str, Any]:
         "ok": True,
         "repo_root": str(config.repo_root),
         "fields": fields,
+        "llm_capabilities": _diagnose_llm_capabilities(config, raw),
     }
+
+
+# ---------------------------------------------------------------------------
+# \u00a715.2-D: LLM capability diagnostic
+# ---------------------------------------------------------------------------
+
+
+def _diagnose_llm_capabilities(config: MemoryConfig, raw: dict[str, Any]) -> dict[str, Any]:
+    """Return the effective ``enabled / timeout / max_tokens`` for every
+    LLM capability registered in :data:`DEFAULT_CAPABILITY_PROFILES`,
+    along with the source (default / file / file.capabilities.<name> / env)
+    that produced each value.
+
+    This mirrors the precedence walk inside
+    :func:`memory_llm_runner.resolve_capability_profile` so users can
+    answer "why is this capability disabled?" without reading code.
+    """
+
+    try:
+        from .memory_llm_runner import (
+            DEFAULT_CAPABILITY_PROFILES,
+            resolve_capability_profile,
+        )
+    except Exception as exc:  # pragma: no cover \u2014 defensive
+        return {"error": f"runner_unavailable: {exc}"}
+
+    block = raw.get("llm_defaults") if isinstance(raw.get("llm_defaults"), dict) else {}
+    cap_block = block.get("capabilities") if isinstance(block.get("capabilities"), dict) else {}
+
+    out: dict[str, Any] = {}
+    # Map UI field names to the raw key aliases we accept in
+    # ``llm_defaults`` / ``llm_defaults.capabilities.<cap>``.
+    _ALIASES = {
+        "enabled": ("enabled",),
+        "timeout_ms": ("timeout_ms", "timeout"),
+        "max_tokens": ("max_tokens", "tokens"),
+        "fallback": ("fallback",),
+    }
+    for cap_name, base in DEFAULT_CAPABILITY_PROFILES.items():
+        resolved = resolve_capability_profile(config, cap_name)
+        cap_overrides = cap_block.get(cap_name) if isinstance(cap_block.get(cap_name), dict) else {}
+
+        def _source(field: str) -> str:
+            for alias in _ALIASES.get(field, (field,)):
+                if alias in cap_overrides:
+                    return "file"
+                if alias in block:
+                    return "file"
+            return "default"
+
+        out[cap_name] = {
+            "enabled": {"value": resolved.enabled, "source": _source("enabled")},
+            "timeout_ms": {
+                "value": int(resolved.timeout * 1000) if resolved.timeout else None,
+                "source": _source("timeout_ms"),
+            },
+            "max_tokens": {
+                "value": resolved.max_tokens,
+                "source": _source("max_tokens"),
+            },
+            "fallback": {
+                "value": "deterministic" if cap_name in {
+                    "rebuild_key_document", "query_rewrite", "snapshot_narrative",
+                } else "in_band_error",
+                "source": "default",
+            },
+            "description": base.description,
+        }
+    return out

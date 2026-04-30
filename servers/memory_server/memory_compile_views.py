@@ -86,6 +86,77 @@ def format_record_bullets(
 # ── Snapshot target ────────────────────────────────────────────────────
 
 
+def _maybe_generate_snapshot_narrative(
+    config: MemoryConfig,
+    *,
+    target: str,
+    label: str,
+    records: list[CompilableRecord],
+) -> dict[str, Any]:
+    """Run the v0.10.0 ``snapshot_narrative`` capability under the runner.
+
+    Returns a status envelope.  When the LLM is disabled / unavailable /
+    fails, ``ok`` is still True from the runner's perspective (callers
+    can read the inner ``status`` to decide whether to retry); the
+    snapshot body itself is always written deterministically and the
+    only effect of failure is that no ``## Narrative (LLM)`` section is
+    spliced in.
+    """
+
+    from .memory_llm_runner import run_llm_capability
+
+    record_payload = [
+        {
+            "id": str(record.metadata.get("id", "")),
+            "title": str(record.title or ""),
+            "record_kind": str(record.metadata.get("record_kind", "")),
+            "body": str(getattr(record, "content", "") or ""),
+        }
+        for record in records
+    ]
+
+    def _invoke(client):
+        from .memory_llm import LLMRequestError
+        from .memory_snapshot_narrative import generate_snapshot_narrative
+
+        outcome = generate_snapshot_narrative(
+            client,
+            record_payload,
+            target=target,
+            label=label,
+        )
+        if not outcome.ok:
+            raise LLMRequestError(outcome.error or "snapshot_narrative failed")
+        return {
+            "ok": True,
+            "section": outcome.injected_section,
+            "narrative": outcome.narrative,
+            "model": outcome.model,
+            "cache_hit": outcome.cache_hit,
+            "record_count": outcome.record_count,
+        }
+
+    envelope = run_llm_capability(
+        config,
+        "snapshot_narrative",
+        _invoke,
+        fallback=lambda: {"ok": True, "section": "", "fallback": True},
+    )
+    payload = envelope.value if isinstance(envelope.value, dict) else {}
+    return {
+        "ok": bool(envelope.ok),
+        "status": envelope.status,
+        "fallback_used": bool(envelope.fallback_used),
+        "section": str(payload.get("section") or "") if isinstance(payload, dict) else "",
+        "narrative": str(payload.get("narrative") or "") if isinstance(payload, dict) else "",
+        "model": str(payload.get("model") or "") if isinstance(payload, dict) else "",
+        "cache_hit": bool(payload.get("cache_hit")) if isinstance(payload, dict) else False,
+        "record_count": int(payload.get("record_count") or 0) if isinstance(payload, dict) else 0,
+        "error": envelope.error,
+        "envelope": envelope.to_dict(),
+    }
+
+
 def compile_snapshot_target(
     config: MemoryConfig,
     *,
@@ -96,6 +167,7 @@ def compile_snapshot_target(
     branch: str | None,
     body_mode: str,
     as_of: str | None,
+    narrative: bool = False,
 ) -> dict[str, Any]:
     try:
         reference = reference_time(as_of)
@@ -184,11 +256,34 @@ def compile_snapshot_target(
             lines.append("- none")
     lines.append("")
     rel_path = _compiled_path(target, task_id=label)
+    content = "\n".join(lines)
+
+    # v0.10.0 §15.3 — optional LLM-generated executive summary for
+    # weekly / monthly snapshots.  The deterministic body above is the
+    # source of truth; the narrative is spliced in front of it via
+    # :func:`memory_snapshot_narrative.inject_narrative`, which is
+    # idempotent and additive (re-running without ``narrative=True``
+    # produces an identical body).
+    narrative_outcome: dict[str, Any] | None = None
+    if narrative and target in {"weekly_snapshot", "monthly_snapshot"}:
+        narrative_outcome = _maybe_generate_snapshot_narrative(
+            config,
+            target=target,
+            label=label,
+            records=in_window,
+        )
+        if narrative_outcome and narrative_outcome.get("ok"):
+            section = str(narrative_outcome.get("section") or "")
+            if section.strip():
+                from .memory_snapshot_narrative import inject_narrative
+
+                content = inject_narrative(content, section)
+
     result = write_compiled_view(
         config,
         target=target,
         rel_path=rel_path,
-        content="\n".join(lines),
+        content=content,
         included=in_window,
         user=user,
         task_id=task_id,
@@ -214,6 +309,8 @@ def compile_snapshot_target(
         result["window_start"] = window_start.isoformat()
         result["window_end"] = window_end.isoformat()
         result["derived_from_snapshot_ids"] = derived_snapshots
+    if narrative_outcome is not None and isinstance(result, dict):
+        result["narrative"] = narrative_outcome
     return result
 
 

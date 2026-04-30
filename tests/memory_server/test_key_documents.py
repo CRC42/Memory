@@ -278,11 +278,18 @@ def test_rebuild_llm_renderer_without_client_returns_llm_unavailable(monkeypatch
     assert err["error"] == "llm_unavailable"
 
 
-def test_rebuild_embedding_renderer_returns_not_implemented(populated_repo: Path) -> None:
+def test_rebuild_embedding_renderer_requires_enabled_flag(populated_repo: Path) -> None:
+    """Without ``embeddings.enabled=true`` the embedding tier is hard-disabled.
+
+    Once the flag is on, the orchestrator falls through to the deterministic
+    tier when the vector index is missing — see
+    ``test_rebuild_embedding_renderer_falls_back_to_deterministic`` below.
+    """
+
     config = load_config(populated_repo)
     result = rebuild_key_documents(config, targets=["progress"], user="alice", renderer="embedding")
     assert result["ok"] is False
-    assert result["error"] == "not_implemented"
+    assert result["error"] == "embeddings_disabled"
 
 
 def test_rebuild_dispatch_via_memory_context_op(populated_repo: Path) -> None:

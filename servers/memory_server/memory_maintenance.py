@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .memory_config import MemoryConfig
-from .memory_events import append_event
+from .memory_events import append_event, count_recent_events
 from .memory_locks import file_lock
 from .memory_paths import PathSecurityError
 from .memory_record_io import (
@@ -95,6 +95,15 @@ def memory_health_check(config: MemoryConfig) -> dict[str, Any]:
 
     # P2-2: startup self-heal — clean stale .tmp orphans and lock sidecars.
     extras.update(_self_heal(config))
+
+    # \u00a715.1-D: surface how often the optional vector tier is being skipped
+    # in the past 24h so operators can spot index/provider regressions.
+    try:
+        extras["vector_skip_count_24h"] = count_recent_events(
+            config, "vector_supplement_skipped"
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
 
     # P2-3: scoring strategy drift warning.
     try:

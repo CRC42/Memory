@@ -21,6 +21,7 @@ can be used from the MCP server without adding install-time requirements.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket
@@ -118,6 +119,14 @@ class LLMConfig:
     # Default thinking mode for the client; per-call override always wins.
     default_thinking: bool = False
     default_reasoning_effort: str | None = None
+    # Retry policy for transient upstream errors (5xx + network).  Set
+    # ``max_retries=0`` to disable.  Backoff is exponential: ``backoff *
+    # 2**attempt`` seconds, capped at ``retry_backoff_max_seconds``.  We
+    # never retry 4xx (auth/budget) or :class:`LLMBudgetExceeded` /
+    # :class:`LLMInputTooLarge` (deterministic refusals).
+    max_retries: int = 2
+    retry_backoff_seconds: float = 0.5
+    retry_backoff_max_seconds: float = 4.0
 
     def chat_completions_url(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
@@ -402,6 +411,8 @@ class LLMClient:
         self.total_completion_tokens: int = 0
         self.call_count: int = 0
         self.total_estimated_cost_cny: float = 0.0
+        self.retry_count: int = 0
+        self.last_retry_reason: str | None = None
 
     def reset_usage(self) -> None:
         """Reset cumulative usage counters."""
@@ -409,6 +420,8 @@ class LLMClient:
         self.total_completion_tokens = 0
         self.call_count = 0
         self.total_estimated_cost_cny = 0.0
+        self.retry_count = 0
+        self.last_retry_reason = None
 
     def usage_snapshot(self) -> dict[str, Any]:
         return {
@@ -417,6 +430,7 @@ class LLMClient:
             "total_completion_tokens": self.total_completion_tokens,
             "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
             "total_estimated_cost_cny": round(self.total_estimated_cost_cny, 6),
+            "retry_count": self.retry_count,
         }
 
     @staticmethod
@@ -538,9 +552,38 @@ class LLMClient:
         effective_timeout = float(timeout) if timeout is not None else self.config.timeout
 
         if self._transport is not None:
-            status, body_text = self._transport(url, headers, body_bytes, effective_timeout)
+            transport_call = lambda: self._transport(url, headers, body_bytes, effective_timeout)
         else:
-            status, body_text = _http_post(url, headers, body_bytes, effective_timeout)
+            transport_call = lambda: _http_post(url, headers, body_bytes, effective_timeout)
+
+        # Retry loop: 5xx + network errors are transient; 4xx are not.
+        max_retries = max(0, int(self.config.max_retries))
+        backoff = max(0.0, float(self.config.retry_backoff_seconds))
+        backoff_cap = max(backoff, float(self.config.retry_backoff_max_seconds))
+        attempt = 0
+        while True:
+            try:
+                status, body_text = transport_call()
+                network_error: LLMRequestError | None = None
+            except LLMRequestError as exc:
+                status, body_text = 0, ""
+                network_error = exc
+            should_retry = attempt < max_retries and (
+                network_error is not None or (status >= 500 and status != 501)
+            )
+            if not should_retry:
+                if network_error is not None:
+                    raise network_error
+                break
+            attempt += 1
+            self.retry_count += 1
+            sleep_for = min(backoff_cap, backoff * (2 ** (attempt - 1))) if backoff > 0 else 0.0
+            self.last_retry_reason = (
+                f"network: {network_error}" if network_error is not None else f"http {status}"
+            )
+            if sleep_for > 0:
+                import time as _time
+                _time.sleep(sleep_for)
 
         if status >= 400:
             raise LLMRequestError(
@@ -898,7 +941,13 @@ def _http_post(url: str, headers: dict[str, str], body: bytes, timeout: float) -
         except Exception:  # pragma: no cover — defensive
             pass
         return int(exc.code), body_text
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+    except (
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+        http.client.HTTPException,
+        ConnectionError,
+    ) as exc:
         raise LLMRequestError(f"network error contacting LLM: {exc}") from exc
 
 

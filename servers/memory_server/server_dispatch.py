@@ -64,6 +64,10 @@ def _run_distill_for_write(
     Failure modes are reported in-band (``{ok: False, error, message}``)
     so the primary write result is never lost. Always opt-in via
     ``distill=True``.
+
+    \u00a715.2-A: routes through :func:`run_llm_capability` so disabled /
+    unavailable / timeout / budget paths emit the canonical 7-status
+    envelope (no more ad-hoc try/except + ``_build_llm_client``).
     """
     from datetime import datetime, timezone
 
@@ -75,14 +79,20 @@ def _run_distill_for_write(
     if not raw_content.strip():
         return error_result("distill_skipped", "empty raw content; nothing to distill")
 
-    client, err = _build_llm_client()
-    if err is not None:
-        return err
     try:
-        from .memory_llm import LLMError, make_raw_record
+        from .memory_llm import make_raw_record
         from .memory_llm_pipeline import map_reduce_distill
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:  # pragma: no cover \u2014 defensive
         return error_result("llm_unavailable", f"pipeline import failed: {exc}")
+    from .memory_llm_runner import (
+        STATUS_BUDGET,
+        STATUS_DISABLED,
+        STATUS_FAILED,
+        STATUS_OK,
+        STATUS_TIMEOUT,
+        STATUS_UNAVAILABLE,
+        run_llm_capability,
+    )
 
     captured_at = datetime.now(timezone.utc).isoformat()
     raw_view = make_raw_record(
@@ -93,8 +103,8 @@ def _run_distill_for_write(
         author=str(args.get("author") or "system"),
     )
 
-    try:
-        distilled = map_reduce_distill(
+    def _invoke(client, _profile):
+        distilled_payload = map_reduce_distill(
             client,
             [raw_view],
             record_id=f"{raw_id}-distilled",
@@ -104,15 +114,49 @@ def _run_distill_for_write(
             tags=args.get("distill_tags") or args.get("tags"),
             max_tokens=args.get("distill_max_tokens"),
         )
-    except LLMError as exc:
-        return error_result("distill_failed", str(exc))
-    except Exception as exc:  # pragma: no cover — unexpected
-        logger.exception("unexpected error in distill pipeline")
-        return error_result("distill_failed", f"unexpected: {exc}")
+        return {"distilled": distilled_payload, "client": client}
 
+    def _client_factory(_profile):
+        # Honour the legacy ``_build_llm_client`` seam so tests that
+        # monkey-patch it (and production callers that pre-built a client)
+        # keep working unchanged.
+        client, err = _build_llm_client()
+        if client is None:
+            from .memory_llm import LLMConfigError
+
+            raise LLMConfigError((err or {}).get("message") or "LLM client unavailable")
+        return client
+
+    envelope = run_llm_capability(
+        config,
+        "distill_summary",
+        _invoke,
+        client_factory=_client_factory,
+        # \u00a715.2-A legacy contract: ``distill=True`` is itself the opt-in
+        # signal; we don't gate again on the capability flag.
+        force_enabled=True,
+    )
+    if not envelope.ok:
+        status_to_code = {
+            STATUS_DISABLED: "llm_disabled",
+            STATUS_UNAVAILABLE: "llm_unavailable",
+            STATUS_TIMEOUT: "distill_timeout",
+            STATUS_BUDGET: "distill_budget_exceeded",
+            STATUS_FAILED: "distill_failed",
+        }
+        code = status_to_code.get(envelope.status, "distill_failed")
+        out = error_result(code, envelope.error or "distill skipped")
+        out["envelope"] = envelope.to_dict()
+        return out
+
+    payload = envelope.value if isinstance(envelope.value, dict) else {}
+    distilled = payload.get("distilled") or {}
+    client = payload.get("client")
     summary_text = str(distilled.get("content") or "").strip()
     if not summary_text:
-        return error_result("distill_failed", "empty summary text")
+        out = error_result("distill_failed", "empty summary text")
+        out["envelope"] = envelope.to_dict()
+        return out
 
     persist = memory_write_record(
         config,
@@ -131,31 +175,55 @@ def _run_distill_for_write(
         task_id=str(args["task_id"]) if args.get("task_id") is not None else None,
         branch=str(args["branch"]) if args.get("branch") is not None else None,
     )
+    usage = {}
+    snap = getattr(client, "usage_snapshot", None)
+    if callable(snap):
+        try:
+            usage_snap = snap()
+            if isinstance(usage_snap, dict):
+                usage = usage_snap
+        except Exception:
+            usage = {}
     return {
         "ok": bool(persist.get("ok")),
+        "status": envelope.status,
         "summary": summary_text,
         "distilled_record_id": persist.get("id"),
         "distilled_path": persist.get("path"),
         "model": distilled.get("model"),
         "pipeline": distilled.get("pipeline", {}),
-        "usage": client.usage_snapshot(),
+        "usage": usage,
         "persist_result": persist,
+        "envelope": envelope.to_dict(),
     }
 
 
-def _run_recall_summarize(args: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
-    """LLM map-reduce summary over already-retrieved records (read-only)."""
+def _run_recall_summarize(
+    config: MemoryConfig,
+    args: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """LLM map-reduce summary over already-retrieved records (read-only).
+
+    \u00a715.2-A: routes through :func:`run_llm_capability` so the 7-status
+    envelope replaces the previous ad-hoc opt-in + try/except block.
+    """
     if not records:
         return error_result("summarize_skipped", "no records to summarize")
-    client, err = _build_llm_client()
-    if err is not None:
-        return err
     try:
-        from .memory_llm import LLMError
         from .memory_llm_pipeline import summarize_records_for_recall
     except Exception as exc:  # pragma: no cover
         return error_result("llm_unavailable", f"pipeline import failed: {exc}")
-    try:
+    from .memory_llm_runner import (
+        STATUS_BUDGET,
+        STATUS_DISABLED,
+        STATUS_FAILED,
+        STATUS_TIMEOUT,
+        STATUS_UNAVAILABLE,
+        run_llm_capability,
+    )
+
+    def _invoke(client, _profile):
         outcome = summarize_records_for_recall(
             client,
             records,
@@ -163,14 +231,119 @@ def _run_recall_summarize(args: dict[str, Any], records: list[dict[str, Any]]) -
             max_tokens=args.get("summary_max_tokens"),
             max_chars_per_record=int(args.get("summary_max_chars_per_record") or 4000),
         )
-    except LLMError as exc:
-        return error_result("summarize_failed", str(exc))
-    except Exception as exc:  # pragma: no cover
-        logger.exception("unexpected error in recall summarize")
-        return error_result("summarize_failed", f"unexpected: {exc}")
+        outcome["__client"] = client
+        return outcome
+
+    def _client_factory(_profile):
+        client, err = _build_llm_client()
+        if client is None:
+            from .memory_llm import LLMConfigError
+
+            raise LLMConfigError((err or {}).get("message") or "LLM client unavailable")
+        return client
+
+    envelope = run_llm_capability(
+        config,
+        "summarize_recall",
+        _invoke,
+        client_factory=_client_factory,
+        # Legacy: ``summarize=True`` is the explicit opt-in.
+        force_enabled=True,
+    )
+    if not envelope.ok:
+        status_to_code = {
+            STATUS_DISABLED: "llm_disabled",
+            STATUS_UNAVAILABLE: "llm_unavailable",
+            STATUS_TIMEOUT: "summarize_timeout",
+            STATUS_BUDGET: "summarize_budget_exceeded",
+            STATUS_FAILED: "summarize_failed",
+        }
+        code = status_to_code.get(envelope.status, "summarize_failed")
+        out = error_result(code, envelope.error or "summarize skipped")
+        out["envelope"] = envelope.to_dict()
+        return out
+
+    outcome = envelope.value if isinstance(envelope.value, dict) else {}
+    client = outcome.pop("__client", None)
     outcome["ok"] = True
-    outcome["usage"] = client.usage_snapshot()
+    outcome["status"] = envelope.status
+    outcome["envelope"] = envelope.to_dict()
+    if client is not None:
+        snap = getattr(client, "usage_snapshot", None)
+        if callable(snap):
+            try:
+                usage_snap = snap()
+                if isinstance(usage_snap, dict):
+                    outcome["usage"] = usage_snap
+            except Exception:
+                pass
     return outcome
+
+
+def _run_query_rewrite(
+    config: MemoryConfig,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the v0.10.0 query_rewrite capability under the unified runner.
+
+    Returns a dict with ``ok``, ``status``, ``variants`` (always a list),
+    plus the runner envelope so the caller can attach diagnostics to the
+    final retrieval result.  When the LLM is disabled / unavailable /
+    times out, ``variants`` is empty and the caller continues with the
+    deterministic FTS recall — this never blocks retrieval.
+    """
+    from .memory_llm_runner import run_llm_capability
+
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return {"ok": True, "status": "skipped", "variants": [], "reason": "empty_query"}
+
+    raw_max = args.get("rewrite_max_variants")
+    try:
+        max_variants = int(raw_max) if raw_max is not None else 3
+    except (TypeError, ValueError):
+        max_variants = 3
+    max_variants = max(1, min(max_variants, 8))
+
+    context_hint = args.get("rewrite_context_hint")
+    if context_hint is not None:
+        context_hint = str(context_hint)
+
+    def _invoke(client, _profile):
+        from .memory_query_rewrite import rewrite_query
+
+        result = rewrite_query(
+            client,
+            query,
+            max_variants=max_variants,
+            context_hint=context_hint,
+        )
+        if not result.ok:
+            # Surface as a runner-side failure so the unified envelope can
+            # apply its standard fallback bookkeeping.
+            from .memory_llm import LLMRequestError
+
+            raise LLMRequestError(result.error or "query_rewrite failed")
+        return result.to_dict()
+
+    envelope = run_llm_capability(
+        config,
+        "query_rewrite",
+        _invoke,
+        fallback=lambda: {"ok": True, "variants": [], "fallback": True},
+    )
+    payload = envelope.value if isinstance(envelope.value, dict) else {}
+    variants = payload.get("variants") if isinstance(payload, dict) else []
+    if not isinstance(variants, list):
+        variants = []
+    return {
+        "ok": bool(envelope.ok),
+        "status": envelope.status,
+        "variants": [str(v) for v in variants if isinstance(v, str) and v.strip()],
+        "fallback_used": bool(envelope.fallback_used),
+        "error": envelope.error,
+        "envelope": envelope.to_dict(),
+    }
 
 
 def _check_required(args: dict[str, Any], *keys: str) -> dict[str, Any] | None:
@@ -358,6 +531,7 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             preferred_tags=args.get("preferred_tags"),
             body_mode=str(args["body_mode"]) if args.get("body_mode") is not None else None,
             as_of=str(args["as_of"]) if args.get("as_of") is not None else None,
+            narrative=bool(args.get("narrative", False)),
         )
     if operation == "runtime_digest":
         return memory_get_runtime_digest(
@@ -384,6 +558,11 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             other_path=str(args.get("other_path", "")),
         )
     if operation == "retrieve_context":
+        rewrite_outcome: dict[str, Any] | None = None
+        query_variants: list[str] = []
+        if bool(args.get("rewrite_query")):
+            rewrite_outcome = _run_query_rewrite(config, args)
+            query_variants = rewrite_outcome.get("variants") or []
         result = memory_retrieve_context(
             config,
             query=str(args["query"]) if args.get("query") is not None else None,
@@ -406,16 +585,25 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             max_chars=args.get("max_chars"),
             max_tokens=args.get("max_tokens"),
             max_items=args.get("max_items"),
+            query_variants=query_variants or None,
         )
+        if rewrite_outcome is not None and isinstance(result, dict):
+            result["query_rewrite"] = rewrite_outcome
         if bool(args.get("summarize")) and result.get("ok"):
             summary_outcome = _run_recall_summarize(
+                config,
                 args,
                 result.get("context_items") or result.get("selected_records") or [],
             )
             result["summary"] = summary_outcome
         return result
     if operation == "important_memories":
-        return memory_get_important_memories(
+        rewrite_outcome: dict[str, Any] | None = None
+        query_variants: list[str] = []
+        if bool(args.get("rewrite_query")):
+            rewrite_outcome = _run_query_rewrite(config, args)
+            query_variants = rewrite_outcome.get("variants") or []
+        result = memory_get_important_memories(
             config,
             query=str(args["query"]) if args.get("query") is not None else None,
             user=str(args["user"]) if args.get("user") is not None else None,
@@ -437,7 +625,11 @@ def _dispatch_memory_context(config: MemoryConfig, args: dict[str, Any]) -> dict
             max_chars=args.get("max_chars"),
             max_tokens=args.get("max_tokens"),
             max_items=args.get("max_items"),
+            query_variants=query_variants or None,
         )
+        if rewrite_outcome is not None and isinstance(result, dict):
+            result["query_rewrite"] = rewrite_outcome
+        return result
     if operation == "config_diagnose":
         from .memory_diagnose import config_diagnose
         return config_diagnose(config)

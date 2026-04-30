@@ -19,6 +19,16 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _clear_memory_mcp_user_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure the developer's shell ``MEMORY_MCP_USER`` (highest-priority
+    user override; v0.10.1) does not leak into tests that monkeypatch
+    ``USERNAME`` / ``USER`` to drive user-resolution scenarios. Tests that
+    want to exercise the override set it explicitly via ``monkeypatch.setenv``.
+    """
+    monkeypatch.delenv("MEMORY_MCP_USER", raising=False)
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     _write(

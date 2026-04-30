@@ -102,6 +102,7 @@ def memory_compile(
     preferred_tags: list[str] | None = None,
     body_mode: str | None = None,
     as_of: str | None = None,
+    narrative: bool = False,
 ) -> dict[str, Any]:
     if target not in SUPPORTED_TARGETS:
         return error_result("invalid_input", f"target must be one of: {', '.join(sorted(SUPPORTED_TARGETS))}")
@@ -153,6 +154,7 @@ def memory_compile(
             branch=branch,
             body_mode=effective_body_mode,
             as_of=as_of,
+            narrative=narrative,
         )
         if result.get("ok"):
             result["stats"] = {**scan_stats, "matched_records": len(result.get("included_record_ids", []))}

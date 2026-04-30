@@ -31,6 +31,7 @@ from .memory_compiler import memory_compile, memory_get_runtime_digest
 from .memory_config import MemoryConfig, load_config
 from .memory_governance import memory_archive_record, memory_publish_candidate, memory_validate_candidate
 from .memory_guard import memory_guard_check
+from .memory_key_documents import KEY_DOCUMENT_KEYS, rebuild_key_documents
 from .memory_maintenance import memory_delete_record, memory_health_check, memory_migrate_records
 from .memory_record_index import memory_rebuild_index
 from .memory_baseline import write_baseline as _write_baseline
@@ -150,6 +151,34 @@ def _cmd_snapshot_rebuild(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _cmd_weekly_snapshot_rebuild(args: argparse.Namespace) -> dict[str, Any]:
+    """Rebuild the weekly snapshot.  ``--narrative`` opts into the v0.10.0
+    LLM executive-summary section; without it the body is identical to v0.9.x."""
+    return memory_compile(
+        _load(args),
+        target="weekly_snapshot",
+        user=args.user,
+        task_id=args.task_id,
+        branch=args.branch,
+        as_of=args.as_of,
+        narrative=bool(getattr(args, "narrative", False)),
+    )
+
+
+def _cmd_monthly_snapshot_rebuild(args: argparse.Namespace) -> dict[str, Any]:
+    """Rebuild the monthly snapshot.  ``--narrative`` opts into the v0.10.0
+    LLM executive-summary section; without it the body is identical to v0.9.x."""
+    return memory_compile(
+        _load(args),
+        target="monthly_snapshot",
+        user=args.user,
+        task_id=args.task_id,
+        branch=args.branch,
+        as_of=args.as_of,
+        narrative=bool(getattr(args, "narrative", False)),
+    )
+
+
 def _cmd_runtime_digest(args: argparse.Namespace) -> dict[str, Any]:
     return memory_get_runtime_digest(
         _load(args),
@@ -157,6 +186,24 @@ def _cmd_runtime_digest(args: argparse.Namespace) -> dict[str, Any]:
         task_id=args.task_id,
         branch=args.branch,
         max_chars=args.max_chars,
+    )
+
+
+def _cmd_rebuild_key_docs(args: argparse.Namespace) -> dict[str, Any]:
+    targets = list(args.target) if args.target else None
+    if targets:
+        unknown = [t for t in targets if t not in KEY_DOCUMENT_KEYS]
+        if unknown:
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": f"unknown target(s): {unknown}; valid: {sorted(KEY_DOCUMENT_KEYS)}",
+            }
+    return rebuild_key_documents(
+        _load(args),
+        targets=targets,
+        user=args.user,
+        renderer=args.renderer,
     )
 
 
@@ -248,12 +295,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_snap.add_argument("--as-of")
     p_snap.set_defaults(func=_cmd_snapshot_rebuild)
 
+    p_weekly = sub.add_parser(
+        "weekly-snapshot-rebuild",
+        help="Rebuild the weekly snapshot. Pass --narrative to opt into the v0.10.0 LLM executive summary.",
+    )
+    p_weekly.add_argument("--user")
+    p_weekly.add_argument("--task-id")
+    p_weekly.add_argument("--branch")
+    p_weekly.add_argument("--as-of")
+    p_weekly.add_argument(
+        "--narrative",
+        action="store_true",
+        help="Opt into the LLM-generated executive summary (additive only; honours unified runner timeout/budget).",
+    )
+    p_weekly.set_defaults(func=_cmd_weekly_snapshot_rebuild)
+
+    p_monthly = sub.add_parser(
+        "monthly-snapshot-rebuild",
+        help="Rebuild the monthly snapshot. Pass --narrative to opt into the v0.10.0 LLM executive summary.",
+    )
+    p_monthly.add_argument("--user")
+    p_monthly.add_argument("--task-id")
+    p_monthly.add_argument("--branch")
+    p_monthly.add_argument("--as-of")
+    p_monthly.add_argument(
+        "--narrative",
+        action="store_true",
+        help="Opt into the LLM-generated executive summary (additive only; honours unified runner timeout/budget).",
+    )
+    p_monthly.set_defaults(func=_cmd_monthly_snapshot_rebuild)
+
     p_digest = sub.add_parser("runtime-digest", help="Read the cached runtime_digest view.")
     p_digest.add_argument("--user")
     p_digest.add_argument("--task-id")
     p_digest.add_argument("--branch")
     p_digest.add_argument("--max-chars", type=int)
     p_digest.set_defaults(func=_cmd_runtime_digest)
+
+    p_rebuild_kd = sub.add_parser(
+        "rebuild-key-docs",
+        help="Rebuild memory-bank/{activeContext,progress,techContext,systemPatterns}.md from raw records.",
+    )
+    p_rebuild_kd.add_argument(
+        "--target",
+        action="append",
+        choices=sorted(KEY_DOCUMENT_KEYS),
+        help="Subset of key documents to rebuild (repeatable). Omit to rebuild all four.",
+    )
+    p_rebuild_kd.add_argument(
+        "--renderer",
+        default="auto",
+        choices=["auto", "deterministic", "llm", "embedding"],
+        help="Renderer tier. 'auto' walks key_documents.prefer_order; explicit tiers fail-fast on their tier.",
+    )
+    p_rebuild_kd.add_argument("--user", help="Optional asking user (only affects activeContext ranking).")
+    p_rebuild_kd.set_defaults(func=_cmd_rebuild_key_docs)
 
     return parser
 

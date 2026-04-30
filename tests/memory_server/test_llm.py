@@ -970,3 +970,111 @@ def test_distill_raw_records_raises_on_empty_completion() -> None:
     )
     with pytest.raises(LLMRequestError):
         distill_raw_records(client, [raw], record_id="d-1", distilled_at="t")
+
+
+# ── Regression: http.client.HTTPException must be wrapped as LLMRequestError ──
+
+
+def test_http_post_wraps_remote_disconnected_as_llm_request_error(monkeypatch) -> None:
+    """``http.client.RemoteDisconnected`` is NOT a subclass of ``URLError`` —
+    historically it leaked out of ``_http_post`` as a raw exception, causing
+    the runner to misclassify it as ``unexpected: ...``.  Ensure it is now
+    wrapped as :class:`LLMRequestError` (network branch).
+    """
+    import http.client
+    from servers.memory_server import memory_llm as me
+
+    def boom(*args, **kwargs):
+        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    monkeypatch.setattr(me.urllib.request, "urlopen", boom)
+    with pytest.raises(LLMRequestError, match="network error"):
+        me._http_post("https://api.test/x", {}, b"{}", timeout=1.0)
+
+
+def test_http_post_wraps_connection_reset_error(monkeypatch) -> None:
+    from servers.memory_server import memory_llm as me
+
+    def boom(*args, **kwargs):
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(me.urllib.request, "urlopen", boom)
+    with pytest.raises(LLMRequestError, match="network error"):
+        me._http_post("https://api.test/x", {}, b"{}", timeout=1.0)
+
+
+# ── 5xx auto-retry policy ─────────────────────────────────────────────
+
+
+def _ok_response_body() -> str:
+    return _summary_response()
+
+
+def test_chat_retries_on_5xx_then_succeeds() -> None:
+    """A 503 followed by a 200 must result in a single successful call
+    with ``retry_count == 1`` and no exception raised.
+    """
+    calls: list[int] = []
+    def transport(url, headers, body, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            return 503, "service unavailable"
+        return 200, _ok_response_body()
+
+    cfg = LLMConfig(api_key="sk", base_url="https://api.test",
+                    max_retries=2, retry_backoff_seconds=0.0)
+    client = LLMClient(cfg, transport=transport)
+    out = client.chat([{"role": "user", "content": "ping"}])
+    assert out["choices"][0]["message"]["content"]
+    assert client.retry_count == 1
+    assert client.last_retry_reason and "503" in client.last_retry_reason
+
+
+def test_chat_retries_on_network_error_then_succeeds() -> None:
+    """A network error followed by a 200 must succeed with retry_count==1."""
+    from servers.memory_server.memory_llm import LLMRequestError as _LRE
+    calls: list[int] = []
+    def transport(url, headers, body, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _LRE("network error contacting LLM: timeout")
+        return 200, _ok_response_body()
+
+    cfg = LLMConfig(api_key="sk", base_url="https://api.test",
+                    max_retries=1, retry_backoff_seconds=0.0)
+    client = LLMClient(cfg, transport=transport)
+    out = client.chat([{"role": "user", "content": "ping"}])
+    assert out["choices"][0]["message"]["content"]
+    assert client.retry_count == 1
+
+
+def test_chat_does_not_retry_on_4xx() -> None:
+    """4xx must surface as :class:`LLMRequestError` immediately (no retry)."""
+    calls: list[int] = []
+    def transport(url, headers, body, timeout):
+        calls.append(1)
+        return 401, "auth failed"
+
+    cfg = LLMConfig(api_key="sk", base_url="https://api.test",
+                    max_retries=3, retry_backoff_seconds=0.0)
+    client = LLMClient(cfg, transport=transport)
+    with pytest.raises(LLMRequestError, match="HTTP 401"):
+        client.chat([{"role": "user", "content": "ping"}])
+    assert len(calls) == 1
+    assert client.retry_count == 0
+
+
+def test_chat_exhausts_retries_then_raises() -> None:
+    """Persistent 500 with max_retries=2 → 3 calls then raise."""
+    calls: list[int] = []
+    def transport(url, headers, body, timeout):
+        calls.append(1)
+        return 500, "boom"
+
+    cfg = LLMConfig(api_key="sk", base_url="https://api.test",
+                    max_retries=2, retry_backoff_seconds=0.0)
+    client = LLMClient(cfg, transport=transport)
+    with pytest.raises(LLMRequestError, match="HTTP 500"):
+        client.chat([{"role": "user", "content": "ping"}])
+    assert len(calls) == 3
+    assert client.retry_count == 2

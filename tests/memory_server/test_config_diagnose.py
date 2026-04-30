@@ -78,3 +78,55 @@ def test_dispatch_routes_config_diagnose(tmp_path: Path) -> None:
     result = _dispatch_memory_context(config, {"operation": "config_diagnose"})
     assert result["ok"] is True
     assert "fields" in result
+
+
+# ---------------------------------------------------------------------------
+# §15.2-D: llm_capabilities section in config_diagnose
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_llm_capabilities_defaults(tmp_path: Path) -> None:
+    config = _bootstrap(tmp_path)
+    caps = config_diagnose(config).get("llm_capabilities")
+    assert caps is not None
+    expected = {
+        "distill_summary",
+        "summarize_recall",
+        "rebuild_key_document",
+        "query_rewrite",
+        "snapshot_narrative",
+    }
+    assert expected.issubset(set(caps.keys()))
+    distill = caps["distill_summary"]
+    for key in ("enabled", "timeout_ms", "max_tokens", "fallback"):
+        assert distill[key]["source"] == "default"
+    assert distill["enabled"]["value"] is False
+    assert "description" in distill
+
+
+def test_diagnose_llm_capabilities_file_overrides(tmp_path: Path) -> None:
+    config = _bootstrap(
+        tmp_path,
+        raw={
+            "allowed_roots": ["memory-bank"],
+            "llm_defaults": {
+                "timeout_ms": 12345,
+                "capabilities": {
+                    "distill_summary": {"enabled": True, "max_tokens": 2048},
+                },
+            },
+        },
+    )
+    caps = config_diagnose(config)["llm_capabilities"]
+    distill = caps["distill_summary"]
+    assert distill["enabled"]["source"] == "file"
+    assert distill["enabled"]["value"] is True
+    assert distill["max_tokens"]["source"] == "file"
+    assert distill["max_tokens"]["value"] == 2048
+    # Source attribution must surface the file-level llm_defaults.timeout_ms
+    # for capabilities that did not override timeout themselves; resolved
+    # values may still come from per-capability defaults if the runner does
+    # not honour the global, but the diagnose output should at minimum tell
+    # operators where the value came from.
+    summarize = caps["summarize_recall"]
+    assert summarize["timeout_ms"]["source"] == "file"

@@ -139,3 +139,57 @@ def test_memory_write_succeeds_with_real_user(
     result = memory_write(config, path="memory-bank/note.md", content="# hi\nbody\n")
     assert result.get("ok") is True
     assert (tmp_path / "memory-bank" / "note.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# v0.10.1 — MEMORY_MCP_USER env override (CI / subprocess / tests)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_mcp_user_env_overrides_vscode_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``MEMORY_MCP_USER`` is the highest-priority source so CI / tests /
+    detached subprocesses can inject a stable user without touching
+    ``.vscode/settings.json``."""
+    from servers.memory_server.memory_events import _vscode_user_cache, get_current_user
+
+    _vscode_user_cache.clear()
+    settings_dir = tmp_path / ".vscode"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.json").write_text(
+        json.dumps({"memory-mcp.userName": "from-vscode"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("USERNAME", "from-os")
+    monkeypatch.setenv("MEMORY_MCP_USER", "from-env")
+
+    assert get_current_user(tmp_path) == "from-env"
+
+
+def test_memory_mcp_user_env_unblocks_unconfigured_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In CI / subprocess scenarios neither ``.vscode/settings.json`` nor
+    OS account name may be reliable; ``MEMORY_MCP_USER`` alone must be
+    enough to satisfy ``validate_effective_user``."""
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setenv("MEMORY_MCP_USER", "ci-runner")
+    config = _bootstrap_config(tmp_path)
+
+    assert validate_effective_user(config) is None
+
+
+def test_memory_mcp_user_env_blank_falls_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whitespace-only ``MEMORY_MCP_USER`` must NOT mask a valid lower-tier
+    source (otherwise an empty CI variable would silently break user-id
+    resolution)."""
+    from servers.memory_server.memory_events import _vscode_user_cache, get_current_user
+
+    _vscode_user_cache.clear()
+    monkeypatch.setenv("MEMORY_MCP_USER", "   ")
+    monkeypatch.setenv("USERNAME", "from-os")
+
+    assert get_current_user(tmp_path) == "from-os"

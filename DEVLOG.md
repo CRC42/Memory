@@ -1,5 +1,164 @@
 # DEVLOG - MCP Memory
 
+## v0.11.1 — v0.11.x 收口：预置模型校验 + 真 LLM smoke
+
+> **状态：624 passed + 3 skipped。** 收口设计文档 §15.1-B / §15.2-C 两个 v0.11.x 保留项；普通 CI 不触发真实 LLM 或模型下载。
+
+### 交付清单
+
+| 来源 | 交付 | 验证 |
+|---|---|---|
+| §15.1-B | `scripts/download_embedding_model.py` 的 `PRESETS` 去除 `<fill-me-in>`：内置 `bge-small-zh-v1.5` 与 `paraphrase-multilingual-MiniLM-L12-v2` 两组 verified preset，均固定 `model + tokenizer + sha256`；bge 的 ONNX external data sidecar 同步固定 sha256 并下载到同目录；新增 `--list` 输出 verified 清单；显式下载路径支持 `--tokenizer-url / --tokenizer-sha256`。 | `test_local_onnx_provider.py`：`test_cli_lists_verified_presets` + `test_cli_downloads_explicit_model_and_tokenizer`；手动 `python scripts/download_embedding_model.py --list` 确认两组 preset 均显示 verified。 |
+| §15.2-C | 新增 `scripts/llm_smoke.py`：默认 gated skip；仅当 `MEMORY_LLM_SMOKE=1` 且存在真实 LLM key 时，通过 `run_llm_capability(force_enabled=True)` 依次跑 `distill_summary`、`query_rewrite`、`snapshot_narrative` 三个最小 case；逐行输出 JSON：`capability / status / latency_ms / token_used / fallback_used`。 | `test_llm_smoke.py`：确认无 env 时返回 skip、不发网络请求；手动无 env 运行确认 skip。 |
+
+### 文件级改动
+
+- `scripts/download_embedding_model.py`：preset schema 从单文件扩展为 `model/tokenizer/extra_files`；新增 sha256 校验 helper、alias 解析、`--list`、多 artefact 事件记录与安装目录布局。
+- `scripts/llm_smoke.py`：新增手动 smoke 脚本，复用现有 LLM client / runner / pipeline，不引入新依赖。
+- `tests/memory_server/test_local_onnx_provider.py` + `test_llm_smoke.py`：新增 3 个用例，删除旧 placeholder preset 断言。
+- `README.md` + `MemorySystemDesignDocument.md`：同步 v0.11.1 状态。
+
+### 后续观察
+
+- 真模型下载后可手动跑 `scripts/eval_recall.py` 建立 `local-onnx` 召回基线；不作为 v0.11.x 阻塞项。
+
+---
+
+## v0.11.0 — RAG 召回质量解锁 + LLM 调用统一（首批）
+
+> **状态：621 passed + 3 skipped（v0.10.2 是 610 passed + 1 skipped；新增 11 用例 + 2 个 onnxruntime gated skip）。** 设计文档 §15.1 / §15.2 的最高优先级条目首批落地：6 项交付。
+
+### 交付清单
+
+| 来源 | 交付 | 验证 |
+|---|---|---|
+| §15.1-A | `LocalOnnxProvider` 引入真实 tokenizer：构造函数新增 `tokenizer="auto"` 参数，按模型同目录探测 `tokenizer.json`（HuggingFace `tokenizers`）→ `spiece.model` / `tokenizer.model`（`sentencepiece`）；缺失即抛 `ProviderUnavailableError`，`get_provider("auto", ...)` 透明降级到 `deterministic-hash`；`model_hash` 把 tokenizer 文件 sha256 折进去（换 tokenizer 自动失效缓存）。原字节级哈希桩件已删除。 | `test_local_onnx_provider.py`：新增 `test_local_onnx_provider_missing_tokenizer_raises_unavailable` + `test_get_provider_auto_falls_back_when_tokenizer_missing` + 现有 `test_local_onnx_provider_loads_real_model` 改用 `tokenizer=callable` 注入。 |
+| §15.1-D | `_vector_supplement` 异常 / `result.ok=False` 双路径写 `events.jsonl::vector_supplement_skipped`（带 `reason` + `query_preview`）；`memory_health_check` 新增 `vector_skip_count_24h` 字段，由新工具函数 `count_recent_events(config, event_type, window_seconds=86400)` 实现。 | `test_vector_integration.py`：新增 `test_vector_supplement_writes_event_when_search_raises` + `test_health_check_surfaces_vector_skip_count_24h`。 |
+| §15.1-C | `scripts/eval_recall.py`：`recall@5 / recall@10 / MRR + provider_id + model_hash` 输出，`tests/data/recall_set.jsonl` 提供 5 条种子用例。 | `test_eval_recall.py`：smoke + CLI 入口两条；deterministic 提供方下限 `recall@10 ≥ 0.4`。 |
+| §15.2-A | 三处 LLM 入口统一改走 `run_llm_capability`：`server_dispatch._run_distill_for_write`（`distill_summary`）+ `server_dispatch._run_recall_summarize`（`summarize_recall`，新增 `config` 形参）+ `memory_key_documents._rebuild_one`（`rebuild_key_document`）。`run_llm_capability` 新增 `force_enabled: bool = False` 关键字以保留三处「显式 opt-in」语义；旧路径返回的状态字符串映射到原失败码（`disabled→llm_disabled` / `unavailable→llm_unavailable` / `timeout→distill_timeout` / …）。`_build_llm_client()` / `_maybe_build_llm_client()` 仍保留供 monkeypatch 测试与 snapshot 路径复用。 | 79/79 影响测试全绿（`test_dispatch` + `test_key_documents` + `test_cli_rebuild_key_docs` + `test_query_rewrite` + `test_llm_runner` + `test_llm_pipeline_dispatch` + `test_llm_enhance_dispatch`）。 |
+| §15.2-B | `test_dispatch.py` 新增 4 个 `rewrite_query` facade 端到端用例（`disabled` / `unavailable` / `timeout` / `ok`）+ 1 个 `narrative` disabled 用例；通过 `monkeypatch.setattr(_runner, "_default_client_factory", ...)` + `monkeypatch.setattr(memory_query_rewrite, "rewrite_query", ...)` 控制四档分支。修复 `_run_query_rewrite._invoke` 缺失的 `profile` 第二实参（runner 契约）。 | `test_dispatch.py`：18 用例全绿。 |
+| §15.2-D | `config_diagnose` 输出新增 `llm_capabilities` 段：5 个能力（`distill_summary` / `summarize_recall` / `rebuild_key_document` / `query_rewrite` / `snapshot_narrative`），每项 4 字段（`enabled` / `timeout_ms` / `max_tokens` / `fallback`）+ `description`，每字段带 `{value, source}`，`source ∈ {default, file}`，识别 `llm_defaults.timeout_ms` ↔ `llm_defaults.timeout` 别名。 | `test_config_diagnose.py`：新增 2 个用例覆盖 default 与 file overrides 两种来源。 |
+
+### 文件级改动
+
+- `servers/memory_server/memory_embeddings.py`：`LocalOnnxProvider.__init__` 重写；新增 `_resolve_tokenizer` static / `tokenizer_path` / `tokenizer_kind` properties；`_tokenise_batch` 删除字节级哈希桩件，改走 `self._tokenize_fn` + 截断 + 对齐 padding；`get_provider` 透传 `tokenizer` kw。
+- `servers/memory_server/memory_retrieval.py`：导入 `append_event`；`_vector_supplement` 异常 / 非 ok 两路径写 `vector_supplement_skipped` 事件。
+- `servers/memory_server/memory_events.py`：新增 `count_recent_events(config, event_type, *, window_seconds)`，遍历 `events.jsonl` + 轮转副本。
+- `servers/memory_server/memory_maintenance.py`：`memory_health_check` 写 `extras["vector_skip_count_24h"]`。
+- `servers/memory_server/memory_llm_runner.py`：`run_llm_capability` 增 `force_enabled` kw。
+- `servers/memory_server/server_dispatch.py`：`_run_distill_for_write` / `_run_recall_summarize` 改走 runner；`_run_query_rewrite._invoke` 接受 `profile`。
+- `servers/memory_server/memory_key_documents.py`：`_rebuild_one` 改走 runner，删除 `llm_client` 形参；`rebuild_key_documents` 用 `_maybe_build_llm_client()` 探针保留显式 `renderer="llm"` fast-fail。
+- `servers/memory_server/memory_diagnose.py`：新增 `_diagnose_llm_capabilities` + 顶层 `llm_capabilities` 字段。
+- `scripts/eval_recall.py` + `tests/data/recall_set.jsonl`：新增。
+- 测试：`test_local_onnx_provider.py` + `test_vector_integration.py` + `test_config_diagnose.py` + `test_dispatch.py` 共增 11 个用例 + `test_eval_recall.py` 新文件。
+
+### v0.11.x 待续状态
+
+- §15.1-B / §15.2-C 已在 v0.11.1 收口。
+- 实测 `local-onnx` 召回基线可作为后续观察项：下载真实模型后跑 `scripts/eval_recall.py`。
+
+---
+
+## v0.10.2 — 设计文档与 README 重组（仅文档）
+
+> **状态：无代码改动；610 passed + 1 skipped 与 v0.10.1 一致。** 设计文档收敛到「未完成且影响下一步走向」的工作；已完成里程碑细节迁移至 README §5。
+
+### 改动
+
+- **`MemorySystemDesignDocument.md`**：原 432 行 → 330 行。
+  - §15 整段重写：删除 §15.1（v0.6.0 P0/P1/P2 详细清单）、§15.2（P4-C 详表）、§15.3（v0.10.0 三处入口列表）、§15.4.1–§15.4.6（RAG 硬约束 / GPU 阈值 / Provider 抽象 / 索引格式 / 接入点 / Phase 推进表）、§15.5.1（v0.10.1 表格）、§15.6（后续版本占位 8 行表）。
+  - §15 新结构：§15.1 **【最高优先级】RAG 召回质量解锁（v0.11.x）** + §15.2 **【最高优先级】LLM 调用统一（v0.11.x）** + §15.3 已完成里程碑速查表（5 行表）+ §15.4 已降级方向 + §15.5 不启动。
+  - §16 精简到 5 条结论 + 下一阶段优先级显式指向 §15.1 / §15.2。
+  - §17 UE Facet 数据模型保留（设计内容非状态）。
+- **`README.md`**：§5 在原「已落地（最近）」+「计划中」之间插入「已完成里程碑详情（设计文档原 §15.1–§15.4 细节归档）」段，搬入 v0.6.0 / v0.7.0 / v0.7.5–v0.9.0 / v0.10.0 / v0.10.1 的全部实现要点（包括 RAG 硬约束、Provider 抽象、索引格式、配置示例、LLM 七状态包络等）。
+- **未改代码、未改测试**：测试输出与 v0.10.1 完全一致。
+
+### v0.11.x 待办（已写入设计文档 §15.1 / §15.2）
+
+| 主题 | 关键验收 |
+|---|---|
+| RAG 召回质量解锁 | 真实 tokenizer（`tokenizers` / `sentencepiece`）+ `PRESETS` sha256 填实 + `scripts/eval_recall.py`（recall@k / MRR）+ `events.jsonl` 写 `vector_supplement_skipped` |
+| LLM 调用统一 | 三处入口（`_run_distill_for_write` / `_run_recall_summarize` / `key_documents.render_llm_document`）改走 `run_llm_capability` + `test_dispatch.py` 增 `rewrite_query` / `narrative` 端到端 + `scripts/llm_smoke.py` gated + `config_diagnose` 新增 `llm_capabilities` 段 |
+
+---
+
+## v0.10.1 — 团队接入扫尾 + 文档同步
+
+> **状态：`MEMORY_MCP_USER` 环境变量成为最高优先级 user 来源；conftest autouse 隔离；README/设计文档同步至当前实现；测试 607 → 610 passed (+3)，1 skipped 不变。** 不引入新功能，只关闭 P0-1 在 CI / 子进程 / 测试场景下的最后一个易踩坑。
+
+### 改动
+
+- **`memory_events.get_current_user`**：新增第 1 优先级 `MEMORY_MCP_USER` 环境变量分支；空白字符串视为未设置、继续向下回落。原 `.vscode/settings.json` → `USERNAME`/`USER` → `unknown` 顺序保留为 2/3/4 档。
+- **`tests/memory_server/conftest.py`**：新增 autouse fixture `_clear_memory_mcp_user_env`，在每个测试前 `monkeypatch.delenv("MEMORY_MCP_USER", raising=False)`，避免开发者 shell 中已 export 的值污染依赖 `USERNAME` 的旧测试。
+- **`tests/memory_server/test_user_validation.py`**：新增 3 个测试覆盖 (1) env 优先级压过 vscode + USERNAME；(2) env 单独即可解锁未配置 repo 的 `validate_effective_user`；(3) 空白字符串 env 不掩盖下层有效来源。
+- **README**：测试数 506 → 610 + 1 skipped；§3.3 多人协作重写：列出 4 档用户名解析优先级 + 4 行常见失败模式表格 + 64 用例并发子集全绿；§5「计划中」把 embedding/RAG 从计划项移到「已落地」段（v0.7.5 / v0.8.0 / v0.9.0）+ 追加 v0.10.0 / v0.10.1 收尾说明。
+- **MemorySystemDesignDocument.md**：头部状态行更新到 v0.10.1；§15.5.1 新增「v0.10.1 团队接入扫尾」小节，列出三个修复入口；§15.6 表格补 v0.10.1 行；§17 新增「UE Facet 数据模型」小节，分项目级（`memory_ue_facets.py`）+ 记录级（六个 facet 字段）+ 显式不做的扩张三段，对齐 §1 "无 UE 编辑器依赖" 边界。
+- **`/memories/repo/memory_mcp_roadmap_status.md`**：测试规模 607 → 610，新增 v0.10.1 条目到「已完成」段。
+
+### 验证
+
+- `pytest tests/memory_server/test_user_validation.py -q`：35 passed in 0.12s（含新增 3）。
+- 并发/多用户子集复跑：`test_concurrent_writes` + `test_multi_agent_stress` + `test_multi_user` + `test_user_validation` + `test_shared_overwrite_rejected` = **64 passed in 15.46s**，全绿。
+- `pytest tests/ -q` 全量回归（见末段验证）：见下行实际运行记录。
+
+### 影响范围 / 兼容性
+
+- `get_current_user()` 行为零回归：未 export `MEMORY_MCP_USER` 时与 v0.10.0 完全一致。
+- 测试侧 autouse fixture 仅 `delenv`，对未触碰该变量的测试透明。
+- 文档侧 0 代码修改；UE facet 小节描述的全部 6 个字段与 `memory_ue_facets.py` 在 v0.6.0 P1-2 起就已存在，本次只是把已有事实正式纳入设计文档。
+
+---
+
+## v0.10.0 — P4 LLM 软增强余项收口
+
+> **状态：§15.3 P4 全部余项落地；测试 571 → 607 passed (+36)，1 skipped 不变。** v0.10.0 默认所有 capability `enabled=False`，老调用路径零行为变化；用户可在 `.ai-memory/config.json` 的 `llm_defaults` 块按 capability 开启。
+
+### 新增模块
+
+- `memory_query_rewrite.py`：`rewrite_query(client, query, *, max_variants=3, context_hint=None, cache=None) -> QueryRewriteResult`。SHA-256 缓存（`qrw::` 前缀），markdown fence 兼容，去重 echo，`HARD_MAX_VARIANTS=8` 硬封顶；`MAX_VARIANT_CHARS=200`。
+- `memory_snapshot_narrative.py`：`generate_snapshot_narrative(client, records, *, target, label, cache=None) -> SnapshotNarrativeResult` + `inject_narrative(snapshot_md, section)`。后者 idempotent — 重复注入只替换 `## Narrative (LLM)` 块，不堆叠；空 section 直接返回原文。
+- 已在 `memory_llm_runner.run_llm_capability` (v0.10.0 早期) 之上消费：dispatch 走 `_run_query_rewrite` / `_maybe_generate_snapshot_narrative` 两个 helper，七状态包绕（`ok` / `disabled` / `unavailable` / `timeout` / `budget_exceeded` / `failed` / `invalid_capability`）+ fallback 保留原始 status 供诊断。
+
+### 接入点
+
+- `memory_retrieval._rank_records(extra_queries=...)`：每条记录 `_query_match_score(primary)` 与各 variant 取 max；`memory_get_important_memories` / `memory_retrieve_context` 增加 `query_variants: list[str] | None = None`。
+- `server_dispatch`：`retrieve_context` / `important_memories` 检测 `args["rewrite_query"]` → 走 `_run_query_rewrite` → 把 LLMOutcome 落到 `result["query_rewrite"]`；`compile` op 透传 `narrative=bool(args.get("narrative", False))`。
+- `memory_compile_views.compile_snapshot_target(narrative: bool=False)`：仅 `weekly_snapshot` / `monthly_snapshot` 触发；`inject_narrative` 在 deterministic 模板生成后注入；LLMOutcome 落到 `result["narrative"]`。
+- `server_tools.memory_context` schema：新增 `rewrite_query` (bool)、`rewrite_max_variants` (int 1–8 默认 3)、`rewrite_context_hint` (string)、`narrative` (bool)。
+- CLI：新增 `weekly-snapshot-rebuild` / `monthly-snapshot-rebuild`（`--user` `--task-id` `--branch` `--as-of` `--narrative`）。
+
+### 配置
+
+- `memory_config.MemoryConfig.llm_defaults: dict | None`。`DEFAULT_CONFIG_CONTENT` 新增带注释示例：
+
+```jsonc
+"llm_defaults": {
+  "enabled": false,
+  "timeout": 30.0,
+  "max_tokens": 1024,
+  "capabilities": {
+    // "query_rewrite": { "enabled": true, "max_tokens": 256 },
+    // "snapshot_narrative": { "enabled": true, "timeout": 60 }
+  }
+}
+```
+
+`_parse_llm_defaults` 仅保留 `enabled` / `timeout` / `max_tokens` 三个 knob，块缺失返回 `None` 由 runner 用内置默认；不会因为缺字段抛错。
+
+### 测试
+
+- `test_llm_runner.py`（新，15 测试）：profile 解析三档（built-in / global / cap-override）、policy 拒绝未知 capability、七状态全覆盖、fallback `ok=True` 但 `status` 保留原始失败、`to_dict_round_trip`。
+- `test_query_rewrite.py`（新，10 测试）：happy path / markdown fence / max_variants / hard cap / 去 echo / empty query / 非 JSON 优雅降级 / 空数组 / cache hit / cache 按 query 隔离。
+- `test_snapshot_narrative.py`（新，7 测试）：narrative 生成、空 records 短路、cache 命中、按 (target,label) 隔离、`inject_narrative` 位置在 `# Title` 后且在 `## Window` 前、idempotent 替换、空 section noop。
+- `test_llm_policy.py` parametrize 扩容：`summarize_recall` / `snapshot_narrative` 进 LLM-native；`rebuild_key_document` / `query_rewrite` 进 hybrid。
+
+### 验证
+
+- `pytest tests/ -q`：**607 passed, 1 skipped in 28.7s**（基线 571 + 1）。
+- 老调用链路（无 `llm_defaults` 块、未传 `rewrite_query` / `narrative`）行为零变化。
+
+---
+
 ## 2026-04-27 (路径解耦：插件可部署在任意相对路径)
 
 > **状态：插件位置不再硬编码 `<RepoRoot>/MCP/Memory/`，可部署在 `Tools/Memory/`、`vendor/memory-mcp/` 等任意相对路径；同时显式支持 MCP server + CLI 两种使用模式。** 测试维持 506 passed。

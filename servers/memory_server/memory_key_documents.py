@@ -49,6 +49,7 @@ from .memory_locks import LockTimeoutError, file_lock
 from .memory_record_io import DiskFullError, _atomic_write_text
 from .memory_request_id import new_request_id
 from .memory_result import error_result
+from .memory_vector_search import vector_search
 
 
 # ── Document specifications ──────────────────────────────────────────────
@@ -321,6 +322,165 @@ def render_deterministic_document(
     return "\n".join(lines).rstrip() + "\n"
 
 
+# ── P5 Phase 2b — embedding-tier renderer (DesignDoc §15.4) ────────────
+
+
+class _EmbeddingRendererError(RuntimeError):
+    """Raised when the embedding tier cannot produce a useful ranking.
+
+    The orchestrator catches this and falls through to the next renderer
+    in ``key_documents_prefer_order``; embedding is *strictly best-effort*.
+    """
+
+
+def _embedding_query_for(spec: dict[str, Any]) -> str:
+    """Build a stable natural-language query from the doc spec.
+
+    Used only as the vector tier's input — the rendered body still comes
+    from the same template as the deterministic renderer so output is
+    deterministic given the (records, ordering) tuple.
+    """
+
+    parts = [str(spec.get("title") or ""), str(spec.get("role") or "")]
+    tags = spec.get("preferred_tags") or []
+    if isinstance(tags, list) and tags:
+        parts.append(" ".join(str(t) for t in tags))
+    kinds = spec.get("include_kinds") or []
+    if isinstance(kinds, list) and kinds:
+        parts.append(" ".join(str(k) for k in kinds))
+    query = " \u00b7 ".join(p.strip() for p in parts if str(p).strip())
+    return query.strip()
+
+
+def _rerank_by_vector(
+    config: MemoryConfig,
+    *,
+    records: list[CompilableRecord],
+    query: str,
+    top_k: int,
+) -> tuple[list[CompilableRecord], dict[str, float]]:
+    """Reorder ``records`` so semantically-strong matches come first.
+
+    Records absent from the vector hit list keep their original relative
+    order behind the boosted ones (stable partition).  Returns the new
+    record list plus the ``{record_id: score}`` map for diagnostics.
+    """
+
+    if not query:
+        return records, {}
+
+    result = vector_search(config, query, top_k=max(top_k, len(records)))
+    if not result.get("ok"):
+        raise _EmbeddingRendererError(
+            f"vector_search failed: {result.get('error')}"
+        )
+
+    candidate_ids = {_record_id(r): r for r in records if _record_id(r)}
+    if not candidate_ids:
+        return records, {}
+
+    best: dict[str, float] = {}
+    for hit in result.get("hits", []):
+        rid = str(hit.get("record_id", ""))
+        if rid not in candidate_ids:
+            continue
+        score = float(hit.get("score", 0.0))
+        if score > best.get(rid, 0.0):
+            best[rid] = score
+
+    if not best:
+        # No hit overlapped the candidate set — treat as a soft failure so
+        # the orchestrator can fall through to the deterministic tier.
+        raise _EmbeddingRendererError("no vector hits intersected the candidate set")
+
+    promoted_ids = sorted(best, key=lambda rid: best[rid], reverse=True)
+    promoted_ids = promoted_ids[:top_k]
+    promoted_set = set(promoted_ids)
+    promoted = [candidate_ids[rid] for rid in promoted_ids]
+    remaining = [r for r in records if _record_id(r) not in promoted_set]
+    return promoted + remaining, best
+
+
+def render_embedding_document(
+    config: MemoryConfig,
+    *,
+    doc_key: str,
+    user: str | None,
+    generated_at: str | None = None,
+) -> str:
+    """Embedding-tier rebuild — semantic re-ranking on top of the template.
+
+    Falls back by raising ``_EmbeddingRendererError`` when the vector
+    index is missing/disabled/empty.  The orchestrator catches the
+    resulting ``render_failed`` error and tries the next tier (typically
+    deterministic) so callers always get *some* output.
+    """
+
+    if doc_key not in KEY_DOCUMENTS:
+        raise KeyError(doc_key)
+    if not getattr(config, "embeddings_enabled", False):
+        raise _EmbeddingRendererError("embeddings_enabled=false in config")
+
+    spec = KEY_DOCUMENTS[doc_key]
+    candidates = select_records_for(config, doc_key=doc_key, user=user)
+    if not candidates:
+        # Same empty-corpus fallback as the deterministic renderer — emit
+        # a valid generated document instead of erroring out.
+        return render_deterministic_document(
+            config, doc_key=doc_key, user=user, generated_at=generated_at
+        )
+
+    query = _embedding_query_for(spec)
+    max_items = int(spec.get("max_items") or 60)
+    reordered, scores = _rerank_by_vector(
+        config, records=candidates, query=query, top_k=max_items
+    )
+
+    record_ids = [_record_id(r) for r in reordered if _record_id(r)]
+    header = build_generated_header(
+        renderer="embedding",
+        source_record_ids=record_ids,
+        generated_at=generated_at or _now_iso(),
+        config_hash=_config_hash_for(config, doc_key),
+    )
+
+    lines: list[str] = [header, "", f"# {spec['title']}", ""]
+    role = spec.get("role")
+    if role:
+        lines.append(f"> _{role}_")
+        lines.append("")
+
+    for rec in reordered:
+        title = rec.title or _record_id(rec) or "(untitled)"
+        kind = _record_kind(rec) or "record"
+        rid = _record_id(rec)
+        created = _record_created_at(rec)
+        tags = _record_tags(rec)
+        meta_bits = [f"kind=`{kind}`"]
+        if rid:
+            meta_bits.append(f"id=`{rid}`")
+        if created:
+            meta_bits.append(f"created=`{created}`")
+        if tags:
+            meta_bits.append("tags=" + ",".join(f"`{t}`" for t in tags))
+        if rid and rid in scores:
+            meta_bits.append(f"vector_score=`{scores[rid]:.3f}`")
+
+        lines.append(f"## {title}")
+        lines.append("")
+        lines.append("> " + " \u00b7 ".join(meta_bits))
+        lines.append("")
+        body = rec.body.strip()
+        body_lines = body.splitlines()
+        if body_lines and body_lines[0].strip().lstrip("#").strip() == title.strip():
+            body = "\n".join(body_lines[1:]).strip()
+        if body:
+            lines.append(body)
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # ── Manual-edit archival + rebuild orchestrator ──────────────────────────
 
 
@@ -469,7 +629,6 @@ def _rebuild_one(
     user: str | None,
     request_id: str,
     tier: str = "deterministic",
-    llm_client: Any = None,
 ) -> dict[str, Any]:
     spec = KEY_DOCUMENTS[doc_key]
     rel_path = spec["rel_path"]
@@ -479,20 +638,79 @@ def _rebuild_one(
     generated_at = _now_iso()
     try:
         if tier == "llm":
-            if llm_client is None:
-                return error_result(
-                    "llm_unavailable",
-                    "LLM tier selected but no client available",
-                    path=rel_path,
-                )
-            rendered = render_llm_document(
-                config,
-                doc_key=doc_key,
-                user=user,
-                llm_client=llm_client,
-                generated_at=generated_at,
+            # \u00a715.2-A: route the LLM tier through the unified capability
+            # runner so disabled / unavailable / timeout / budget paths share
+            # the same 7-status envelope used by distill / summarize / rewrite.
+            from .memory_llm_runner import (
+                STATUS_BUDGET,
+                STATUS_DISABLED,
+                STATUS_FAILED,
+                STATUS_TIMEOUT,
+                STATUS_UNAVAILABLE,
+                run_llm_capability,
             )
+
+            captured: dict[str, Any] = {}
+
+            def _client_factory(_profile):
+                # Honour the local ``_maybe_build_llm_client`` helper so
+                # tests that monkey-patch it keep working unchanged.
+                client, err = _maybe_build_llm_client()
+                if client is None:
+                    from .memory_llm import LLMConfigError
+
+                    raise LLMConfigError(
+                        (err or {}).get("message")
+                        or "LLM client unavailable"
+                    )
+                return client
+
+            def _invoke(client, _profile):
+                captured["text"] = render_llm_document(
+                    config,
+                    doc_key=doc_key,
+                    user=user,
+                    llm_client=client,
+                    generated_at=generated_at,
+                )
+                return captured["text"]
+
+            envelope = run_llm_capability(
+                config,
+                "rebuild_key_document",
+                _invoke,
+                client_factory=_client_factory,
+                # Legacy contract: when the user has an LLM client configured
+                # (via env or llm_config.local.json), the LLM tier is allowed
+                # to run even if the capability flag has not been flipped on
+                # in ``llm_defaults``. The runner still enforces timeout /
+                # budget / failure normalization.
+                force_enabled=True,
+            )
+            if not envelope.ok:
+                status_to_code = {
+                    STATUS_DISABLED: "llm_disabled",
+                    STATUS_UNAVAILABLE: "llm_unavailable",
+                    STATUS_TIMEOUT: "llm_timeout",
+                    STATUS_BUDGET: "llm_budget_exceeded",
+                    STATUS_FAILED: "render_failed",
+                }
+                code = status_to_code.get(envelope.status, "render_failed")
+                err = error_result(
+                    code,
+                    envelope.error or f"LLM tier failed for {doc_key!r}",
+                    path=rel_path,
+                    tier="llm",
+                )
+                err["envelope"] = envelope.to_dict()
+                return err
+            rendered = captured.get("text") or str(envelope.value or "")
             renderer_used = "llm"
+        elif tier == "embedding":
+            rendered = render_embedding_document(
+                config, doc_key=doc_key, user=user, generated_at=generated_at
+            )
+            renderer_used = "embedding"
         else:
             rendered = render_deterministic_document(
                 config, doc_key=doc_key, user=user, generated_at=generated_at
@@ -604,8 +822,11 @@ def rebuild_key_documents(
             - ``"deterministic"``: force the no-LLM template renderer.
             - ``"llm"``: force the LLM renderer; if the LLM client is
               unavailable the call returns ``error="llm_unavailable"``.
-            - ``"embedding"``: reserved for the future RAG-backed renderer
-              (P5); currently returns ``error="not_implemented"``.
+            - ``"embedding"``: RAG-backed renderer (P5 Phase 2b). Requires
+              ``embeddings.enabled=true`` and a built vector index; the
+              renderer reranks per-record candidates by chunk vector
+              similarity and stamps ``vector_score=…`` onto the meta line.
+              Returns ``error="embeddings_disabled"`` when the gate is off.
 
     Returns:
         ``{ok, written: {doc_key: per_doc_result}, errors: {…}, mode,
@@ -629,16 +850,18 @@ def rebuild_key_documents(
         }
 
     if renderer == "embedding":
-        return {
-            "ok": False,
-            "error": "not_implemented",
-            "message": (
-                "renderer='embedding' is reserved for the future RAG-backed "
-                "tier (P5); use 'deterministic', 'llm', or 'auto'."
-            ),
-            "request_id": rid,
-        }
-    if renderer not in {"deterministic", "auto", "llm"}:
+        if not getattr(config, "embeddings_enabled", False):
+            return {
+                "ok": False,
+                "error": "embeddings_disabled",
+                "message": (
+                    "renderer='embedding' requires embeddings.enabled=true "
+                    "in .ai-memory/config.json and a built vector index "
+                    "(see DesignDoc §15.4)."
+                ),
+                "request_id": rid,
+            }
+    if renderer not in {"deterministic", "auto", "llm", "embedding"}:
         return error_result(
             "invalid_input",
             f"renderer must be one of: auto, deterministic, llm, embedding (got {renderer!r})",
@@ -664,31 +887,38 @@ def rebuild_key_documents(
         per_doc_order: tuple[str, ...] = ("deterministic",)
     elif renderer == "llm":
         per_doc_order = ("llm",)
+    elif renderer == "embedding":
+        per_doc_order = ("embedding", "deterministic")
     else:  # auto
         per_doc_order = tuple(
             r for r in getattr(config, "key_documents_prefer_order", ("llm", "deterministic"))
-            if r in {"llm", "deterministic"}
+            if r in {"llm", "deterministic", "embedding"}
         ) or ("deterministic",)
         if "deterministic" not in per_doc_order:
             per_doc_order = per_doc_order + ("deterministic",)
 
-    # Lazily build LLM client only when needed
-    llm_client = None
+    # Lazily build LLM client only when needed.
+    # \u00a715.2-A: client construction now happens inside the runner per-call
+    # via ``_maybe_build_llm_client``; we just probe once here so explicit
+    # ``renderer="llm"`` requests can fail fast with a useful error when the
+    # user has no LLM configured.
     llm_unavailable_err: dict[str, Any] | None = None
     if "llm" in per_doc_order:
-        llm_client, llm_unavailable_err = _maybe_build_llm_client()
+        probe_client, probe_err = _maybe_build_llm_client()
+        if probe_client is None:
+            llm_unavailable_err = probe_err or error_result(
+                "llm_unavailable", "LLM client unavailable"
+            )
 
     written: dict[str, dict[str, Any]] = {}
     errors: dict[str, dict[str, Any]] = {}
     for doc_key in chosen:
         last_error: dict[str, Any] | None = None
         for tier in per_doc_order:
-            if tier == "llm" and llm_client is None:
-                # explicit llm-only request → surface error; auto-mode falls through
+            if tier == "llm" and llm_unavailable_err is not None:
+                # explicit llm-only request \u2192 surface error; auto-mode falls through
                 if renderer == "llm":
-                    last_error = llm_unavailable_err or error_result(
-                        "llm_unavailable", "LLM client unavailable"
-                    )
+                    last_error = llm_unavailable_err
                     break
                 continue
             outcome = _rebuild_one(
@@ -697,7 +927,6 @@ def rebuild_key_documents(
                 user=user,
                 request_id=rid,
                 tier=tier,
-                llm_client=llm_client,
             )
             if outcome.get("ok"):
                 last_error = None

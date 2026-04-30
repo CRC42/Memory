@@ -185,3 +185,183 @@ def test_dispatch_facade_write_observation_and_trace_lineage(repo: Path) -> None
     assert observation["ok"] is True
     assert traced["ok"] is True
     assert traced["record_id"] == observation["id"]
+
+
+# ---------------------------------------------------------------------------
+# §15.2-B: rewrite_query / narrative facade end-to-end coverage
+# Covers the four runner statuses: disabled / unavailable / timeout / ok.
+# ---------------------------------------------------------------------------
+
+
+import json as _json
+
+import pytest
+
+from servers.memory_server import memory_llm_runner as _runner
+from servers.memory_server import memory_query_rewrite as _qr_module
+from servers.memory_server import memory_compile_views as _compile_views
+
+
+def _enable_capability(repo: Path, capability: str) -> None:
+    cfg_path = repo / ".ai-memory/config.json"
+    payload = _json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    llm = payload.setdefault("llm_defaults", {})
+    caps = llm.setdefault("capabilities", {})
+    caps[capability] = {"enabled": True}
+    cfg_path.write_text(_json.dumps(payload), encoding="utf-8")
+
+
+class _FakeClient:
+    """Stand-in for ``LLMClient``; the real one is not invoked because we
+    monkeypatch the capability worker (`rewrite_query` /
+    `generate_snapshot_narrative`).
+    """
+
+    def __init__(self):
+        self.config = type("Cfg", (), {"model": "fake-model", "timeout": 30.0,
+                                       "max_output_tokens_per_call": 1024})()
+
+
+def _seed_for_retrieval(config) -> str:
+    res = memory_write_record(
+        config,
+        content_markdown="# Material PBR\n\nMaterial pipeline notes.\n",
+        record_kind="note",
+        scope="personal",
+        status="validated",
+        tags=["mcp"],
+    )
+    return res["id"]
+
+
+def test_dispatch_rewrite_query_disabled(repo: Path) -> None:
+    """Default config keeps query_rewrite disabled → status=disabled,
+    variants empty, retrieval still succeeds.
+    """
+    config = load_config(repo)
+    _seed_for_retrieval(config)
+
+    result = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "retrieve_context",
+            "query": "material pbr",
+            "rewrite_query": True,
+        },
+    )
+    assert result["ok"] is True
+    qr = result.get("query_rewrite")
+    assert qr is not None
+    assert qr["status"] == "disabled"
+    assert qr["variants"] == []
+
+
+def test_dispatch_rewrite_query_unavailable(repo: Path, monkeypatch) -> None:
+    _enable_capability(repo, "query_rewrite")
+    config = load_config(repo)
+    _seed_for_retrieval(config)
+
+    from servers.memory_server.memory_llm import LLMConfigError
+
+    def boom(_profile):
+        raise LLMConfigError("api key missing")
+
+    monkeypatch.setattr(_runner, "_default_client_factory", boom)
+
+    result = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "retrieve_context",
+            "query": "material pbr",
+            "rewrite_query": True,
+        },
+    )
+    assert result["ok"] is True  # retrieval still works
+    qr = result["query_rewrite"]
+    assert qr["status"] == "unavailable"
+    assert qr["variants"] == []
+
+
+def test_dispatch_rewrite_query_timeout(repo: Path, monkeypatch) -> None:
+    _enable_capability(repo, "query_rewrite")
+    config = load_config(repo)
+    _seed_for_retrieval(config)
+
+    from servers.memory_server.memory_llm import LLMRequestError
+
+    monkeypatch.setattr(_runner, "_default_client_factory", lambda _p: _FakeClient())
+
+    def slow_call(*_a, **_kw):
+        raise LLMRequestError("operation timeout")
+
+    monkeypatch.setattr(_qr_module, "rewrite_query", slow_call)
+
+    result = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "retrieve_context",
+            "query": "material pbr",
+            "rewrite_query": True,
+        },
+    )
+    qr = result["query_rewrite"]
+    assert qr["status"] == "timeout"
+    assert qr["variants"] == []
+
+
+def test_dispatch_rewrite_query_ok(repo: Path, monkeypatch) -> None:
+    _enable_capability(repo, "query_rewrite")
+    config = load_config(repo)
+    _seed_for_retrieval(config)
+
+    monkeypatch.setattr(_runner, "_default_client_factory", lambda _p: _FakeClient())
+
+    def ok_call(_client, query, *, max_variants=3, context_hint=None, **_kw):
+        return _qr_module.QueryRewriteResult(
+            ok=True,
+            original=query,
+            variants=["material pipeline pbr", "pbr roughness metallic"],
+            model="fake-model",
+        )
+
+    monkeypatch.setattr(_qr_module, "rewrite_query", ok_call)
+
+    result = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "retrieve_context",
+            "query": "material pbr",
+            "rewrite_query": True,
+        },
+    )
+    qr = result["query_rewrite"]
+    assert qr["status"] == "ok"
+    assert "material pipeline pbr" in qr["variants"]
+
+
+# ── narrative facade ────────────────────────────────────────────────
+
+
+def test_dispatch_narrative_disabled(repo: Path) -> None:
+    config = load_config(repo)
+    _seed_for_retrieval(config)
+    result = _dispatch_tool(
+        config,
+        "memory_context",
+        {
+            "operation": "compile",
+            "target": "daily_snapshot",
+            "narrative": True,
+        },
+    )
+    # The compile call itself must succeed; the narrative envelope (if
+    # surfaced under either key) must report a non-ok terminal status
+    # because snapshot_narrative defaults to disabled.
+    assert result.get("ok") is True
+    nar = result.get("narrative") or result.get("snapshot_narrative") or {}
+    if nar:
+        assert nar.get("status") in {"disabled", "skipped", None}

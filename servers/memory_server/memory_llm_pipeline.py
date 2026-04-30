@@ -126,6 +126,113 @@ class DistillCache:
         return len(self.entries)
 
 
+class SqliteDistillCache:
+    """Persistent ``.get/.put`` cache backed by a tiny SQLite file.
+
+    Drop-in replacement for :class:`DistillCache` for callers that want
+    to amortise LLM cost across process restarts. Schema is intentionally
+    minimal: ``(key TEXT PRIMARY KEY, summary TEXT, created_at TEXT)``.
+    Cache misses are silent; corrupt rows are treated as misses so a
+    bad cache never breaks the LLM path.
+
+    Thread-safety: each method opens its own short-lived connection so
+    multiple threads / processes can share the file via SQLite's file
+    locking (sufficient for the Memory MCP's "occasional summary"
+    workload — not a high-throughput cache).
+    """
+
+    _SCHEMA = (
+        "CREATE TABLE IF NOT EXISTS distill_cache ("
+        " key TEXT PRIMARY KEY,"
+        " summary TEXT NOT NULL,"
+        " created_at TEXT NOT NULL"
+        ")"
+    )
+
+    def __init__(self, path: "Path | str") -> None:
+        from pathlib import Path as _Path
+
+        self.path = _Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def _connect(self):
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(self.path), timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_schema(self) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(self._SCHEMA)
+        except Exception:
+            # Schema init must never break callers; subsequent get/put
+            # will fail soft and behave as a miss.
+            pass
+
+    def get(self, key: str) -> str | None:
+        if not key:
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT summary FROM distill_cache WHERE key = ?", (key,)
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        value = row[0]
+        return value if isinstance(value, str) and value else None
+
+    def put(self, key: str, summary: str) -> None:
+        if not key or not summary:
+            return
+        from datetime import datetime, timezone
+
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO distill_cache(key, summary, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (key, summary, ts),
+                )
+        except Exception:
+            # Persistence failure is non-fatal — caller has the summary
+            # in memory; the next call will re-LLM if cache stays empty.
+            return
+
+    def __len__(self) -> int:  # pragma: no cover — trivial
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT COUNT(1) FROM distill_cache").fetchone()
+        except Exception:
+            return 0
+        return int(row[0]) if row else 0
+
+
+def default_distill_cache(config: "Any | None" = None) -> "DistillCache | SqliteDistillCache":
+    """Pick a cache implementation based on ``config``.
+
+    Returns :class:`SqliteDistillCache` when ``config`` exposes a
+    ``llm_cache_path`` attribute (a writable :class:`pathlib.Path`); falls
+    back to the in-memory :class:`DistillCache` otherwise.  Callers that
+    do not want persistence can construct ``DistillCache()`` directly.
+    """
+
+    if config is not None:
+        path = getattr(config, "llm_cache_path", None)
+        if path is not None:
+            try:
+                return SqliteDistillCache(path)
+            except Exception:
+                pass
+    return DistillCache()
+
+
 # ── Chunking ──────────────────────────────────────────────────────────────
 
 

@@ -53,6 +53,17 @@ LLM_CAPABILITY_MATRIX: dict[str, Owner] = {
     # P4-C: rebuild a key document body. LLM proposes the prose,
     # deterministic layer enforces header/contracts and atomic write.
     "rebuild_key_document": "hybrid",
+    # v0.10.0 — opt-in recall enhancements ----------------------------------
+    # Read-only summary of already-retrieved records (memory_context
+    # retrieve_context summarize=true). Same posture as distill_summary
+    # but never persisted.
+    "summarize_recall": "llm",
+    # LLM-assisted query expansion for FTS recall. Strictly read-only:
+    # variants feed back into the deterministic ranker.
+    "query_rewrite": "hybrid",
+    # LLM "executive summary" prepended to weekly/monthly snapshots
+    # (deterministic body remains the source of truth).
+    "snapshot_narrative": "llm",
 }
 
 

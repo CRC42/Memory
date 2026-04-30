@@ -42,16 +42,23 @@ def get_current_user(repo_root: Path | None = None) -> str:
     """获取当前用户名，完全无感。
 
     优先级：
-    1. .vscode/settings.json 中的 "memory-mcp.userName"（需传入 repo_root）
-    2. 环境变量 USERNAME（Windows）/ USER（POSIX）
-    3. 回退到 'unknown'
+    1. 环境变量 ``MEMORY_MCP_USER``（CI / 子进程 / 测试稳定注入；最高优先级）
+    2. .vscode/settings.json 中的 "memory-mcp.userName"（需传入 repo_root）
+    3. 环境变量 USERNAME（Windows）/ USER（POSIX）
+    4. 回退到 'unknown'
     """
-    # 优先从 .vscode/settings.json 读取
+    # 1. 显式覆盖：CI / 测试 / 子进程注入稳定 user
+    explicit = os.environ.get("MEMORY_MCP_USER")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    # 2. .vscode/settings.json
     if repo_root is not None:
         vscode_user = _read_vscode_username(repo_root)
         if vscode_user:
             return vscode_user
 
+    # 3. OS 账号
     return os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
 
 
@@ -148,3 +155,63 @@ def _rotate_events_if_needed(config: MemoryConfig) -> None:
     except OSError:
         # Rotation must never block the audit write path.
         return
+
+
+def count_recent_events(
+    config: MemoryConfig,
+    event_type: str,
+    *,
+    window_seconds: int = 24 * 3600,
+) -> int:
+    """Return the count of ``event_type`` rows within the last ``window_seconds``.
+
+    Walks ``events.jsonl`` plus any rotated archives; tolerant of partial /
+    malformed lines so the operational health surface never fails just
+    because the audit log has been rotated mid-write.
+    """
+
+    try:
+        active = config.events_file
+    except Exception:
+        return 0
+    if not isinstance(active, Path):
+        return 0
+    cutoff = datetime.now(timezone.utc).timestamp() - max(0, int(window_seconds))
+    candidates: list[Path] = []
+    if active.is_file():
+        candidates.append(active)
+    parent = active.parent
+    if parent.is_dir():
+        try:
+            candidates.extend(
+                p for p in parent.iterdir()
+                if p.is_file() and p.name.startswith(active.name + ".")
+            )
+        except OSError:
+            pass
+    count = 0
+    for path in candidates:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"event_type"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    if record.get("event_type") != event_type:
+                        continue
+                    ts_raw = record.get("ts")
+                    if not isinstance(ts_raw, str):
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(ts_raw).timestamp()
+                    except ValueError:
+                        continue
+                    if ts >= cutoff:
+                        count += 1
+        except OSError:
+            continue
+    return count

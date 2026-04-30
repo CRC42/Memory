@@ -283,3 +283,41 @@ def test_summarize_records_query_changes_cache_key() -> None:
     summarize_records_for_recall(client, records, query="what?", cache=cache)
     summarize_records_for_recall(client, records, query="why?", cache=cache)
     assert calls["n"] == 2  # different question → fresh LLM call
+
+
+# ── persistent SQLite distill cache ───────────────────────────────────
+
+
+def test_sqlite_distill_cache_round_trip(tmp_path) -> None:
+    from servers.memory_server.memory_llm_pipeline import SqliteDistillCache
+
+    cache = SqliteDistillCache(tmp_path / "distill.sqlite")
+    assert cache.get("missing") is None
+    cache.put("k1", "summary one")
+    cache.put("k2", "summary two")
+    assert cache.get("k1") == "summary one"
+    assert cache.get("k2") == "summary two"
+    # idempotent overwrite (INSERT OR REPLACE)
+    cache.put("k1", "summary one v2")
+    assert cache.get("k1") == "summary one v2"
+
+
+def test_sqlite_distill_cache_persists_across_instances(tmp_path) -> None:
+    from servers.memory_server.memory_llm_pipeline import SqliteDistillCache
+
+    path = tmp_path / "nested" / "distill.sqlite"
+    cache_a = SqliteDistillCache(path)
+    cache_a.put("alpha", "value-A")
+    # Reopen — value must survive process-equivalent restart.
+    cache_b = SqliteDistillCache(path)
+    assert cache_b.get("alpha") == "value-A"
+
+
+def test_sqlite_distill_cache_ignores_empty_inputs(tmp_path) -> None:
+    from servers.memory_server.memory_llm_pipeline import SqliteDistillCache
+
+    cache = SqliteDistillCache(tmp_path / "distill.sqlite")
+    cache.put("", "non-empty summary")
+    cache.put("k", "")
+    assert cache.get("") is None
+    assert cache.get("k") is None
