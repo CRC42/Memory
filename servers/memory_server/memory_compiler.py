@@ -1,13 +1,8 @@
 """Memory compile orchestration.
 
-Thin entry-point that dispatches to the right compile-target module:
-
-- snapshot / level / review / rollback views   -> ``memory_compile_views``
-- runtime / handoff / system / publish views   -> ``memory_compile_render``
-
-This file used to contain everything (~929 LOC at peak). After the
-P0-1 second-pass split it is intentionally a small router so that
-adding a new compile target only touches one feature module.
+Thin entry-point that drives a corpus scan + filter and dispatches to
+the right view in :mod:`memory_compile_views` (which now also hosts the
+formerly-split leaf helpers: targets, render, scoring, writer).
 
 Back-compat re-exports keep `from .memory_compiler import …` working
 for tests, ``server_dispatch``, and external callers.
@@ -17,9 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .memory_compile_render import render_compile_markdown as _render_compile_markdown
-from .memory_compile_scoring import record_sort_key as _record_sort_key
-from .memory_compile_targets import (
+from .memory_compile_views import (
     DEFAULT_BODY_MODE,
     DEFAULT_INCLUDE_SCOPES,
     DEFAULT_INCLUDE_STATUSES,
@@ -27,16 +20,16 @@ from .memory_compile_targets import (
     SNAPSHOT_TARGETS,
     SUPPORTED_BODY_MODES,
     SUPPORTED_TARGETS,
-    compiled_path as _compiled_path,
-)
-from .memory_compile_views import (
     compile_level_digest as _compile_level_digest,
     compile_review_queue as _compile_review_queue,
     compile_rollback_context as _compile_rollback_context,
     compile_snapshot_target as _compile_snapshot_target,
+    compiled_path as _compiled_path,
     memory_compare_snapshots,  # re-export for server_dispatch / tests
+    record_sort_key as _record_sort_key,
+    render_compile_markdown as _render_compile_markdown,
+    write_compiled_view as _write_compiled_view,
 )
-from .memory_compile_writer import write_compiled_view as _write_compiled_view
 from .memory_compiler_cache import (  # re-exports preserved for callers/tests
     find_compile_cache_entry,
     get_record_last_used_at,
