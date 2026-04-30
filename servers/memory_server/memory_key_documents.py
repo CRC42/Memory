@@ -626,6 +626,125 @@ def render_llm_document(
     return "\n".join(lines).rstrip() + "\n"
 
 
+# ----------------------------------------------------------------------
+# Tier dispatch (D2 slim-down: unify the 3-tier renderer plumbing)
+#
+# Each tier-invoker has the same signature
+#     (config, doc_key, user, generated_at, rel_path)
+#         -> (text | None, error_dict | None)
+# and exactly one of the two return slots is non-None. ``_rebuild_one``
+# picks the invoker via ``_TIER_INVOKERS`` and then runs the shared
+# backup / atomic-write / event path -- no per-tier branches downstream.
+# ----------------------------------------------------------------------
+
+
+def _invoke_deterministic_tier(
+    config: MemoryConfig,
+    doc_key: str,
+    user: str | None,
+    generated_at: str,
+    rel_path: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    text = render_deterministic_document(
+        config, doc_key=doc_key, user=user, generated_at=generated_at
+    )
+    return text, None
+
+
+def _invoke_embedding_tier(
+    config: MemoryConfig,
+    doc_key: str,
+    user: str | None,
+    generated_at: str,
+    rel_path: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    text = render_embedding_document(
+        config, doc_key=doc_key, user=user, generated_at=generated_at
+    )
+    return text, None
+
+
+def _invoke_llm_tier(
+    config: MemoryConfig,
+    doc_key: str,
+    user: str | None,
+    generated_at: str,
+    rel_path: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """LLM tier -- routed through the unified 7-status capability runner.
+
+    DesignDoc 15.2-A: disabled / unavailable / timeout / budget / failed
+    paths share the envelope used by distill / summarize / rewrite.
+    ``force_enabled`` keeps the legacy contract that a user with an LLM
+    client configured can rebuild even without flipping the capability
+    flag in ``llm_defaults``.
+    """
+    from .memory_llm_runner import (
+        STATUS_BUDGET,
+        STATUS_DISABLED,
+        STATUS_FAILED,
+        STATUS_TIMEOUT,
+        STATUS_UNAVAILABLE,
+        run_llm_capability,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _client_factory(_profile):
+        # Honour ``_maybe_build_llm_client`` so monkey-patching tests keep working.
+        client, err = _maybe_build_llm_client()
+        if client is None:
+            from .memory_llm import LLMConfigError
+
+            raise LLMConfigError(
+                (err or {}).get("message") or "LLM client unavailable"
+            )
+        return client
+
+    def _invoke(client, _profile):
+        captured["text"] = render_llm_document(
+            config,
+            doc_key=doc_key,
+            user=user,
+            llm_client=client,
+            generated_at=generated_at,
+        )
+        return captured["text"]
+
+    envelope = run_llm_capability(
+        config,
+        "rebuild_key_document",
+        _invoke,
+        client_factory=_client_factory,
+        force_enabled=True,
+    )
+    if not envelope.ok:
+        status_to_code = {
+            STATUS_DISABLED: "llm_disabled",
+            STATUS_UNAVAILABLE: "llm_unavailable",
+            STATUS_TIMEOUT: "llm_timeout",
+            STATUS_BUDGET: "llm_budget_exceeded",
+            STATUS_FAILED: "render_failed",
+        }
+        code = status_to_code.get(envelope.status, "render_failed")
+        err = error_result(
+            code,
+            envelope.error or f"LLM tier failed for {doc_key!r}",
+            path=rel_path,
+            tier="llm",
+        )
+        err["envelope"] = envelope.to_dict()
+        return None, err
+    return captured.get("text") or str(envelope.value or ""), None
+
+
+_TIER_INVOKERS: dict[str, Any] = {
+    "deterministic": _invoke_deterministic_tier,
+    "embedding": _invoke_embedding_tier,
+    "llm": _invoke_llm_tier,
+}
+
+
 def _rebuild_one(
     config: MemoryConfig,
     *,
@@ -640,94 +759,26 @@ def _rebuild_one(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     generated_at = _now_iso()
+    invoker = _TIER_INVOKERS.get(tier, _invoke_deterministic_tier)
     try:
-        if tier == "llm":
-            # \u00a715.2-A: route the LLM tier through the unified capability
-            # runner so disabled / unavailable / timeout / budget paths share
-            # the same 7-status envelope used by distill / summarize / rewrite.
-            from .memory_llm_runner import (
-                STATUS_BUDGET,
-                STATUS_DISABLED,
-                STATUS_FAILED,
-                STATUS_TIMEOUT,
-                STATUS_UNAVAILABLE,
-                run_llm_capability,
-            )
-
-            captured: dict[str, Any] = {}
-
-            def _client_factory(_profile):
-                # Honour the local ``_maybe_build_llm_client`` helper so
-                # tests that monkey-patch it keep working unchanged.
-                client, err = _maybe_build_llm_client()
-                if client is None:
-                    from .memory_llm import LLMConfigError
-
-                    raise LLMConfigError(
-                        (err or {}).get("message")
-                        or "LLM client unavailable"
-                    )
-                return client
-
-            def _invoke(client, _profile):
-                captured["text"] = render_llm_document(
-                    config,
-                    doc_key=doc_key,
-                    user=user,
-                    llm_client=client,
-                    generated_at=generated_at,
-                )
-                return captured["text"]
-
-            envelope = run_llm_capability(
-                config,
-                "rebuild_key_document",
-                _invoke,
-                client_factory=_client_factory,
-                # Legacy contract: when the user has an LLM client configured
-                # (via env or llm_config.local.json), the LLM tier is allowed
-                # to run even if the capability flag has not been flipped on
-                # in ``llm_defaults``. The runner still enforces timeout /
-                # budget / failure normalization.
-                force_enabled=True,
-            )
-            if not envelope.ok:
-                status_to_code = {
-                    STATUS_DISABLED: "llm_disabled",
-                    STATUS_UNAVAILABLE: "llm_unavailable",
-                    STATUS_TIMEOUT: "llm_timeout",
-                    STATUS_BUDGET: "llm_budget_exceeded",
-                    STATUS_FAILED: "render_failed",
-                }
-                code = status_to_code.get(envelope.status, "render_failed")
-                err = error_result(
-                    code,
-                    envelope.error or f"LLM tier failed for {doc_key!r}",
-                    path=rel_path,
-                    tier="llm",
-                )
-                err["envelope"] = envelope.to_dict()
-                return err
-            rendered = captured.get("text") or str(envelope.value or "")
-            renderer_used = "llm"
-        elif tier == "embedding":
-            rendered = render_embedding_document(
-                config, doc_key=doc_key, user=user, generated_at=generated_at
-            )
-            renderer_used = "embedding"
-        else:
-            rendered = render_deterministic_document(
-                config, doc_key=doc_key, user=user, generated_at=generated_at
-            )
-            renderer_used = "deterministic"
+        rendered, dispatch_err = invoker(config, doc_key, user, generated_at, rel_path)
     except Exception as exc:
-        # Surface so the orchestrator can try the next tier
         return error_result(
             "render_failed",
             f"{tier} renderer failed for {doc_key!r}: {type(exc).__name__}: {exc}",
             path=rel_path,
             tier=tier,
         )
+    if dispatch_err is not None:
+        return dispatch_err
+    if rendered is None:
+        return error_result(
+            "render_failed",
+            f"{tier} renderer returned no content for {doc_key!r}",
+            path=rel_path,
+            tier=tier,
+        )
+    renderer_used = tier
 
     archived_to: str | None = None
     try:

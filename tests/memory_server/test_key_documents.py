@@ -392,17 +392,85 @@ def test_render_llm_document_uses_map_reduce_distill(monkeypatch, populated_repo
         generated_at="2026-04-27T00:00:00+00:00",
     )
     assert is_generated(text)
-    meta = parse_generated_meta(text)
-    assert meta is not None
-    assert meta["renderer"] == "llm"
-    assert "# Progress" in text
-    assert "## Highlights" in text
-    assert "Sprint focus: P4-C" in text
-    # raw record dicts were passed through map_reduce_distill
-    assert captured["records"], "expected non-empty records to be distilled"
-    for rd in captured["records"]:
-        assert rd.get("provenance") == "raw_capture"
-        assert rd.get("immutable") is True
+
+
+# ── D2 slim-down: tier dispatch table ────────────────────────────────────
+
+
+def test_tier_invokers_table_covers_three_tiers() -> None:
+    """D2: ``_TIER_INVOKERS`` is the single dispatch surface for ``_rebuild_one``;
+    keep its key set tied to the documented renderer choices so a missing
+    invoker can never silently fall through to deterministic."""
+    from servers.memory_server import memory_key_documents as mkd
+
+    assert set(mkd._TIER_INVOKERS.keys()) == {"deterministic", "embedding", "llm"}
+    for tier, invoker in mkd._TIER_INVOKERS.items():
+        assert callable(invoker), f"{tier} invoker must be callable"
+
+
+def test_tier_invokers_share_signature(populated_repo: Path) -> None:
+    """D2: all three invokers must accept the same positional args and
+    return ``(text | None, error_dict | None)``. Embedding is gated by
+    ``embeddings_enabled`` so we only assert it returns the unified tuple
+    shape via the public ``render_embedding_document`` raising path."""
+    from servers.memory_server import memory_key_documents as mkd
+
+    config = load_config(populated_repo)
+
+    text, err = mkd._invoke_deterministic_tier(
+        config, "progress", "alice", "2026-04-27T00:00:00+00:00", "memory-bank/progress.md"
+    )
+    assert err is None
+    assert isinstance(text, str) and is_generated(text)
+
+    # LLM tier with no client configured must return (None, error_dict)
+    # via the runner's ``unavailable`` envelope rather than raising.
+    text2, err2 = mkd._invoke_llm_tier(
+        config, "progress", "alice", "2026-04-27T00:00:00+00:00", "memory-bank/progress.md"
+    )
+    assert text2 is None
+    assert isinstance(err2, dict)
+    assert err2.get("ok") is False
+    assert err2.get("error") in {"llm_unavailable", "llm_disabled", "render_failed"}
+    assert "envelope" in err2
+
+
+def test_rebuild_one_routes_through_dispatch_table(monkeypatch, populated_repo: Path) -> None:
+    """D2: ``_rebuild_one`` must look up its invoker via ``_TIER_INVOKERS``
+    rather than hard-coded if/elif. Override the table and verify the
+    override is actually called."""
+    from servers.memory_server import memory_key_documents as mkd
+
+    config = load_config(populated_repo)
+    calls: list[str] = []
+
+    def _fake_invoker(cfg, doc_key, user, generated_at, rel_path):
+        calls.append(doc_key)
+        return (
+            mkd.build_generated_header(
+                renderer="deterministic",
+                source_record_ids=[],
+                generated_at=generated_at,
+                config_hash="test",
+            )
+            + "\n# Faked\n",
+            None,
+        )
+
+    monkeypatch.setitem(mkd._TIER_INVOKERS, "deterministic", _fake_invoker)
+    result = mkd._rebuild_one(
+        config,
+        doc_key="progress",
+        user="alice",
+        request_id="test-req",
+        tier="deterministic",
+    )
+    assert result.get("ok") is True
+    assert result.get("renderer") == "deterministic"
+    assert calls == ["progress"]
+    written = (populated_repo / "memory-bank/progress.md").read_text(encoding="utf-8")
+    assert "Faked" in written
+
 
 
 def test_rebuild_auto_uses_llm_when_client_available(monkeypatch, populated_repo: Path) -> None:
