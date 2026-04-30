@@ -1,5 +1,13 @@
 """Chunking helpers for the local RAG / vector tier (P5 Phase 2a).
 
+============================================================================
+⚠️  EXPERIMENTAL — FROZEN  (DesignDoc §15.5 / §15.x slim-down decision)
+----------------------------------------------------------------------------
+Chunking layer of the frozen vector tier.  See ``memory_vector_search``
+for the full freeze rationale.  Chunking constants here directly affect
+the stored ``chunk_id`` values; changing them invalidates every index.
+============================================================================
+
 We feed embeddings one *chunk* at a time, not one whole record at a time:
 
 * Records range from a few hundred to a few thousand characters; embedding

@@ -1,5 +1,13 @@
 """Embedding provider abstraction for the local RAG / vector tier (P5 Phase 1).
 
+============================================================================
+⚠️  EXPERIMENTAL — FROZEN  (DesignDoc §15.5 / §15.x slim-down decision)
+----------------------------------------------------------------------------
+Provider layer of the frozen vector tier.  See ``memory_vector_search``
+for the full freeze rationale.  Default config keeps this dormant; do not
+build on it unless a §15.5 activation threshold is met.
+============================================================================
+
 Design contract (see MemorySystemDesignDocument.md §15.4):
 
 * All embedding work must run **locally on CPU** with no required network

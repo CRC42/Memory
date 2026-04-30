@@ -29,6 +29,12 @@ DEFAULT_RETRIEVAL_SCOPES = ["shared", "personal", "session", "task_or_branch", "
 
 
 # ── P5 Phase 2b — vector supplement tunables (see DesignDoc §15.4) ────
+#
+# ⚠️  The vector tier (`memory_vector_search`) is FROZEN at v0.11.1
+# (DesignDoc §15.5).  This supplement is opt-in and a no-op when
+# `embeddings.enabled=False` (default).  Do not add new tuning knobs
+# unless a §15.5 activation threshold is hit.
+#
 # Conservative numbers so the FTS ranking continues to dominate.  These
 # are not user-facing config keys yet; once we have ONNX recall data we
 # can promote them to MemoryConfig.

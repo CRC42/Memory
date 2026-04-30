@@ -1,5 +1,24 @@
 """End-to-end build / query orchestration for the local RAG tier (Phase 2a).
 
+============================================================================
+⚠️  EXPERIMENTAL — FROZEN  (DesignDoc §15.5 / §15.x slim-down decision)
+----------------------------------------------------------------------------
+The vector / RAG tier is frozen at v0.11.1.  Reasoning:
+
+  * It is *opt-in* (`embeddings.enabled=False` by default); on default
+    config every entry point here is a 0-byte no-op.
+  * Activation thresholds (DesignDoc §15.5) are NOT met:
+      - chunks  : ~1.5–3 万   (threshold ≥ 100k)
+      - rebuild : sub-minute  (threshold ≥ 10 min)
+      - QPS     : <1          (threshold ≥ 20)
+  * Real-model recall baseline is still a pending observation item
+    (DesignDoc §16); no production caller currently relies on it.
+
+Do NOT extend this module with new features unless one of the §15.5
+thresholds is hit OR an explicit user / design-doc decision reopens it.
+Bug fixes that keep the existing contract intact are still welcome.
+============================================================================
+
 This module is the seam between the existing record corpus and the
 vector index files written by :mod:`memory_vector_index`.  It deliberately
 stays provider-agnostic — the only thing it needs from a provider is the

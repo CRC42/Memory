@@ -281,9 +281,20 @@ memory-bank/
 
 - **多人联合项目治理**：现有 validate / publish / archive 链路保留用于历史数据；治理动作迁至 CLI / scripts / 管理 skill；不再把"插件内自动审查与规则晋升"当作主产品方向。
 
-### 15.5 不启动（阈值未到）
+### 15.5 已冻结方向（保留实现，不再扩张）
 
-- **v0.11.0 RAG Phase 3**（GPU EP / 量化 / HNSW）：仅当 `chunks ≥ 100k` / `全量重建 ≥ 10min` / `稳态 QPS ≥ 20` 任一阈值命中时启动。当前规模约 1.5–3 万 chunk，远未达阈值。
+- **整个 vector / RAG 通路**（`memory_embeddings.py` / `memory_vector_search.py` / `memory_vector_index.py` / `memory_vector_corpus.py` + `_vector_supplement` + key_documents `embedding` renderer）：自 v0.11.x slim-down 起冻结。
+  - 现状：默认 `embeddings.enabled=False`，主路径 0 字节、0 调用开销；五个模块文件头与两个消费入口（`memory_retrieval._vector_supplement` / `memory_key_documents._render_embedding_renderer`）均带 `EXPERIMENTAL — FROZEN` 横幅。
+  - 不启动条件（任一命中即可解冻）：
+    - `chunks ≥ 100k`（当前约 1.5–3 万）
+    - 全量重建 `≥ 10 min`（当前 sub-minute）
+    - 稳态 `QPS ≥ 20`（当前 < 1）
+    - 完成"真模型召回基线"观察项（设计文档 §16）并证明 deterministic + FTS 召回不足
+  - **冻结期允许的改动**：保持现有契约的 bug fix；测试维护；`embeddings.enabled=True` opt-in 路径上的兼容性修复。
+  - **冻结期不允许的改动**：新 provider；新 chunk 策略；新 renderer；新 tuning knob；HNSW / 量化 / GPU EP（属于已计划但未触发的 RAG Phase 3）。
+- **RAG Phase 3**（GPU EP / 量化 / HNSW）：上述阈值任一命中后再考虑。
+
+> 说明：vector tier 既"已落地"又"未达阈值"，因此从原 §15.5「不启动」升级为「已冻结」；治理链路（原 §15.4）维持「已降级，保留兼容」。两者的差别在于：治理链路有历史数据迁移路径需要保留入口；vector tier 是默认 0 消费、可随时无感重新启用。
 
 ## 16. 最终结论
 

@@ -1,5 +1,14 @@
 """On-disk vector index for the local RAG tier (P5 Phase 1).
 
+============================================================================
+⚠️  EXPERIMENTAL — FROZEN  (DesignDoc §15.5 / §15.x slim-down decision)
+----------------------------------------------------------------------------
+Index format / persistence layer of the frozen vector tier.  See
+``memory_vector_search`` for the full freeze rationale.  Touching the
+on-disk format requires bumping ``provider_id`` / ``model_hash`` so
+existing indexes invalidate cleanly — please don't do it casually.
+============================================================================
+
 Storage layout (per design doc §15.4.4):
 
     .ai-memory/vector_index/<provider_id>__<model_hash>/

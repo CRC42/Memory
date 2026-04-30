@@ -322,8 +322,12 @@ def render_deterministic_document(
     return "\n".join(lines).rstrip() + "\n"
 
 
-# ── P5 Phase 2b — embedding-tier renderer (DesignDoc §15.4) ────────────
-
+# ── P5 Phase 2b — embedding-tier renderer (DesignDoc §15.4) ────────────#
+# ⚠️  Strictly opt-in: requires `renderer="embedding"` AND
+# `embeddings.enabled=True`.  The underlying vector tier is FROZEN at
+# v0.11.1 (DesignDoc §15.5); see ``memory_vector_search`` for rationale.
+# This renderer is kept wired so existing tests / opt-in callers still
+# work, but it is not part of the default key_documents prefer order.
 
 class _EmbeddingRendererError(RuntimeError):
     """Raised when the embedding tier cannot produce a useful ranking.
