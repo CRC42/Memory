@@ -178,7 +178,8 @@ if ($ForceRecreate -and (Test-Path $venvDir)) {
 if (-not (Test-Path $venvPython)) {
     $py = Resolve-Python -Override $PythonExe -WantTag $wantTag
     Write-Host "Creating virtual environment with: $py" -ForegroundColor Cyan
-    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & $py -m venv $venvDir 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     $ErrorActionPreference = $prevEAP
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
@@ -199,8 +200,14 @@ if (-not (Test-Path $venvPython)) {
 function Test-DepsInstalled {
     param([string]$VenvPy)
     if (-not (Test-Path $VenvPy)) { return $false }
-    $probe = & $VenvPy -c "import mcp, mcp.server, pydantic, httpx, anyio, starlette" 2>&1
-    return ($LASTEXITCODE -eq 0)
+    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPy -c "import mcp, mcp.server, pydantic, httpx, anyio, starlette" *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    finally {
+        $ErrorActionPreference = $prevEAP
+    }
 }
 
 $needInstall = -not $SkipInstall -and (
