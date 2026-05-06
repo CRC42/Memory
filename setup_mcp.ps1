@@ -94,6 +94,17 @@ if (!$mcpConfig.ContainsKey("servers") -or $null -eq $mcpConfig["servers"]) {
 }
 
 $servers = $mcpConfig["servers"]
+
+function Test-IsMemoryServerEntry($Entry) {
+    if ($null -eq $Entry) { return $false }
+    $entryMap = Convert-ToHashtable $Entry
+    if ($null -eq $entryMap -or -not $entryMap.ContainsKey("args")) { return $false }
+    foreach ($arg in $entryMap["args"]) {
+        if ([string]$arg -eq "servers.memory_server") { return $true }
+    }
+    return $false
+}
+
 # Path stored in mcp.json: prefer ${workspaceFolder}/<rel> so the file is
 # portable across machines and team members. -AbsolutePath (or plugin not
 # under the repo) forces absolute paths instead.
@@ -109,7 +120,7 @@ $pythonPathArg = if ($useWorkspaceFolderVar) {
     Convert-ToPosixPath $memoryRoot
 }
 
-$servers["project-memory-mcp"] = @{
+$serverEntry = @{
     command = $pythonArg
     args = @(
         "-m",
@@ -121,6 +132,13 @@ $servers["project-memory-mcp"] = @{
         PYTHONPATH = $pythonPathArg
         PYTHONUTF8 = "1"
     }
+}
+
+$servers["project-memory-mcp"] = $serverEntry
+
+if ($servers.ContainsKey("memory-mcp") -and (Test-IsMemoryServerEntry $servers["memory-mcp"])) {
+    $servers["memory-mcp"] = $serverEntry
+    Write-Host "Migrated legacy server: memory-mcp"
 }
 
 $compactJson = $mcpConfig | ConvertTo-Json -Depth 50 -Compress

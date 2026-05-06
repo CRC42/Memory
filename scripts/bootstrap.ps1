@@ -96,7 +96,12 @@ repo_root = Path(r'$repoRoot')
 r1 = write_user_setting(repo_root, '$UserName')
 print('write_user_setting:', json.dumps(r1, ensure_ascii=False))
 
-r2 = merge_mcp_json(repo_root, python_exe=r'$venvPython')
+r2 = merge_mcp_json(
+    repo_root,
+    server_name='project-memory-mcp',
+    python_exe=r'$venvPython',
+    memory_root=r'$mcpRoot',
+)
 print('merge_mcp_json   :', json.dumps(r2, ensure_ascii=False))
 
 r3 = health_green_light(repo_root)

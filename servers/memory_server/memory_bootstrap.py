@@ -35,6 +35,22 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _posix(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def _infer_memory_root_from_venv_python(python_exe: str | None) -> Path | None:
+    if not python_exe:
+        return None
+    python_path = Path(python_exe)
+    try:
+        if python_path.parent.name.lower() == "scripts" and python_path.parent.parent.name.lower() == ".venv":
+            return python_path.parent.parent.parent
+    except IndexError:
+        return None
+    return None
+
+
 def write_user_setting(repo_root: Path, user_name: str) -> dict[str, Any]:
     """Persist ``memory-mcp.userName`` into ``.vscode/settings.json``.
 
@@ -56,6 +72,7 @@ def merge_mcp_json(
     *,
     server_name: str = "memory-mcp",
     python_exe: str | None = None,
+    memory_root: Path | str | None = None,
     args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Idempotent merge of a memory-mcp entry into ``.vscode/mcp.json``.
@@ -69,11 +86,17 @@ def merge_mcp_json(
     if not isinstance(servers, dict):
         servers = {}
 
+    resolved_memory_root = Path(memory_root) if memory_root is not None else _infer_memory_root_from_venv_python(python_exe)
     entry: dict[str, Any] = {
         "command": python_exe or "python",
         "args": args or ["-m", "servers.memory_server", "--root", "${workspaceFolder}"],
         "type": "stdio",
     }
+    if resolved_memory_root is not None:
+        entry["env"] = {
+            "PYTHONPATH": _posix(resolved_memory_root),
+            "PYTHONUTF8": "1",
+        }
     servers[server_name] = entry
     existing["servers"] = servers
     _write_json(mcp_path, existing)

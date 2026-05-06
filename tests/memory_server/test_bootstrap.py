@@ -56,6 +56,22 @@ def test_merge_mcp_json_creates_entry(tmp_path: Path) -> None:
     assert data["servers"]["memory-mcp"]["command"] == "python"
 
 
+def test_merge_mcp_json_writes_env_for_venv_python(tmp_path: Path) -> None:
+    memory_root = tmp_path / "MCP" / "Memory"
+    venv_python = memory_root / ".venv" / "Scripts" / "python.exe"
+
+    result = merge_mcp_json(tmp_path, python_exe=str(venv_python), memory_root=memory_root)
+    assert result["ok"] is True
+
+    data = json.loads((tmp_path / ".vscode" / "mcp.json").read_text(encoding="utf-8"))
+    entry = data["servers"]["memory-mcp"]
+    assert entry["command"] == str(venv_python)
+    assert entry["env"] == {
+        "PYTHONPATH": str(memory_root).replace("\\", "/"),
+        "PYTHONUTF8": "1",
+    }
+
+
 def test_merge_mcp_json_preserves_other_servers(tmp_path: Path) -> None:
     mcp_path = tmp_path / ".vscode" / "mcp.json"
     mcp_path.parent.mkdir(parents=True)
